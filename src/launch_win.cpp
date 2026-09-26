@@ -123,6 +123,9 @@ void load_conf(const std::string& path) {
         std::string line = text.substr(pos, eol == std::string::npos
                                               ? std::string::npos : eol - pos);
         pos = eol == std::string::npos ? text.size() : eol + 1;
+        // 剥离 CRLF 行尾的 \r（记事本等编辑器会把 conf 存成 CRLF）
+        while (!line.empty() && (line.back() == '\r' || line.back() == '\n'))
+            line.pop_back();
         line = trim(line);
         if (line.empty() || line[0] == '#') continue;
         size_t eq = line.find('=');
@@ -300,6 +303,9 @@ BOOL WINAPI on_ctrl(DWORD ev) {
 
 int main(int argc, char** argv) {
     SetConsoleOutputCP(CP_UTF8);
+    // 服务运行期间阻止系统进入新型待机（Modern Standby），否则 GPU 上下文
+    // 会被挂起杀死引擎；仅阻止系统睡眠，显示器仍可关闭。
+    SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED);
     SetConsoleCtrlHandler(on_ctrl, TRUE);
     {
         DWORD procs[4];
