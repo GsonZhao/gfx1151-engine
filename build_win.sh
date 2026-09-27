@@ -24,6 +24,14 @@ cd "$ROOT"
 TR="${THEROCK:-/c/therock-dist-windows-multiarch-10.0.0/therock-dist-windows-multiarch-10.0.0}"
 HIPCC="$TR/bin/hipcc.exe"
 [[ -x "$HIPCC" ]] || { echo "找不到 TheRock hipcc: $HIPCC（设 THEROCK=...）" >&2; exit 1; }
+# hipcc 会读 HIP_PATH 定位 clang（实测指向坏路径直接编译失败；指向 HIP SDK 7.2
+# 时靠布局差异侥幸回退自定位，不该依赖）。强制 HIP_PATH 指向 TheRock，屏蔽机器
+# 上其他 HIP/ROCm 安装（SDK 6.4/7.1/7.2 会设 HIP_PATH/HIP_PATH_64/HIP_PATH_72）。
+# ROCM_PATH 则必须不设：clang 看到它会去 $ROCM_PATH/amdgcn/bitcode 找设备库，
+# 而 TheRock 的设备库在 lib/llvm/amdgcn/bitcode，靠 clang 自定位才找得到。
+TR_WIN="$(cygpath -w "$TR")"
+export HIP_PATH="$TR_WIN"
+unset ROCM_PATH HIP_PATH_64 HIP_PATH_71 HIP_PATH_72
 GPU_ARCH="${GPU_ARCH:-gfx1151}"
 TARGET="${1:-engine}"
 [[ "$TARGET" == engine || "$TARGET" == api || "$TARGET" == launcher || "$TARGET" == test ]] || { sed -n '2,10p' "$0" >&2; exit 2; }
@@ -45,7 +53,6 @@ done
 # （缺主索引 TensileLibrary.dat 时回退枚举 gfx<arch>/ 分片目录，目录必须能
 # 枚举）。只拷本机架构分片（rocblas 17M + hipblaslt 13M；全架构是 703M+530M）。
 # 拷完 build/ 即自包含：目标机器无需安装 TheRock/ROCm 运行库，拷走即用。
-TR_WIN="$(cygpath -w "$TR")"
 for d in rocblas hipblaslt; do
   [[ ! -L "build/$d" ]] || rm "build/$d"  # 旧版 junction：删链接换真身
   if [[ ! -d "build/$d/library/$GPU_ARCH" ]]; then
@@ -68,7 +75,9 @@ FLAGS=(-O3 -std=c++17 --offload-arch="$GPU_ARCH" -D_CRT_SECURE_NO_WARNINGS
 case "$TARGET" in
   engine)
     echo "[编译] build/gdec-win.exe"
-    "$HIPCC" "${FLAGS[@]}" src/gpu/gdec.cpp -o build/gdec-win.exe
+    # 先编到临时文件再原子替换，编译失败保留上次成功的二进制（对齐 Linux build.sh）
+    "$HIPCC" "${FLAGS[@]}" src/gpu/gdec.cpp -o build/gdec-win.exe.tmp \
+      && mv -f build/gdec-win.exe.tmp build/gdec-win.exe
     ;;
   api)
     # OpenAI HTTP 前端：纯主机 C++，用 TheRock 自带 clang++（不拖 HIP 依赖）。
