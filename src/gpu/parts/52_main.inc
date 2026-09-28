@@ -41,6 +41,18 @@ static std::unique_ptr<Checkpoint> open_base(const std::string& base) {
   return ck;
 }
 
+// Base-file lm_head record, captured before overlays are applied (the draft
+// lm_head override in GpuModel::setup_draft_lmhead). The record points into
+// the base file's mmap, which outlives the model (ckbase is main-scoped).
+static Tensor g_lmhead_base;
+static bool g_lmhead_base_ok = false;
+static void lmhead_base_capture(const Checkpoint& ck) {
+  if (const Tensor* t = ck.find("lm_head.weight")) {
+    g_lmhead_base = *t;
+    g_lmhead_base_ok = true;
+  }
+}
+
 int main(int argc, char** argv) {
 #ifdef _WIN32
   if (!wsa_init()) {
@@ -295,6 +307,7 @@ int main(int argc, char** argv) {
     if (!maxctx_set) maxctx = 65536;  // service default; CLI one-shot stays 4096
     auto ckbase = open_base(base);
     Checkpoint& ckpt = *ckbase;
+    lmhead_base_capture(ckpt);
     for (const auto& o : overlays) ckpt.add_overlay(o.c_str());
     fprintf(stderr, "loaded %zu tensors (base+%zu overlay)\n", ckpt.tensor_count(),
             overlays.size());
@@ -304,6 +317,7 @@ int main(int argc, char** argv) {
     devarena_init(ckpt, maxctx);
     load_arena(ckpt);
     GpuModel m(ckpt, maxctx);
+    m.setup_draft_lmhead(g_lmhead_base_ok ? &g_lmhead_base : nullptr);
     gguf_dense_release(ckpt);
     m.ple_on = ple_on;
     m.build_graphs();
@@ -351,6 +365,7 @@ int main(int argc, char** argv) {
 
   auto ckbase = open_base(base);
   Checkpoint& ckpt = *ckbase;
+  lmhead_base_capture(ckpt);
   for (const auto& o : overlays) ckpt.add_overlay(o.c_str());
   fprintf(stderr, "loaded %zu tensors (base+%zu overlay)\n", ckpt.tensor_count(),
           overlays.size());
@@ -370,6 +385,7 @@ int main(int argc, char** argv) {
   load_arena(ckpt);
 
   GpuModel m(ckpt, maxctx);
+  m.setup_draft_lmhead(g_lmhead_base_ok ? &g_lmhead_base : nullptr);
   gguf_dense_release(ckpt);
   m.ple_on = ple_on;
   m.build_graphs();
@@ -528,7 +544,37 @@ int main(int argc, char** argv) {
               "capture without prefill_batch)\n");
       return 1;
     }
-    std::vector<int> spec_out = m.spec_loop(next_id, spec_gen, gamma);
+    // Offline test hooks for the API decode paths:
+    //   GDEC_SPEC_CHAIN=1   chain drafter (ngram first, MTP fallback), the
+    //                       API default
+    //   GDEC_SPEC_SAMPLE=temp,top_k,top_p,seed[,presence,frequency]
+    //                       rejection-sampled spec
+    // The first token (next_id) stays the prefill argmax.
+    const bool chain = getenv("GDEC_SPEC_CHAIN") && atoi(getenv("GDEC_SPEC_CHAIN"));
+    std::vector<int> spec_out;
+    if (const char* ss = getenv("GDEC_SPEC_SAMPLE")) {
+      serve::HostSampler smp;
+      smp.temp = 1.0f;
+      smp.top_k = 20;
+      smp.top_p = 0.95f;
+      smp.min_p = 0.0f;
+      smp.presence = smp.frequency = 0.0f;
+      unsigned long long seed = 1;
+      if (sscanf(ss, "%f,%d,%f,%llu,%f,%f", &smp.temp, &smp.top_k, &smp.top_p, &seed,
+                 &smp.presence, &smp.frequency) < 1) {
+        fprintf(stderr, "GDEC_SPEC_SAMPLE expects temp,top_k,top_p,seed[,presence,frequency]\n");
+        return 2;
+      }
+      smp.rng = seed;
+      fprintf(stderr, "spec-gen sample: temp=%g top_k=%d top_p=%g seed=%llu presence=%g "
+              "frequency=%g chain=%d\n", smp.temp, smp.top_k, smp.top_p, seed,
+              smp.presence, smp.frequency, (int)chain);
+      spec_out = chain ? m.spec_loop_chain_sample(next_id, spec_gen, gamma, smp, true)
+                       : m.spec_loop_sample(next_id, spec_gen, gamma, smp);
+    } else {
+      spec_out = chain ? m.spec_loop_chain(next_id, spec_gen, gamma)
+                       : m.spec_loop(next_id, spec_gen, gamma);
+    }
     printf("ids:");
     for (int t : tokens) printf(" %d", t);
     printf(" %d", next_id);

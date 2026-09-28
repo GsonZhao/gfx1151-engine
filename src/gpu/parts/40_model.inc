@@ -62,6 +62,12 @@ struct GpuModel {
   }
   int* d_iselected = nullptr;
   int index_blocks = 0;
+  // Draft lm_head override (default on, GDEC_DRAFT_LM_Q4=0 opts out): when an
+  // overlay upgraded lm_head to a wider dtype, drafting reads the base file's
+  // 4-bit copy instead (~0.5x bytes per draft step). Verify/output exactness
+  // is unchanged -- only the proposal distribution shifts slightly.
+  WView w_dlm{};
+  bool dlm_on = false;
   // Paged QSA KV (memory model Phase A1). The trunk FP32 KV cache (d_kc/d_vc)
   // and indexer keys (d_ik) are addressed through a logical->physical page
   // table (KV_PAGE = 256 tokens = 64 indexer blocks; one table shared by all
@@ -342,6 +348,35 @@ struct GpuModel {
   size_t ckpt_S = 0, ckpt_convst = 0, ckpt_ring = 0, ckpt_iraw = 0;
   float* d_mring_ckpt = nullptr;  // 512 floats
   int* d_argmax_arr = nullptr;    // per-row verify argmax (<= 65 rows)
+  unsigned long long* d_amx_cand = nullptr;  // two-stage argmax scratch
+  // GPU sampling prep (spec sampling fast path): correction lists, radix
+  // top-k scratch and per-row candidate blocks. Rows are capped at 65 (ngram
+  // <= 64 + 1); the dense path stays as fallback (top_k unset/>64, candidate
+  // overflow, GDEC_SMS_GPU=0).
+  static constexpr int SMS_ROWS = 65, SMS_TCAP = 512, SMS_PCAP = 64;
+  static constexpr int SMS_BIAS_CAP = 20480, SMS_HIST_CAP = 120000;
+  int* d_sm_ctrl = nullptr;        // [SMS_ROWS][8]
+  unsigned* d_sm_hist = nullptr;   // [SMS_ROWS][4096]
+  int* d_sm_cand_ids = nullptr;    // [SMS_ROWS][SMS_TCAP]
+  float* d_sm_cand_vals = nullptr; // [SMS_ROWS][SMS_TCAP]
+  int* d_sm_cand_n = nullptr;      // [SMS_ROWS]
+  int* d_sm_bids = nullptr;        // bias list (shared per round)
+  float* d_sm_bvals = nullptr;
+  int* d_sm_hids = nullptr;        // penalty list from sampler hist (shared)
+  float* d_sm_hvals = nullptr;
+  int* d_sm_pids = nullptr;        // per-row draft-prefix penalties
+  float* d_sm_pvals = nullptr;     // [SMS_ROWS][SMS_PCAP]
+  int* d_sm_pn = nullptr;          // [SMS_ROWS]
+  float* d_sm_scratch = nullptr;   // corrected-logits copy (lazy, corr only)
+  int sm_nb = 0, sm_nh = 0;        // uploaded shared correction counts
+  std::vector<int> h_sm_ids;       // D2H landing + host truncation staging
+  std::vector<float> h_sm_vals;
+  std::vector<int> h_sm_ci;        // shared-correction upload staging
+  std::vector<float> h_sm_cv;
+  std::vector<int> h_sm_pi;        // prefix upload staging (separate: the
+  std::vector<float> h_sm_pv;      //   shared H2D may still be in flight)
+  std::vector<int> sms_out_ids;    // truncated top-k results [rows][k]
+  std::vector<float> sms_out_vals;
   // Rollback snapshots (spec verify): S/convst per accepted depth, indexer
   // proj rows per QSA layer. Written only when spec_snap is set.
   float* d_Ssnap = nullptr;    // [maxbatch+1][ngdn][48*128*128]
@@ -521,6 +556,21 @@ struct GpuModel {
     // rows at most. Keep logits independent of the much larger prefill chunk.
     DALLOC(&d_logits_b, (size_t)g_cfg.vocab * 4 * 65);
     DALLOC(&d_argmax_arr, 65 * sizeof(int));
+    DALLOC(&d_amx_cand, 65 * ARGMAX_B1 * sizeof(unsigned long long));
+    DALLOC(&d_sm_ctrl, SMS_ROWS * 8 * sizeof(int));
+    DALLOC(&d_sm_hist, (size_t)SMS_ROWS * 4096 * sizeof(unsigned));
+    DALLOC(&d_sm_cand_ids, (size_t)SMS_ROWS * SMS_TCAP * sizeof(int));
+    DALLOC(&d_sm_cand_vals, (size_t)SMS_ROWS * SMS_TCAP * sizeof(float));
+    DALLOC(&d_sm_cand_n, SMS_ROWS * sizeof(int));
+    DALLOC(&d_sm_bids, SMS_BIAS_CAP * sizeof(int));
+    DALLOC(&d_sm_bvals, SMS_BIAS_CAP * sizeof(float));
+    DALLOC(&d_sm_hids, SMS_HIST_CAP * sizeof(int));
+    DALLOC(&d_sm_hvals, SMS_HIST_CAP * sizeof(float));
+    DALLOC(&d_sm_pids, (size_t)SMS_ROWS * SMS_PCAP * sizeof(int));
+    DALLOC(&d_sm_pvals, (size_t)SMS_ROWS * SMS_PCAP * sizeof(float));
+    DALLOC(&d_sm_pn, SMS_ROWS * sizeof(int));
+    h_sm_ids.resize((size_t)SMS_ROWS * SMS_TCAP);
+    h_sm_vals.resize((size_t)SMS_ROWS * SMS_TCAP);
     // Trunk checkpoint belongs to the verifier, independently of MTP weights.
     {
       int ngdn = g_cfg.layers - g_cfg.layers / 4;
@@ -847,6 +897,31 @@ struct GpuModel {
     CK(hipMemcpy(p, tmp.data(), 256 * 4, hipMemcpyHostToDevice));
     hcnorm_cache_[name] = p;
     return p;
+  }
+
+  // Draft lm_head override: keep a private device copy of the BASE file's
+  // q4cp lm_head when an overlay replaced it with a wider dtype. Drafting
+  // reads it instead (~0.5x bytes per draft step); verify and serial decode
+  // still use the production lm_head, so committed outputs are unchanged.
+  void setup_draft_lmhead(const Tensor* base_lm) {
+    if (env_zero("GDEC_DRAFT_LM_Q4") || !base_lm || base_lm->dtype != 5) return;
+    const Tensor& cur = ckpt.at("lm_head.weight");
+    if (cur.data == base_lm->data) return;  // no overlay override
+    uint64_t cols = base_lm->dims[base_lm->ndims - 1];
+    uint64_t rows = base_lm->numel() / cols;
+    if (rows != (uint64_t)g_cfg.vocab || cols != (uint64_t)g_cfg.d) return;
+    uint8_t* p = nullptr;
+    DALLOC(&p, base_lm->data_size);
+    CK(hipMemcpy(p, base_lm->data, base_lm->data_size, hipMemcpyHostToDevice));
+    w_dlm.dtype = base_lm->dtype;
+    w_dlm.data = p;
+    w_dlm.rows = rows;
+    w_dlm.cols = cols;
+    w_dlm.scale_stride = ((cols / 32 * 2) + 15) & ~15ull;
+    dlm_on = true;
+    fprintf(stderr,
+            "draft lm_head: base q4cp %.0f MiB (overlay dtype %d skipped for drafts)\n",
+            base_lm->data_size / 1048576.0, (int)cur.dtype);
   }
 
   // ---- M-RoPE (vision) ----
@@ -1647,7 +1722,7 @@ struct GpuModel {
   void enq_final() {
     gr_read("hyper_connection_mixer", d_x /*h*/);
     gemv(wview(ckpt.at("lm_head.weight")), d_x, d_logits);
-    k_argmax<<<1, 1024, 0, g_str>>>(d_logits, g_cfg.vocab, d_argmax);
+    argmax_rows(d_logits, g_cfg.vocab, 1, d_amx_cand, d_argmax, g_str);
   }
 
   // =================== prefill batch (Phase 3a) ==============================
@@ -4120,7 +4195,8 @@ struct GpuModel {
   // One full MTP draft step: appends (tap, tok) at mtp_pos. Greedy callers get
   // the argmax; sampling callers request the full logits instead.
   int mtp_step(const float* tap, int tok,
-               std::vector<float>* host_logits = nullptr) {
+               std::vector<float>* host_logits = nullptr,
+               bool argmax_out = true) {
     // B0: row mtp_pos is in the shared pool; drafts run ahead of the trunk
     // (rows pos-1 .. pos+gamma-2), so map / un-share the page first
     kv_prepare(mtp_pos, mtp_pos + 1);
@@ -4134,14 +4210,14 @@ struct GpuModel {
     mtp_moe(d_x, d_y);
     mtp_gr_write("mtp.layers.0.mlp_hyper_connection", d_y);
     mtp_gr_read("mtp.hyper_connection_mixer", d_x);
-    gemv(wview(ckpt.at("lm_head.weight")), d_x, d_logits);
+    gemv(dlm_on ? w_dlm : wview(ckpt.at("lm_head.weight")), d_x, d_logits);
     int id = -1;
     if (host_logits) {
       host_logits->resize(g_cfg.vocab);
       CK(hipMemcpy(host_logits->data(), d_logits, (size_t)g_cfg.vocab * 4,
                    hipMemcpyDeviceToHost));
-    } else {
-      k_argmax<<<1, 1024, 0, g_str>>>(d_logits, g_cfg.vocab, d_argmax);
+    } else if (argmax_out) {
+      argmax_rows(d_logits, g_cfg.vocab, 1, d_amx_cand, d_argmax, g_str);
       CK(hipMemcpy(&id, d_argmax, 4, hipMemcpyDeviceToHost));
     }
     mtp_pos++;
@@ -4581,10 +4657,226 @@ struct GpuModel {
   // Greedy reduction of the same batched logits.
   void batch_argmax(int P, int* host) {
     batch_logits_device(P);
-    for (int r = 0; r < P; r++)
-      k_argmax<<<1, 1024, 0, g_str>>>(d_logits_b + (size_t)r * g_cfg.vocab,
-                                      g_cfg.vocab, d_argmax_arr + r);
+    argmax_rows(d_logits_b, g_cfg.vocab, P, d_amx_cand, d_argmax_arr, g_str);
     CK(hipMemcpy(host, d_argmax_arr, P * 4, hipMemcpyDeviceToHost));
+  }
+
+  // ---- GPU sampling prep (spec sampling fast path) ----
+  // Corrections (bias/penalties) and the top-k pre-filter of
+  // HostSampler::prepare run on device; only k (id, logit) pairs per row come
+  // back and the host replays the remaining filter chain on them. The
+  // distribution is unchanged; candidate order is (value desc, id asc)
+  // instead of nth_element's arbitrary order, so same-seed draws can differ
+  // from the dense path (allowed: nth_element never promised an order).
+  template <typename Sampler>
+  bool sms_gpu_active(const Sampler& s) const {
+    static const bool off =
+        getenv("GDEC_SMS_GPU") && atoi(getenv("GDEC_SMS_GPU")) == 0;
+    if (off) return false;
+    if (s.top_k <= 0 || s.top_k > 64 || s.top_k >= g_cfg.vocab) return false;
+    if ((int)s.bias.size() > SMS_BIAS_CAP) return false;
+    if (s.bias.size() > 1) {
+      // The GPU bias phase applies entries in parallel; duplicate ids would
+      // race instead of adding sequentially, so those requests stay dense.
+      std::vector<int> ids;
+      ids.reserve(s.bias.size());
+      for (auto& b : s.bias) ids.push_back(b.first);
+      std::sort(ids.begin(), ids.end());
+      for (size_t i = 1; i < ids.size(); i++)
+        if (ids[i] == ids[i - 1]) return false;
+    }
+    return true;
+  }
+
+  // Upload the round-shared correction lists (bias, then hist penalties).
+  // False when the hist overflows the buffer: caller uses the dense path.
+  template <typename Sampler>
+  bool sms_round_shared(const Sampler& s) {
+    if ((int)sms_out_ids.size() < SMS_ROWS * s.top_k) {
+      sms_out_ids.resize((size_t)SMS_ROWS * s.top_k);
+      sms_out_vals.resize((size_t)SMS_ROWS * s.top_k);
+    }
+    sm_nb = (int)s.bias.size();
+    sm_nh = 0;
+    const bool pen = (s.presence != 0.0f || s.frequency != 0.0f);
+    if (pen) {
+      if ((int)s.hist.size() > SMS_HIST_CAP) return false;
+      sm_nh = (int)s.hist.size();
+    }
+    if (!sm_nb && !sm_nh) return true;
+    h_sm_ci.clear();
+    h_sm_cv.clear();
+    for (auto& b : s.bias) {
+      h_sm_ci.push_back(b.first);
+      h_sm_cv.push_back(b.second);
+    }
+    if (sm_nb) {
+      CK(hipMemcpyAsync(d_sm_bids, h_sm_ci.data(), sm_nb * 4,
+                        hipMemcpyHostToDevice, g_str));
+      CK(hipMemcpyAsync(d_sm_bvals, h_sm_cv.data(), sm_nb * 4,
+                        hipMemcpyHostToDevice, g_str));
+    }
+    if (sm_nh) {
+      for (auto& h : s.hist) {
+        h_sm_ci.push_back(h.first);
+        h_sm_cv.push_back(s.presence + s.frequency * (float)h.second);
+      }
+      CK(hipMemcpyAsync(d_sm_hids, h_sm_ci.data() + sm_nb, sm_nh * 4,
+                        hipMemcpyHostToDevice, g_str));
+      CK(hipMemcpyAsync(d_sm_hvals, h_sm_cv.data() + sm_nb, sm_nh * 4,
+                        hipMemcpyHostToDevice, g_str));
+    }
+    return true;
+  }
+
+  // Per-row draft-prefix penalties. Walk row a (flat draft index base_off+a)
+  // is only prepared when drafts[0..base_off+a) were all drawn before it, so
+  // its penalty hist counts include exactly those. An id already in the base
+  // hist gains only frequency * extra (presence came with the shared list);
+  // a new id costs presence + frequency * count. The shared+prefix split
+  // rounds differently from prepare()'s single merged subtraction by ~1 ulp;
+  // the sampling path is distribution-gated, not bit-gated.
+  // Returns whether any prefix list is nonempty.
+  template <typename Sampler>
+  bool sms_prefix_upload(const Sampler& s, const int* drafts, int base_off,
+                         int rows) {
+    const bool pen = (s.presence != 0.0f || s.frequency != 0.0f);
+    if (!pen) return false;
+    std::vector<int> pn(rows, 0);
+    h_sm_pi.assign((size_t)rows * SMS_PCAP, 0);
+    h_sm_pv.assign((size_t)rows * SMS_PCAP, 0.0f);
+    bool any = false;
+    for (int a = 0; a < rows; a++) {
+      const int nd = std::min(base_off + a, SMS_PCAP);
+      int used = 0;
+      int* rids = h_sm_pi.data() + (size_t)a * SMS_PCAP;
+      float* rvals = h_sm_pv.data() + (size_t)a * SMS_PCAP;
+      for (int j = 0; j < nd; j++) {
+        const int id = drafts[j];
+        int slot = -1;
+        for (int u = 0; u < used; u++)
+          if (rids[u] == id) { slot = u; break; }
+        if (slot < 0) {
+          slot = used++;
+          rids[slot] = id;
+          rvals[slot] = s.hist.count(id) ? 0.0f : s.presence;
+        }
+        rvals[slot] += s.frequency;
+      }
+      pn[a] = used;
+      if (used) any = true;
+    }
+    if (!any) return false;
+    CK(hipMemcpyAsync(d_sm_pids, h_sm_pi.data(), (size_t)rows * SMS_PCAP * 4,
+                      hipMemcpyHostToDevice, g_str));
+    CK(hipMemcpyAsync(d_sm_pvals, h_sm_pv.data(), (size_t)rows * SMS_PCAP * 4,
+                      hipMemcpyHostToDevice, g_str));
+    CK(hipMemcpyAsync(d_sm_pn, pn.data(), rows * 4, hipMemcpyHostToDevice,
+                      g_str));
+    return true;
+  }
+
+  // Corrections + two-pass radix top-k + collect for `rows` logit rows
+  // (stride floats each), then D2H and an exact top-k truncation ordered by
+  // (value desc, id asc). On success out_ids/out_vals hold rows*k pairs.
+  // Returns false on candidate overflow: the caller re-runs the dense path
+  // (logits may already carry corrections, so the dense path must regenerate
+  // or read a pristine copy -- hence the scratch bounce when corrections
+  // exist).
+  bool sms_topk_rows(float* x, int stride, int rows, int k, bool use_pfx,
+                     int* out_ids, float* out_vals) {
+    float* src = x;
+    if (sm_nb > 0 || sm_nh > 0 || use_pfx) {
+      if (!d_sm_scratch)
+        DALLOC(&d_sm_scratch, (size_t)SMS_ROWS * g_cfg.vocab * 4);
+      CK(hipMemcpyAsync(d_sm_scratch, x, (size_t)rows * stride * 4,
+                        hipMemcpyDeviceToDevice, g_str));
+      k_corr_apply<<<dim3(1, rows), 256, 0, g_str>>>(
+          d_sm_scratch, stride, d_sm_bids, d_sm_bvals, sm_nb, d_sm_hids,
+          d_sm_hvals, sm_nh, d_sm_pids, d_sm_pvals,
+          use_pfx ? d_sm_pn : nullptr, SMS_PCAP);
+      src = d_sm_scratch;
+    }
+    k_tk_init<<<rows, 32, 0, g_str>>>(d_sm_ctrl, k);
+    CK(hipMemsetAsync(d_sm_hist, 0, (size_t)rows * 4096 * sizeof(unsigned),
+                      g_str));
+    k_tk_hist<0><<<dim3(8, rows), 256, 0, g_str>>>(src, stride, stride,
+                                                   d_sm_ctrl, d_sm_hist);
+    k_tk_scan<0><<<dim3(1, rows), 256, 0, g_str>>>(d_sm_hist, d_sm_ctrl,
+                                                   d_sm_cand_n);
+    CK(hipMemsetAsync(d_sm_hist, 0, (size_t)rows * 4096 * sizeof(unsigned),
+                      g_str));
+    k_tk_hist<1><<<dim3(8, rows), 256, 0, g_str>>>(src, stride, stride,
+                                                   d_sm_ctrl, d_sm_hist);
+    k_tk_scan<1><<<dim3(1, rows), 256, 0, g_str>>>(d_sm_hist, d_sm_ctrl,
+                                                   d_sm_cand_n);
+    k_tk_collect<<<dim3(8, rows), 256, 0, g_str>>>(
+        src, stride, stride, d_sm_ctrl, d_sm_cand_ids, d_sm_cand_vals,
+        d_sm_cand_n, SMS_TCAP);
+    std::vector<int> cn(rows);
+    CK(hipMemcpy(cn.data(), d_sm_cand_n, rows * 4, hipMemcpyDeviceToHost));
+    for (int r = 0; r < rows; r++)
+      if (cn[r] < k || cn[r] > SMS_TCAP) return false;
+    CK(hipMemcpy(h_sm_ids.data(), d_sm_cand_ids, (size_t)rows * SMS_TCAP * 4,
+                 hipMemcpyDeviceToHost));
+    CK(hipMemcpy(h_sm_vals.data(), d_sm_cand_vals,
+                 (size_t)rows * SMS_TCAP * 4, hipMemcpyDeviceToHost));
+    std::vector<int> ord;
+    for (int r = 0; r < rows; r++) {
+      const int m = cn[r];
+      const int* ids = h_sm_ids.data() + (size_t)r * SMS_TCAP;
+      const float* vals = h_sm_vals.data() + (size_t)r * SMS_TCAP;
+      ord.resize(m);
+      for (int j = 0; j < m; j++) ord[j] = j;
+      std::sort(ord.begin(), ord.end(), [&](int a, int b) {
+        if (vals[a] != vals[b]) return vals[a] > vals[b];
+        return ids[a] < ids[b];
+      });
+      for (int j = 0; j < k; j++) {
+        out_ids[(size_t)r * k + j] = ids[ord[j]];
+        out_vals[(size_t)r * k + j] = vals[ord[j]];
+      }
+    }
+    return true;
+  }
+
+  // prepare_sparse on candidate row `row` (draft: row 0 of the d_logits
+  // pass). GDEC_SMS_CHECK=1 also replays the dense prepare() on the raw
+  // logits row and compares the two distributions (support + probabilities).
+  template <typename Sampler>
+  void sms_prep(Sampler& s, int row, bool draft,
+                typename Sampler::SDist& out) {
+    const int k = s.top_k;
+    s.prepare_sparse(sms_out_ids.data() + (size_t)row * k,
+                     sms_out_vals.data() + (size_t)row * k, k, out);
+    static const bool chk = getenv("GDEC_SMS_CHECK") != nullptr;
+    if (!chk) return;
+    static long n = 0, bad = 0;
+    static double maxd = 0, maxout = 0;
+    std::vector<float> v(g_cfg.vocab);
+    const float* src = draft ? d_logits : d_logits_b + (size_t)row * g_cfg.vocab;
+    CK(hipMemcpy(v.data(), src, (size_t)g_cfg.vocab * 4, hipMemcpyDeviceToHost));
+    Sampler c = s;
+    c.prepare(v);
+    double d = 0, in = 0;
+    for (size_t j = 0; j < out.ids.size(); j++) {
+      d = std::max(d, (double)fabsf(v[out.ids[j]] - out.pr[j]));
+      in += v[out.ids[j]];
+    }
+    int dn = 0;
+    for (int i = 0; i < g_cfg.vocab; i++) dn += v[i] > 0.0f;
+    const double o = fabs(1.0 - in);
+    n++;
+    maxd = std::max(maxd, d);
+    maxout = std::max(maxout, o);
+    const bool b = d > 1e-5 || o > 1e-5 || dn != (int)out.ids.size();
+    if (b) {
+      bad++;
+      fprintf(stderr, "[sms-check] MISMATCH %s row %d: maxdiff %.3g outside %.3g support dense %d sparse %zu\n",
+              draft ? "draft" : "verify", row, d, o, dn, out.ids.size());
+    }
+    if (b || n % 32 == 0)
+      fprintf(stderr, "[sms-check] n=%ld bad=%ld maxdiff=%.3g maxoutside=%.3g\n", n, bad, maxd, maxout);
   }
 
   std::vector<int> spec_loop_ngram(int cur, int gen, int gamma,
@@ -5200,14 +5492,43 @@ struct GpuModel {
       Sampler accept_sampler = sampler.fork_stream(
           0x3c6ef372fe94f82aull ^ (uint64_t)(q + 1));
       auto t0 = std::chrono::steady_clock::now();
+      // GPU sampling prep (direction A): corrections + top-k on device, host
+      // replays the filter chain on <= top_k candidates per row. The dense
+      // path remains as fallback (GDEC_SMS_GPU=0, top_k unset/>64, overflow).
+      const bool smg = sms_gpu_active(sampler) && sms_round_shared(sampler);
+      std::vector<typename Sampler::SDist> q_sd(smg ? g : 0);
+      std::vector<char> q_sparse(g, 0);
       for (int j = 0; j < g; j++) {
-        mtp_step(j ? d_mR : d_R, j ? drafts[j - 1] : cur, &q_rows[j]);
-        draft_sampler.prepare(q_rows[j]);
+        bool dense = true;
+        if (smg) {
+          mtp_step(j ? d_mR : d_R, j ? drafts[j - 1] : cur, nullptr, false);
+          if (sms_topk_rows(d_logits, g_cfg.vocab, 1, sampler.top_k, false,
+                            sms_out_ids.data(), sms_out_vals.data())) {
+            dense = false;
+          } else {
+            // Candidate overflow (never expected): corrections touched the
+            // logits in place, so regenerate the raw row before going dense.
+            gemv(dlm_on ? w_dlm : wview(ckpt.at("lm_head.weight")), d_x,
+                 d_logits);
+            q_rows[j].resize(g_cfg.vocab);
+            CK(hipMemcpy(q_rows[j].data(), d_logits, (size_t)g_cfg.vocab * 4,
+                         hipMemcpyDeviceToHost));
+          }
+        } else {
+          mtp_step(j ? d_mR : d_R, j ? drafts[j - 1] : cur, &q_rows[j]);
+        }
         float qlp = 0.0f;
         // Penalties are defined over committed/emitted tokens only. Provisional
         // draft tokens therefore do not enter the proposal sampler's history;
-        // q_rows[j] records exactly the distribution that produced drafts[j].
-        drafts[j] = draft_sampler.draw_prepared(q_rows[j], &qlp, false);
+        // q_rows[j]/q_sd[j] records the distribution that produced drafts[j].
+        if (dense) {
+          draft_sampler.prepare(q_rows[j]);
+          drafts[j] = draft_sampler.draw_prepared(q_rows[j], &qlp, false);
+        } else {
+          sms_prep(draft_sampler, 0, true, q_sd[j]);
+          drafts[j] = draft_sampler.draw_sparse(q_sd[j], &qlp, false);
+          q_sparse[j] = 1;
+        }
         if (j == 0) {
           // MTP indexer state after consuming cur is causal truth. Later
           // speculative draft steps are discarded before committed ingest.
@@ -5223,16 +5544,53 @@ struct GpuModel {
       spec_snap = true;
       prefill_batch(vt, q + 1, true, true);
       spec_snap = false;
-      batch_logits(g + 1, verify_logits);
+      bool smg_v = false;
+      if (smg) {
+        const bool pfx = sms_prefix_upload(sampler, drafts.data(), 0, g + 1);
+        batch_logits_device(g + 1);
+        smg_v = sms_topk_rows(d_logits_b, g_cfg.vocab, g + 1, sampler.top_k,
+                              pfx, sms_out_ids.data(), sms_out_vals.data());
+      }
+      if (!smg_v) batch_logits(g + 1, verify_logits);
+      const int smk = sampler.top_k;
 
       Sampler target_view = sampler;
+      std::vector<typename Sampler::SDist> p_sd(smg_v ? g + 1 : 0);
       int a = 0;
+      // q_dense[a]: q_rows[a] holds a real dense distribution. The sparse
+      // draft path leaves q_rows[a] stale, so scatter q_sd[a] when the two
+      // sides disagree (rare per-row fallback mixing).
+      auto q_dense = [&](int r) -> std::vector<float>& {
+        if (q_sparse[r]) {
+          q_sparse[r] = 0;
+          q_rows[r].assign(g_cfg.vocab, 0.0f);
+          for (size_t u = 0; u < q_sd[r].ids.size(); u++)
+            q_rows[r][q_sd[r].ids[u]] = q_sd[r].pr[u];
+        }
+        return q_rows[r];
+      };
       for (; a < g; a++) {
-        std::copy_n(verify_logits.data() + (size_t)a * g_cfg.vocab,
-                    g_cfg.vocab, p_row.data());
-        target_view.prepare(p_row);
-        float px = p_row[drafts[a]];
-        float qx = q_rows[a][drafts[a]];
+        float px, qx;
+        const bool q_sp = q_sparse[a];
+        if (smg_v && q_sp) {
+          sms_prep(target_view, a, false, p_sd[a]);
+          px = Sampler::sdist_prob(p_sd[a], drafts[a]);
+          qx = Sampler::sdist_prob(q_sd[a], drafts[a]);
+        } else {
+          if (smg_v) {
+            // Sparse verify but dense draft row: materialize p densely.
+            sms_prep(target_view, a, false, p_sd[a]);
+            p_row.assign(g_cfg.vocab, 0.0f);
+            for (size_t u = 0; u < p_sd[a].ids.size(); u++)
+              p_row[p_sd[a].ids[u]] = p_sd[a].pr[u];
+          } else {
+            std::copy_n(verify_logits.data() + (size_t)a * g_cfg.vocab,
+                        g_cfg.vocab, p_row.data());
+            target_view.prepare(p_row);
+          }
+          px = p_row[drafts[a]];
+          qx = q_dense(a)[drafts[a]];
+        }
         draft_lps[a] = px > 0.0f ? logf(px) : -INFINITY;
         double threshold = qx > 0.0f ? std::min(1.0, (double)px / qx) : 0.0;
         if (accept_sampler.uniform() >= threshold) break;
@@ -5243,7 +5601,14 @@ struct GpuModel {
       float next_lp = 0.0f;
       target_view.rng = sampler.rng;
       if (a < g) {
-        next = target_view.sample_residual(p_row, q_rows[a], &next_lp);
+        next = (smg_v && q_sparse[a])
+                   ? target_view.sample_residual_sparse(p_sd[a], q_sd[a],
+                                                        &next_lp)
+                   : target_view.sample_residual(p_row, q_dense(a),
+                                                 &next_lp);
+      } else if (smg_v) {
+        sms_prep(target_view, g, false, p_sd[g]);
+        next = target_view.draw_sparse(p_sd[g], &next_lp, false);
       } else {
         std::copy_n(verify_logits.data() + (size_t)g * g_cfg.vocab,
                     g_cfg.vocab, p_row.data());
@@ -5412,6 +5777,8 @@ struct GpuModel {
       std::vector<int> draft =
           want > 0 ? ngram.draft(chist, cur, want) : std::vector<int>{};
       bool stop = false;
+      // GPU sampling prep (direction A) applies to all three legs below.
+      const bool smg = sms_gpu_active(sampler) && sms_round_shared(sampler);
       if (!draft.empty() && ng_legacy) {
         // ---- ngram round: long draft, whole-state checkpoint + replay ----
         const int base = pos;
@@ -5425,20 +5792,36 @@ struct GpuModel {
         tokens.insert(tokens.end(), draft.begin(), draft.end());
         auto t = std::chrono::steady_clock::now();
         verify_ng(tokens, base);
-        batch_logits((int)tokens.size(), verify_logits);
+        const int ngP = (int)tokens.size();
+        bool smg_v = false;
+        if (smg) {
+          const bool pfx = sms_prefix_upload(sampler, draft.data(), 0, ngP);
+          batch_logits_device(ngP);
+          smg_v = sms_topk_rows(d_logits_b, g_cfg.vocab, ngP, sampler.top_k,
+                                pfx, sms_out_ids.data(), sms_out_vals.data());
+        }
+        if (!smg_v) batch_logits(ngP, verify_logits);
+        const int smk = sampler.top_k;
         verify_ms += elapsed(t);
         // Walk the draft rows with a scratch sampler view: accept draft[a]
         // iff it equals this round's draw from row a, else the draw is the
         // correction. keep = committed draft count (emit may stop early).
         Sampler view = sampler;
         const size_t committed0 = out.size();
+        std::vector<typename Sampler::SDist> p_sd(smg_v ? ngP : 0);
         int a = 0, next = -1;
         float next_lp = 0.0f;
         for (; a < (int)draft.size(); a++) {
-          std::copy_n(verify_logits.data() + (size_t)a * g_cfg.vocab,
-                      g_cfg.vocab, p_row.data());
+          int s;
           float lp_a = 0.0f;
-          int s = view.sample(p_row, &lp_a);
+          if (smg_v) {
+            sms_prep(view, a, false, p_sd[a]);
+            s = view.draw_sparse(p_sd[a], &lp_a, true);
+          } else {
+            std::copy_n(verify_logits.data() + (size_t)a * g_cfg.vocab,
+                        g_cfg.vocab, p_row.data());
+            s = view.sample(p_row, &lp_a);
+          }
           if (s != draft[a]) {
             next = s;
             next_lp = lp_a;
@@ -5451,10 +5834,15 @@ struct GpuModel {
         if (!stop) {
           if (next < 0) {
             // Full accept: the bonus row continues the sequence.
-            std::copy_n(verify_logits.data() +
-                            (size_t)draft.size() * g_cfg.vocab,
-                        g_cfg.vocab, p_row.data());
-            next = view.sample(p_row, &next_lp);
+            if (smg_v) {
+              sms_prep(view, draft.size(), false, p_sd[draft.size()]);
+              next = view.draw_sparse(p_sd[draft.size()], &next_lp, true);
+            } else {
+              std::copy_n(verify_logits.data() +
+                              (size_t)draft.size() * g_cfg.vocab,
+                          g_cfg.vocab, p_row.data());
+              next = view.sample(p_row, &next_lp);
+            }
           }
           if (emit && !emit(next, next_lp)) stop = true;
           else out.push_back(next);
@@ -5521,15 +5909,34 @@ struct GpuModel {
                         draft.begin() + di + cs);
           auto t = std::chrono::steady_clock::now();
           verify_ng(tokens, base);
-          batch_logits((int)tokens.size(), verify_logits);
+          const int ngP = (int)tokens.size();
+          bool smg_v = false;
+          if (smg) {
+            // Row a of this chunk is prepared with draft[0..di+a) in the
+            // penalty history (the walk only reaches it via matching draws).
+            const bool pfx = sms_prefix_upload(sampler, draft.data(), di, ngP);
+            batch_logits_device(ngP);
+            smg_v =
+                sms_topk_rows(d_logits_b, g_cfg.vocab, ngP, sampler.top_k,
+                              pfx, sms_out_ids.data(), sms_out_vals.data());
+          }
+          if (!smg_v) batch_logits(ngP, verify_logits);
+          const int smk = sampler.top_k;
           verify_ms += elapsed(t);
+          std::vector<typename Sampler::SDist> p_sd(smg_v ? ngP : 0);
           cont = -1;
           int a = 0;
           for (; a < cs; a++) {
-            std::copy_n(verify_logits.data() + (size_t)a * g_cfg.vocab,
-                        g_cfg.vocab, p_row.data());
+            int s;
             float lp_a = 0.0f;
-            int s = view.sample(p_row, &lp_a);
+            if (smg_v) {
+              sms_prep(view, a, false, p_sd[a]);
+              s = view.draw_sparse(p_sd[a], &lp_a, true);
+            } else {
+              std::copy_n(verify_logits.data() + (size_t)a * g_cfg.vocab,
+                          g_cfg.vocab, p_row.data());
+              s = view.sample(p_row, &lp_a);
+            }
             if (s != draft[di + a]) { cont = s; cont_lp = lp_a; break; }
             if (emit && !emit(draft[di + a], lp_a)) { stop = true; break; }
             out.push_back(draft[di + a]);
@@ -5538,9 +5945,14 @@ struct GpuModel {
           if (!stop) {
             if (cont < 0) {
               // Full chunk accept: the bonus row continues the sequence.
-              std::copy_n(verify_logits.data() + (size_t)cs * g_cfg.vocab,
-                          g_cfg.vocab, p_row.data());
-              cont = view.sample(p_row, &cont_lp);
+              if (smg_v) {
+                sms_prep(view, cs, false, p_sd[cs]);
+                cont = view.draw_sparse(p_sd[cs], &cont_lp, true);
+              } else {
+                std::copy_n(verify_logits.data() + (size_t)cs * g_cfg.vocab,
+                            g_cfg.vocab, p_row.data());
+                cont = view.sample(p_row, &cont_lp);
+              }
             }
             if (emit && !emit(cont, cont_lp)) stop = true;
             else out.push_back(cont);
@@ -5612,13 +6024,39 @@ struct GpuModel {
         Sampler accept_sampler = sampler.fork_stream(
             0x3c6ef372fe94f82aull ^ (uint64_t)(q + 1));
         auto t = std::chrono::steady_clock::now();
+        // GPU sampling prep (direction A), as in spec_loop_sample.
+        std::vector<typename Sampler::SDist> q_sd(smg ? g : 0);
+        std::vector<char> q_sparse(g, 0);
         for (int j = 0; j < g; j++) {
-          mtp_step(j ? d_mR : d_R, j ? drafts[j - 1] : cur, &q_rows[j]);
-          draft_sampler.prepare(q_rows[j]);
+          bool dense = true;
+          if (smg) {
+            mtp_step(j ? d_mR : d_R, j ? drafts[j - 1] : cur, nullptr, false);
+            if (sms_topk_rows(d_logits, g_cfg.vocab, 1, sampler.top_k, false,
+                              sms_out_ids.data(), sms_out_vals.data())) {
+              dense = false;
+            } else {
+              // Candidate overflow: regenerate the raw row, then go dense.
+              gemv(dlm_on ? w_dlm : wview(ckpt.at("lm_head.weight")), d_x,
+                   d_logits);
+              q_rows[j].resize(g_cfg.vocab);
+              CK(hipMemcpy(q_rows[j].data(), d_logits,
+                           (size_t)g_cfg.vocab * 4, hipMemcpyDeviceToHost));
+            }
+          } else {
+            mtp_step(j ? d_mR : d_R, j ? drafts[j - 1] : cur, &q_rows[j]);
+          }
           // Provisional drafts stay out of the penalty history (as
-          // spec_loop_sample): q_rows[j] records the producing distribution.
-          drafts[j] =
-              draft_sampler.draw_prepared(q_rows[j], &draft_lps[j], false);
+          // spec_loop_sample): q_rows[j]/q_sd[j] records the distribution.
+          if (dense) {
+            draft_sampler.prepare(q_rows[j]);
+            drafts[j] =
+                draft_sampler.draw_prepared(q_rows[j], &draft_lps[j], false);
+          } else {
+            sms_prep(draft_sampler, 0, true, q_sd[j]);
+            drafts[j] =
+                draft_sampler.draw_sparse(q_sd[j], &draft_lps[j], false);
+            q_sparse[j] = 1;
+          }
           if (j == 0) {
             // Draft 1's indexer ring rows are truth; later drafts pollute.
             CK(hipMemcpyAsync(d_mring_ckpt, d_miraw, 512 * 4,
@@ -5632,16 +6070,50 @@ struct GpuModel {
         spec_snap = true;  // capture per-row rollback snapshots during verify
         prefill_batch(vt, q + 1, true, true);
         spec_snap = false;
-        batch_logits(g + 1, verify_logits);
+        bool smg_v = false;
+        if (smg) {
+          const bool pfx = sms_prefix_upload(sampler, drafts.data(), 0, g + 1);
+          batch_logits_device(g + 1);
+          smg_v = sms_topk_rows(d_logits_b, g_cfg.vocab, g + 1, sampler.top_k,
+                                pfx, sms_out_ids.data(), sms_out_vals.data());
+        }
+        if (!smg_v) batch_logits(g + 1, verify_logits);
+        const int smk = sampler.top_k;
         verify_ms += elapsed(t);
         Sampler target_view = sampler;
+        std::vector<typename Sampler::SDist> p_sd(smg_v ? g + 1 : 0);
         int a = 0;
+        auto q_dense = [&](int r) -> std::vector<float>& {
+          if (q_sparse[r]) {
+            q_sparse[r] = 0;
+            q_rows[r].assign(g_cfg.vocab, 0.0f);
+            for (size_t u = 0; u < q_sd[r].ids.size(); u++)
+              q_rows[r][q_sd[r].ids[u]] = q_sd[r].pr[u];
+          }
+          return q_rows[r];
+        };
         for (; a < g; a++) {
-          std::copy_n(verify_logits.data() + (size_t)a * g_cfg.vocab,
-                      g_cfg.vocab, p_row.data());
-          target_view.prepare(p_row);
-          float px = p_row[drafts[a]];
-          float qx = q_rows[a][drafts[a]];
+          float px, qx;
+          const bool q_sp = q_sparse[a];
+          if (smg_v && q_sp) {
+            sms_prep(target_view, a, false, p_sd[a]);
+            px = Sampler::sdist_prob(p_sd[a], drafts[a]);
+            qx = Sampler::sdist_prob(q_sd[a], drafts[a]);
+          } else {
+            if (smg_v) {
+              // Sparse verify but dense draft row: materialize p densely.
+              sms_prep(target_view, a, false, p_sd[a]);
+              p_row.assign(g_cfg.vocab, 0.0f);
+              for (size_t u = 0; u < p_sd[a].ids.size(); u++)
+                p_row[p_sd[a].ids[u]] = p_sd[a].pr[u];
+            } else {
+              std::copy_n(verify_logits.data() + (size_t)a * g_cfg.vocab,
+                          g_cfg.vocab, p_row.data());
+              target_view.prepare(p_row);
+            }
+            px = p_row[drafts[a]];
+            qx = q_dense(a)[drafts[a]];
+          }
           draft_lps[a] = px > 0.0f ? logf(px) : -INFINITY;
           double threshold = qx > 0.0f ? std::min(1.0, (double)px / qx) : 0.0;
           if (accept_sampler.uniform() >= threshold) break;
@@ -5651,7 +6123,14 @@ struct GpuModel {
         float next_lp = 0.0f;
         target_view.rng = sampler.rng;
         if (a < g) {
-          next = target_view.sample_residual(p_row, q_rows[a], &next_lp);
+          next = (smg_v && q_sparse[a])
+                     ? target_view.sample_residual_sparse(p_sd[a], q_sd[a],
+                                                          &next_lp)
+                     : target_view.sample_residual(p_row, q_dense(a),
+                                                   &next_lp);
+        } else if (smg_v) {
+          sms_prep(target_view, g, false, p_sd[g]);
+          next = target_view.draw_sparse(p_sd[g], &next_lp, false);
         } else {
           std::copy_n(verify_logits.data() + (size_t)g * g_cfg.vocab,
                       g_cfg.vocab, p_row.data());

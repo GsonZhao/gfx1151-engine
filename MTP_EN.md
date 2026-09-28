@@ -43,3 +43,21 @@ Focus on tok/s, commit/round, depth acc, and draft/verify/rollback times. The `1
 The overall acceptance rate in the logs is accepted drafts / proposed drafts. Shortening gamma often makes this percentage look better without necessarily making generation faster. For example, at gamma=3 with a 30% acceptance rate, about 0.9 drafts are accepted on average; adding the verification token for each round gives roughly 1.9 tokens/round (ignoring truncation at the end).
 
 If the first draft has a high acceptance rate and the next two drop off quickly, try gamma=1/2 first; if even the first item is very low, shortening the length mainly reduces waste, and you should also compare whether serial is faster. In the end, choose based on stable actual generation tok/s and output quality, not on acceptance rate alone.
+
+## Decode speed-up switches and offline testing
+
+All on by default; turn off only for troubleshooting:
+
+| Switch | Effect |
+|---|---|
+| `GDEC_SMS_GPU=0` | Disable GPU sampling prep (bias/penalty corrections + top-k on the GPU, only candidates copied back; active for top_k 1..64, otherwise the host full-vocab path is used). Output distribution unchanged; the exact tokens for a given seed may differ |
+| `GDEC_DRAFT_LM_Q4=0` | Drafts use the production lm_head again (default: the base file's 4-bit copy; affects drafts only, never committed tokens; ~350 MB extra VRAM) |
+| `GDEC_ARGMAX_OLD=1` | Single-block argmax (differs only on exact ties) |
+
+Offline reproduction of the API decode paths (`--spec-gen N`, or `tools/pp_prod.sh <tok> LABEL SPEC=256 ...`):
+
+- `GDEC_SPEC_CHAIN=1`: chain drafter (API default); unset = pure MTP.
+- `GDEC_SPEC_SAMPLE=temp,top_k,top_p,seed[,presence,frequency]`: rejection-sampling mode; unset = greedy.
+- `GDEC_SMS_CHECK=1`: compare the GPU sparse distribution with the host full-vocab `prepare()` on every row, printing `[sms-check] n=… bad=…` (slow; verification only).
+
+One-shot check: `bash tools/tg_verify.sh` (kernel unit test + greedy token identity + sampling distribution self-check + sampling speed, ends in PASS/FAIL).

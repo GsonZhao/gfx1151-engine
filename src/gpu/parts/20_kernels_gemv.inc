@@ -223,9 +223,9 @@ __global__ void k_bf16_gemv_mr(const uint16_t* __restrict__ w,
 }
 
 // --- q8g64 multi-row GEMV (overlay o_proj): [codes uint8 x cols][(s,m) fp16 per 64] ---
-template <int P>
+template <int P, bool XBF16 = false>
 __global__ void k_q8g64_gemv_mr(const uint8_t* __restrict__ w,
-                                const float* __restrict__ x,
+                                const void* __restrict__ x,
                                 float* __restrict__ y, uint64_t rows,
                                 uint64_t cols, uint64_t xstride) {
   uint64_t stride = cols + cols / 64 * 4;
@@ -255,16 +255,32 @@ __global__ void k_q8g64_gemv_mr(const uint8_t* __restrict__ w,
     }
 #pragma unroll
     for (int p = 0; p < P; p++) {
-      const float* xg = x + (size_t)p * xstride + g * 64;
       float b0 = 0.f, b1 = 0.f, xs = 0.f;
+      if (XBF16) {
+        const uint16_t* xg = (const uint16_t*)x + (size_t)p * xstride + g * 64;
 #pragma unroll
-      for (int j = 0; j < 64; j += 4) {
-        float4 t = *(const float4*)(xg + j);
-        b0 += (float)c0[j] * t.x + (float)c0[j + 1] * t.y +
-              (float)c0[j + 2] * t.z + (float)c0[j + 3] * t.w;
-        b1 += (float)c1[j] * t.x + (float)c1[j + 1] * t.y +
-              (float)c1[j + 2] * t.z + (float)c1[j + 3] * t.w;
-        xs += t.x + t.y + t.z + t.w;
+        for (int j = 0; j < 64; j += 8) {
+          uint4 t = *(const uint4*)(xg + j);
+          const uint16_t* th = (const uint16_t*)&t;
+#pragma unroll
+          for (int k = 0; k < 8; k++) {
+            float v = __bfloat162float(*(__hip_bfloat16*)(&th[k]));
+            b0 += (float)c0[j + k] * v;
+            b1 += (float)c1[j + k] * v;
+            xs += v;
+          }
+        }
+      } else {
+        const float* xg = (const float*)x + (size_t)p * xstride + g * 64;
+#pragma unroll
+        for (int j = 0; j < 64; j += 4) {
+          float4 t = *(const float4*)(xg + j);
+          b0 += (float)c0[j] * t.x + (float)c0[j + 1] * t.y +
+                (float)c0[j + 2] * t.z + (float)c0[j + 3] * t.w;
+          b1 += (float)c1[j] * t.x + (float)c1[j + 1] * t.y +
+                (float)c1[j + 2] * t.z + (float)c1[j + 3] * t.w;
+          xs += t.x + t.y + t.z + t.w;
+        }
       }
       // q8g64 dequant: w = c*s + m  ->  w.x = s*(c.x) + m*sum(x)
       acc0[p] += b0 * s0 + m0 * xs;

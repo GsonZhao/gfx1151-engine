@@ -43,3 +43,21 @@ grep -E 'decode-live:|spec(-sample)?:|depth acc:|spec(-sample)? time:' logs/*/en
 日志的总体接受率是接受草稿数 / 提出草稿数。缩短 gamma 常会让这个百分比好看，却不一定让生成更快。例如 gamma=3 时 30% 接受率，平均约接受 0.9 个草稿；加上每轮的验证 token，大致是 1.9 token/轮（忽略末尾截断）。
 
 如果第 1 个草稿接受率高、后两项快速下降，优先尝试 gamma=1/2；如果第 1 项也很低，缩短长度主要减少浪费，还需比较 serial 是否更快。最后按稳定的实际生成 tok/s 和输出质量选择，不按接受率单独选择。
+
+## decode 加速开关与离线测试
+
+以下默认开启，仅用于排查时关闭：
+
+| 开关 | 作用 |
+|---|---|
+| `GDEC_SMS_GPU=0` | 关闭 GPU 采样准备（bias/penalty 修正 + top-k 在 GPU 上做，只拷回候选；top_k 为 1..64 时生效，否则自动回退 host 全词表路径）。输出分布不变，同 seed 的具体 token 可能不同 |
+| `GDEC_DRAFT_LM_Q4=0` | draft 改回用生产 lm_head（默认用 base 文件的 4-bit 副本，只影响草稿，不影响提交的 token；多占约 350 MB 显存） |
+| `GDEC_ARGMAX_OLD=1` | 改回单 block argmax（只在完全并列时结果不同） |
+
+离线复现 API 的 decode 路径（`--spec-gen N`，或 `tools/pp_prod.sh <tok> LABEL SPEC=256 ...`）：
+
+- `GDEC_SPEC_CHAIN=1`：chain drafter（API 默认）；不设为纯 MTP。
+- `GDEC_SPEC_SAMPLE=temp,top_k,top_p,seed[,presence,frequency]`：拒绝采样模式；不设为 greedy。
+- `GDEC_SMS_CHECK=1`：每行把 GPU 稀疏分布与 host 全词表 `prepare()` 比对，打印 `[sms-check] n=… bad=…`（很慢，只用于验证）。
+
+一键验证：`bash tools/tg_verify.sh`（kernel 单测 + greedy 逐 token + 采样分布自检 + 采样速度，结尾 PASS/FAIL）。

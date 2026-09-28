@@ -864,8 +864,26 @@ static bool gemv_multi_q4cp(const WView& w, const void* x, float* y, int P,
     }
     return true;
   }
-  if (w.dtype == 7 && !xbf16 && w.cols % 64 == 0) {
-    switch (P) {
+  if (w.dtype == 7 && w.cols % 64 == 0) {
+    if (xbf16) switch (P) {
+#define GDEC_GEMV_MR_CASE(PP)                                              \
+  case PP:                                                                 \
+    k_q8g64_gemv_mr<PP, true><<<(unsigned)blocks, threads, 0, g_str>>>(    \
+        w.data, x, y, w.rows, w.cols, xstride);                            \
+    break;
+      GDEC_GEMV_MR_CASE(1)
+      GDEC_GEMV_MR_CASE(2)
+      GDEC_GEMV_MR_CASE(3)
+      GDEC_GEMV_MR_CASE(4)
+      GDEC_GEMV_MR_CASE(5)
+      GDEC_GEMV_MR_CASE(6)
+      GDEC_GEMV_MR_CASE(7)
+      GDEC_GEMV_MR_CASE(8)
+#undef GDEC_GEMV_MR_CASE
+      default:
+        return false;
+    }
+    else switch (P) {
 #define GDEC_GEMV_MR_CASE(PP)                                              \
   case PP:                                                                 \
     k_q8g64_gemv_mr<PP><<<(unsigned)blocks, threads, 0, g_str>>>(          \
