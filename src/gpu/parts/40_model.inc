@@ -2107,10 +2107,19 @@ struct GpuModel {
     }
     gemm(wup, d_t320b, d_Gb, P);
     if (prefill_fused) {
-      if (gr_bf16)
-        k_gr_combine_b_hc_bf16<<<P, 256, 0, g_str>>>(
-            d_Gb, d_Rhatbf16, d_xb, g_cfg.d, g_cfg.branches, P, d_xbf16);
-      else
+      if (gr_bf16) {
+        // verify sizes: 4 column slices over P*4 blocks (per-column arithmetic
+        // single-thread, unchanged). GDEC_COMBINE_CS=0 keeps P blocks.
+        static const bool comb_cs = !env_zero("GDEC_COMBINE_CS");
+        if (comb_cs && P <= 8)
+          k_gr_combine_b_hc_bf16<<<dim3(P, 4), 256, 0, g_str>>>(
+              d_Gb, d_Rhatbf16, d_xb, g_cfg.d, g_cfg.branches, P, d_xbf16,
+              g_cfg.d / 4);
+        else
+          k_gr_combine_b_hc_bf16<<<P, 256, 0, g_str>>>(
+              d_Gb, d_Rhatbf16, d_xb, g_cfg.d, g_cfg.branches, P, d_xbf16,
+              g_cfg.d);
+      } else
         k_gr_combine_b<true><<<(P * 2560 + 255) / 256, 256, 0, g_str>>>(
             d_Gb, d_Rhatb, d_xb, g_cfg.d, g_cfg.branches, P, d_xbf16);
       xf16_src = d_xb;

@@ -344,14 +344,18 @@ __global__ void k_gr_combine_b(const float* __restrict__ G, const float* __restr
 __global__ void k_gr_combine_b_hc_bf16(
     const float* __restrict__ G, const uint16_t* __restrict__ Rhat,
     float* __restrict__ x, int d, int branches, int P,
-    uint16_t* __restrict__ xbf16) {
+    uint16_t* __restrict__ xbf16, int cspan) {
   int t = blockIdx.x;
   if (t >= P) return;
+  // blockIdx.y takes a cspan-wide column slice (cspan >= d: whole row). Each
+  // column is computed by one thread with identical ops regardless of split.
+  const int c0 = cspan >= d ? 0 : blockIdx.y * cspan;
+  const int c1 = cspan >= d ? d : min(c0 + cspan, d);
   const float* Gt = G + (size_t)t * branches * d;
   const uint16_t* Rt = Rhat + (size_t)t * branches * d;
   float* xt = x + (size_t)t * d;
   uint16_t* x16t = xbf16 + (size_t)t * d;
-  for (int c = threadIdx.x; c < d; c += blockDim.x) {
+  for (int c = c0 + threadIdx.x; c < c1; c += blockDim.x) {
     float acc = 0.f;
     for (int b = 0; b < branches; b++) {
       float gate = 1.f / (1.f + expf(-Gt[b * d + c]));

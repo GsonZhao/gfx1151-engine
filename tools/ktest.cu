@@ -268,7 +268,7 @@ int main() {
     float* dx = dalloc((size_t)P * N);
     uint16_t* dx16;
     TCK(hipMalloc(&dx16, (size_t)P * N * sizeof(uint16_t)));
-    k_gr_combine_b_hc_bf16<<<P, 256>>>(dg, dRh, dx, N, G, P, dx16);
+    k_gr_combine_b_hc_bf16<<<P, 256>>>(dg, dRh, dx, N, G, P, dx16, N);
     std::vector<float> xgot = dget(dx, (size_t)P * N);
     std::vector<uint16_t> x16((size_t)P * N);
     TCK(hipMemcpy(x16.data(), dx16, x16.size() * sizeof(uint16_t),
@@ -292,6 +292,29 @@ int main() {
     printf("%-28s x_abs=%.3e packed_exact=%d %s\n", "gr_bf16_combine", xabs,
            (int)packed_exact, combine_ok ? "PASS" : "FAIL");
     if (!combine_ok) fails++;
+    // column split (verify P<=8 path): dim3(P,4), cspan=N/4 must be bit-exact
+    {
+      float* dx2 = dalloc((size_t)P * N);
+      uint16_t* dx16b;
+      TCK(hipMalloc(&dx16b, (size_t)P * N * sizeof(uint16_t)));
+      TCK(hipMemset(dx2, 0xCD, (size_t)P * N * 4));
+      TCK(hipMemset(dx16b, 0xAB, (size_t)P * N * 2));
+      k_gr_combine_b_hc_bf16<<<dim3(P, 4), 256>>>(dg, dRh, dx2, N, G, P, dx16b,
+                                                  N / 4);
+      std::vector<float> xgot2 = dget(dx2, (size_t)P * N);
+      std::vector<uint16_t> x16b((size_t)P * N);
+      TCK(hipMemcpy(x16b.data(), dx16b, x16b.size() * sizeof(uint16_t),
+                    hipMemcpyDeviceToHost));
+      size_t mism = 0;
+      for (size_t i = 0; i < (size_t)P * N; i++)
+        mism += (xgot2[i] != xgot[i]) + (x16b[i] != x16[i]);
+      bool cs_ok = mism == 0;
+      printf("%-28s mismatches=%zu %s\n", "gr_combine_colsplit", mism,
+             cs_ok ? "PASS" : "FAIL");
+      if (!cs_ok) fails++;
+      TCK(hipFree(dx2));
+      TCK(hipFree(dx16b));
+    }
     TCK(hipFree(dR));
     TCK(hipFree(dRh));
     TCK(hipFree(dy));
