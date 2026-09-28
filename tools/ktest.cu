@@ -562,6 +562,364 @@ int main() {
     TCK(hipFree(y0)); TCK(hipFree(y1));
   }
 
+  // ---- 1g. 行不变性审计（D0-M4，HANDOFF-CONCURRENCY §6.3）----
+  // D2 合批 verify 把多序列拼成 R 行：按行合批的 kernel 必须对"同一批行在
+  // P=R 与 P=P_s 下"逐 bit 一致（y 布局都是 [P, N]，前 Ps*N 个 float 即前
+  // Ps 行）。独立 RNG（0x4d），不消耗共享 rng。
+  {
+    std::mt19937 rng(0x4d);
+    auto frand = [&] { return std::uniform_real_distribution<float>(-1.f, 1.f)(rng); };
+    auto bf16b = [&](float f) { return bf16_bits(f); };
+
+    // 通用 family 审计：runP(P, dy) 启动该 kernel 的 P 模板实例；
+    // 先跑 R=8 作基准，再与 Ps ∈ {1,3,5} 比前缀 Ps*N。
+    auto audit = [&](const char* name, int N, auto runP, float* dy) {
+      std::vector<float> yR((size_t)8 * N);
+      runP(8, dy);
+      TCK(hipMemcpy(yR.data(), dy, (size_t)8 * N * 4, hipMemcpyDeviceToHost));
+      size_t m = 0;
+      for (int Ps : {1, 3, 5}) {
+        runP(Ps, dy);
+        std::vector<float> yS = dget(dy, (size_t)Ps * N);
+        for (size_t i = 0; i < (size_t)Ps * N; i++) m += (yR[i] != yS[i]);
+      }
+      printf("ri_%-23s mism=%zu %s\n", name, m, m ? "FAIL" : "PASS");
+      if (m) fails++;
+    };
+
+    // ri_q4cp_mr：q4cp 稠密 GEMV（P<=8 档），float x 与 bf16 x 两条路
+    for (int xbf = 0; xbf <= 1; xbf++) {
+      const uint64_t rows = 128, cols = 1024, ss = (cols / 32) * 2;
+      std::vector<uint8_t> w(64 + rows * cols / 2 + rows * ss);
+      std::vector<float> cb(16);
+      for (auto& v : cb) v = frand() * 2.f;
+      memcpy(w.data(), cb.data(), 64);
+      for (uint64_t i = 0; i < rows * cols / 2; i++) w[64 + i] = (uint8_t)rng();
+      __half* hs = (__half*)(w.data() + 64 + rows * cols / 2);
+      for (uint64_t i = 0; i < rows * cols / 32; i++)
+        hs[i] = __float2half(0.01f + 0.005f * frand());
+      std::vector<float> xf(8 * cols);
+      for (auto& v : xf) v = frand();
+      std::vector<uint16_t> xb(8 * cols);
+      for (size_t i = 0; i < xb.size(); i++) xb[i] = bf16b(xf[i]);
+      uint8_t* dw = dup(w);
+      float* dxf = dup(xf);
+      uint16_t* dxb = dup(xb);
+      float* dy = dalloc((size_t)8 * rows);
+      const unsigned blocks = (unsigned)((rows + 31) / 32);
+      auto runP = [&](int P, float* y) {
+        auto run = [&](auto Pc) {
+          constexpr int PP = decltype(Pc)::value;
+          if (xbf)
+            k_q4cp_gemv_mr<PP, true><<<blocks, 512>>>(
+                dw + 64, dw + 64 + rows * cols / 2, (const float*)dw, dxb, y,
+                rows, cols, ss, cols);
+          else
+            k_q4cp_gemv_mr<PP, false><<<blocks, 512>>>(
+                dw + 64, dw + 64 + rows * cols / 2, (const float*)dw, dxf, y,
+                rows, cols, ss, cols);
+        };
+        switch (P) {
+          case 1: run(std::integral_constant<int, 1>{}); break;
+          case 2: run(std::integral_constant<int, 2>{}); break;
+          case 3: run(std::integral_constant<int, 3>{}); break;
+          case 4: run(std::integral_constant<int, 4>{}); break;
+          case 5: run(std::integral_constant<int, 5>{}); break;
+          case 6: run(std::integral_constant<int, 6>{}); break;
+          case 7: run(std::integral_constant<int, 7>{}); break;
+          case 8: run(std::integral_constant<int, 8>{}); break;
+        }
+      };
+      audit(xbf ? "q4cp_mr_bx" : "q4cp_mr", (int)rows, runP, dy);
+      TCK(hipFree(dw)); TCK(hipFree(dxf)); TCK(hipFree(dxb)); TCK(hipFree(dy));
+    }
+
+    // ri_bf16_mr / ri_bf16_row_mp（_bx）：bf16 稠密 GEMV 两条路径
+    for (int kind = 0; kind < 3; kind++) {  // 0=mr 1=row_mp 2=row_mp bf16x
+      const uint64_t rows = kind ? 48 : 64, cols = kind ? 2560 : 2048;
+      std::vector<uint16_t> w(rows * cols);
+      for (auto& v : w) v = bf16b(frand());
+      std::vector<float> xf(8 * cols);
+      for (auto& v : xf) v = frand();
+      std::vector<uint16_t> xb(8 * cols);
+      for (size_t i = 0; i < xb.size(); i++) xb[i] = bf16b(xf[i]);
+      uint16_t* dw = dup(w);
+      float* dxf = dup(xf);
+      uint16_t* dxb = dup(xb);
+      float* dy = dalloc((size_t)8 * rows);
+      const unsigned blocks = (unsigned)((rows + 31) / 32);
+      auto runP = [&](int P, float* y) {
+        auto run = [&](auto Pc) {
+          constexpr int PP = decltype(Pc)::value;
+          if (kind == 0)
+            k_bf16_gemv_mr<PP><<<blocks, 512>>>(dw, dxf, y, rows, cols, cols);
+          else if (kind == 1)
+            k_bf16_gemv_row_mp<PP, false><<<(unsigned)rows, 256>>>(dw, dxf, y,
+                                                                   rows, cols,
+                                                                   cols);
+          else
+            k_bf16_gemv_row_mp<PP, true><<<(unsigned)rows, 256>>>(dw, dxb, y,
+                                                                  rows, cols,
+                                                                  cols);
+        };
+        switch (P) {
+          case 1: run(std::integral_constant<int, 1>{}); break;
+          case 2: run(std::integral_constant<int, 2>{}); break;
+          case 3: run(std::integral_constant<int, 3>{}); break;
+          case 4: run(std::integral_constant<int, 4>{}); break;
+          case 5: run(std::integral_constant<int, 5>{}); break;
+          case 6: run(std::integral_constant<int, 6>{}); break;
+          case 7: run(std::integral_constant<int, 7>{}); break;
+          case 8: run(std::integral_constant<int, 8>{}); break;
+        }
+      };
+      audit(kind == 0 ? "bf16_mr" : (kind == 1 ? "bf16_row_mp" : "bf16_row_mp_bx"),
+            (int)rows, runP, dy);
+      TCK(hipFree(dw)); TCK(hipFree(dxf)); TCK(hipFree(dxb)); TCK(hipFree(dy));
+    }
+
+    // ri_q8g64_mr：q8g64 稠密（float x）
+    {
+      const uint64_t rows = 64, cols = 1024;
+      const uint64_t stride = cols + cols / 64 * 4;
+      std::vector<uint8_t> w(rows * stride);
+      for (uint64_t r = 0; r < rows; r++) {
+        uint8_t* rp = w.data() + r * stride;
+        for (uint64_t i = 0; i < cols; i++) rp[i] = (uint8_t)rng();
+        for (uint64_t g = 0; g < cols / 64; g++) {
+          __half* sm = (__half*)(rp + cols + g * 4);
+          sm[0] = __float2half(0.01f + 0.005f * frand());
+          sm[1] = __float2half(0.5f * frand());
+        }
+      }
+      std::vector<float> xf(8 * cols);
+      for (auto& v : xf) v = frand();
+      uint8_t* dw = dup(w);
+      float* dxf = dup(xf);
+      float* dy = dalloc((size_t)8 * rows);
+      const unsigned blocks = (unsigned)((rows + 31) / 32);
+      auto runP = [&](int P, float* y) {
+        auto run = [&](auto Pc) {
+          constexpr int PP = decltype(Pc)::value;
+          k_q8g64_gemv_mr<PP, false><<<blocks, 512>>>(dw, dxf, y, rows, cols,
+                                                      cols);
+        };
+        switch (P) {
+          case 1: run(std::integral_constant<int, 1>{}); break;
+          case 2: run(std::integral_constant<int, 2>{}); break;
+          case 3: run(std::integral_constant<int, 3>{}); break;
+          case 4: run(std::integral_constant<int, 4>{}); break;
+          case 5: run(std::integral_constant<int, 5>{}); break;
+          case 6: run(std::integral_constant<int, 6>{}); break;
+          case 7: run(std::integral_constant<int, 7>{}); break;
+          case 8: run(std::integral_constant<int, 8>{}); break;
+        }
+      };
+      audit("q8g64_mr", (int)rows, runP, dy);
+      TCK(hipFree(dw)); TCK(hipFree(dxf)); TCK(hipFree(dy));
+    }
+
+    // ri_q8g32_multi（HQ 主路径 dtype8，lpr=16 档）/ ri_q8g32_brow_r（bf16 x、
+    // 长行少行档）
+    for (int kind = 0; kind < 2; kind++) {
+      const uint64_t rows = kind ? 320 : 64, cols = kind ? 6144 : 2560;
+      std::vector<int8_t> q(rows * cols);
+      for (auto& v : q) v = (int8_t)rng();
+      std::vector<__half> s(rows * (cols / 32));
+      for (auto& v : s) v = __float2half(0.01f + 0.005f * frand());
+      std::vector<float> xf(8 * cols);
+      for (auto& v : xf) v = frand();
+      std::vector<uint16_t> xb(8 * cols);
+      for (size_t i = 0; i < xb.size(); i++) xb[i] = bf16b(xf[i]);
+      int8_t* dq = dup(q);
+      __half* ds = dup(s);
+      float* dxf = dup(xf);
+      uint16_t* dxb = dup(xb);
+      float* dy = dalloc((size_t)8 * rows);
+      auto runP = [&](int P, float* y) {
+        auto run = [&](auto Pc) {
+          constexpr int PP = decltype(Pc)::value;
+          if (kind == 0)
+            q8g32_gemv_multi<PP, false, 16, 256>(dq, ds, dxf, y, rows, cols,
+                                                 cols, (hipStream_t)0);
+          else
+            k_q8g32_gemv_brow_r<PP, 128, 4>
+                <<<(unsigned)((rows + 3) / 4), 128>>>(dq, ds, dxb, y, rows,
+                                                      cols, cols);
+        };
+        switch (P) {
+          case 1: run(std::integral_constant<int, 1>{}); break;
+          case 2: run(std::integral_constant<int, 2>{}); break;
+          case 3: run(std::integral_constant<int, 3>{}); break;
+          case 4: run(std::integral_constant<int, 4>{}); break;
+          case 5: run(std::integral_constant<int, 5>{}); break;
+          case 6: run(std::integral_constant<int, 6>{}); break;
+          case 7: run(std::integral_constant<int, 7>{}); break;
+          case 8: run(std::integral_constant<int, 8>{}); break;
+        }
+      };
+      audit(kind == 0 ? "q8g32_multi" : "q8g32_brow_r", (int)rows, runP, dy);
+      TCK(hipFree(dq)); TCK(hipFree(ds)); TCK(hipFree(dxf)); TCK(hipFree(dxb));
+      TCK(hipFree(dy));
+    }
+
+    // ri_f32_gemv_mr：iproj GEMV（GDEC_IPROJ_GEMV 默认开的路径）
+    {
+      const uint64_t rows = 640, cols = 2560;
+      std::vector<float> w(rows * cols);
+      for (auto& v : w) v = frand();
+      std::vector<float> xf(8 * cols);
+      for (auto& v : xf) v = frand();
+      float* dw = dup(w);
+      float* dxf = dup(xf);
+      float* dy = dalloc((size_t)8 * rows);
+      const unsigned blocks = (unsigned)((rows + 15) / 16);
+      auto runP = [&](int P, float* y) {
+        auto run = [&](auto Pc) {
+          constexpr int PP = decltype(Pc)::value;
+          k_f32_gemv_mr<PP><<<blocks, 512>>>(dw, dxf, y, rows, cols);
+        };
+        switch (P) {
+          case 1: run(std::integral_constant<int, 1>{}); break;
+          case 2: run(std::integral_constant<int, 2>{}); break;
+          case 3: run(std::integral_constant<int, 3>{}); break;
+          case 4: run(std::integral_constant<int, 4>{}); break;
+          case 5: run(std::integral_constant<int, 5>{}); break;
+          case 6: run(std::integral_constant<int, 6>{}); break;
+          case 7: run(std::integral_constant<int, 7>{}); break;
+          case 8: run(std::integral_constant<int, 8>{}); break;
+        }
+      };
+      audit("f32_gemv_mr", (int)rows, runP, dy);
+      TCK(hipFree(dw)); TCK(hipFree(dxf)); TCK(hipFree(dy));
+    }
+
+    // ri_moe_gg / ri_moe_gd_topk：MoE 槽数（nslots=P*k）不变性
+    {
+      const int k = 10, E = 32;
+      const uint64_t rows_per = 8, cols = 1024, gpr = cols / 32;
+      std::vector<uint8_t> codes((size_t)E * rows_per * cols / 2);
+      for (auto& v : codes) v = (uint8_t)rng();
+      std::vector<uint8_t> scales((size_t)E * rows_per * gpr * 2);
+      __half* sh = (__half*)scales.data();
+      for (size_t i = 0; i < (size_t)E * rows_per * gpr; i++)
+        sh[i] = __float2half(0.01f + 0.005f * frand());
+      std::vector<float> cb(16);
+      for (auto& v : cb) v = frand();
+      const int Pmax = 8;
+      std::vector<int> ids(Pmax * 16);
+      for (int t = 0; t < Pmax; t++)
+        for (int s = 0; s < k; s++) ids[t * 16 + s] = (int)(rng() % E);
+      std::vector<float> x((size_t)Pmax * k * cols);
+      for (auto& v : x) v = frand();
+      std::vector<float> ws(Pmax * 16);
+      for (auto& v : ws) v = frand() + 1.1f;
+      uint8_t* dc = dup(codes);
+      uint8_t* dsc = dup(scales);
+      float* dcb = dup(cb);
+      float* dx = dup(x);
+      int* dids = dup(ids);
+      float* dws = dup(ws);
+      float* dy = dalloc((size_t)Pmax * k * rows_per);
+      size_t m = 0;
+      {  // gg：槽 = gw/pairs_per_slot，槽内行对与总数无关
+        uint64_t pairs = (uint64_t)Pmax * k * ((rows_per + 1) / 2);
+        k_q4cp_gemv_gg<<<(unsigned)((pairs + 15) / 16), 512>>>(
+            dc, dsc, dcb, dx, dy, dids, rows_per, cols, gpr * 2, Pmax * k,
+            cols, 16, k);
+        std::vector<float> yR = dget(dy, (size_t)Pmax * k * rows_per);
+        for (int Ps : {1, 3, 5}) {
+          uint64_t ps = (uint64_t)Ps * k * ((rows_per + 1) / 2);
+          k_q4cp_gemv_gg<<<(unsigned)((ps + 15) / 16), 512>>>(
+              dc, dsc, dcb, dx, dy, dids, rows_per, cols, gpr * 2, Ps * k,
+              cols, 16, k);
+          std::vector<float> yS = dget(dy, (size_t)Ps * k * rows_per);
+          for (size_t i = 0; i < yS.size(); i++) m += (yR[i] != yS[i]);
+        }
+        printf("ri_%-23s mism=%zu %s\n", "moe_gg", m, m ? "FAIL" : "PASS");
+        if (m) fails++;
+      }
+      m = 0;
+      {  // gd_topk_h16<10>：每 token 独立，y [P, rows_per]
+        uint64_t rp = (rows_per + 1) / 2;
+        k_q4cp_gemv_gd_topk_h16<10><<<(unsigned)((Pmax * rp + 3) / 4), 128>>>(
+            dc, dsc, dcb, dx, dy, dids, dws, rows_per, cols, gpr * 2, cols,
+            Pmax, 16, rows_per);
+        std::vector<float> yR = dget(dy, (size_t)Pmax * rows_per);
+        for (int Ps : {1, 3, 5}) {
+          k_q4cp_gemv_gd_topk_h16<10><<<(unsigned)((Ps * rp + 3) / 4), 128>>>(
+              dc, dsc, dcb, dx, dy, dids, dws, rows_per, cols, gpr * 2, cols,
+              Ps, 16, rows_per);
+          std::vector<float> yS = dget(dy, (size_t)Ps * rows_per);
+          for (size_t i = 0; i < yS.size(); i++) m += (yR[i] != yS[i]);
+        }
+        printf("ri_%-23s mism=%zu %s\n", "moe_gd_topk", m, m ? "FAIL" : "PASS");
+        if (m) fails++;
+      }
+      TCK(hipFree(dc)); TCK(hipFree(dsc)); TCK(hipFree(dcb)); TCK(hipFree(dx));
+      TCK(hipFree(dids)); TCK(hipFree(dws)); TCK(hipFree(dy));
+    }
+
+    // ri_argmax2：两段 argmax 的行不变性
+    {
+      const int n = 24832, R = 8;
+      std::vector<float> x((size_t)R * n);
+      for (auto& v : x) v = frand();
+      float* dx = dup(x);
+      unsigned long long* dcand;
+      TCK(hipMalloc(&dcand, (size_t)R * 40 * 8));
+      int* dout;
+      TCK(hipMalloc(&dout, R * 4));
+      k_argmax_p1<<<dim3(40, R), 256>>>(dx, n, dcand);
+      k_argmax_p2<<<dim3(1, R), 32>>>(dcand, 40, dout);
+      std::vector<int> oR(R);
+      TCK(hipMemcpy(oR.data(), dout, R * 4, hipMemcpyDeviceToHost));
+      size_t m = 0;
+      for (int Ps : {1, 3, 5}) {
+        k_argmax_p1<<<dim3(40, Ps), 256>>>(dx, n, dcand);
+        k_argmax_p2<<<dim3(1, Ps), 32>>>(dcand, 40, dout);
+        std::vector<int> oS(Ps);
+        TCK(hipMemcpy(oS.data(), dout, Ps * 4, hipMemcpyDeviceToHost));
+        for (int i = 0; i < Ps; i++) m += (oR[i] != oS[i]);
+      }
+      printf("ri_%-23s mism=%zu %s\n", "argmax2", m, m ? "FAIL" : "PASS");
+      if (m) fails++;
+      TCK(hipFree(dx)); TCK(hipFree(dcand)); TCK(hipFree(dout));
+    }
+
+    // ri_moe_reduce / ri_moe_reduce_fast：累加顺序固定 0..k-1，P 行不变
+    for (int fast = 0; fast <= 1; fast++) {
+      const int k = 10, D = 64, R = 8;
+      std::vector<float> pairs((size_t)R * k * D);
+      for (auto& v : pairs) v = frand();
+      std::vector<int> pids(R * k);
+      for (int t = 0; t < R; t++)
+        for (int s = 0; s < k; s++) pids[t * k + s] = t * k + (s * 7 + 3) % k;
+      float* dp = dup(pairs);
+      int* dpi = dup(pids);
+      float* dout = dalloc((size_t)R * D);
+      std::vector<float> oR((size_t)R * D);
+      if (fast)
+        k_moe_reduce_fast<10><<<dim3(1, R), 256>>>(dp, dpi, dout, R, D);
+      else
+        k_moe_reduce<<<(R * D + 255) / 256, 256>>>(dp, dpi, dout, R, k, D);
+      TCK(hipMemcpy(oR.data(), dout, (size_t)R * D * 4, hipMemcpyDeviceToHost));
+      size_t m = 0;
+      for (int Ps : {1, 3, 5}) {
+        if (fast)
+          k_moe_reduce_fast<10><<<dim3(1, Ps), 256>>>(dp, dpi, dout, Ps, D);
+        else
+          k_moe_reduce<<<(Ps * D + 255) / 256, 256>>>(dp, dpi, dout, Ps, k, D);
+        std::vector<float> oS = dget(dout, (size_t)Ps * D);
+        for (size_t i = 0; i < oS.size(); i++) m += (oR[i] != oS[i]);
+      }
+      printf("ri_%-23s mism=%zu %s\n", fast ? "moe_reduce_fast" : "moe_reduce",
+             m, m ? "FAIL" : "PASS");
+      if (m) fails++;
+      TCK(hipFree(dp)); TCK(hipFree(dpi)); TCK(hipFree(dout));
+    }
+  }
+
   // ---- 2. k_router_topk batched (P blocks, ids/ws rows of 16) ----
   {
     const int P = 3, N = 512, K = 10;

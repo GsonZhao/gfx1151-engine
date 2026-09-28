@@ -532,6 +532,41 @@ int main(int argc, char** argv) {
     }
   }
 
+  // GDEC_VBENCH=P1,P2,...（D0-M2）：prompt prefill 之后，用 prompt 开头的
+  // 连续真实 token 片段跑 prefill_batch(P, base=N) 各 20 次取中位数，
+  // 量 P 行成本曲线与 P>8 / P>16 悬崖（verify 路径同款参数 final/quiet，
+  // 不捕 tap、不做快照）。跑完直接退出。
+  if (const char* vb = getenv("GDEC_VBENCH")) {
+    m.mtp_tap_capture = false;
+    std::vector<int> Ps;
+    for (const char* p = vb;;) {
+      Ps.push_back(atoi(p));
+      const char* c = strchr(p, ',');
+      if (!c) break;
+      p = c + 1;
+    }
+    for (int P : Ps) {
+      if (P < 1 || (size_t)P > tokens.size()) {
+        fprintf(stderr, "vbench P=%d skip（越界）\n", P);
+        continue;
+      }
+      std::vector<int> slice(tokens.begin(), tokens.begin() + P);
+      std::vector<double> ts;
+      for (int r = 0; r < 20; r++) {
+        auto t0 = std::chrono::steady_clock::now();
+        m.prefill_batch(slice, (int)tokens.size(), true, true);
+        CK(hipDeviceSynchronize());
+        ts.push_back(std::chrono::duration<double, std::milli>(
+                         std::chrono::steady_clock::now() - t0)
+                         .count());
+      }
+      std::sort(ts.begin(), ts.end());
+      fprintf(stderr, "vbench P=%d median=%.2f ms min=%.2f max=%.2f\n", P,
+              ts[ts.size() / 2], ts.front(), ts.back());
+    }
+    return 0;
+  }
+
   if (mtp_test > 0) {
     m.mtp_accept_test(tokens, next_id, mtp_test);
     return 0;
