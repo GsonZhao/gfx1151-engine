@@ -203,6 +203,11 @@ GGUF Q4_K 11.8）；P=16384 0.168 ms/token（旧 LT 路径 0.291，GGUF 0.173）
 Windows（96 GiB 上限）继续用 hgn 即可拿到这份 prefill 提速，重新编译即可。质量（KLD）仍是 hgn 的
 0.163，下一步是用 imatrix 重新量化出高质量 hgn（dense 8-bit）。
 
+## 不换格式也能拿到 GGUF 的质量：高质量 hgn
+
+GGUF 的质量优势主要来自 dense 8-bit（Q8_0）。同样的 dense 8-bit + imatrix 专家量化可以直接做进
+hgn（Windows 需要），见 [HGN-HQ.md](HGN-HQ.md)。
+
 ## 验证脚本
 
 - `tools/g2_verify.sh` — G2（专家）
