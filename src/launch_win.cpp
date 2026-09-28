@@ -331,7 +331,7 @@ int main(int argc, char** argv) {
     const std::string api_host = cfg("API_HOST", "0.0.0.0");
     const int api_port = cfg_int("API_PORT", 8731, 1, 65535);
     const int max_context = cfg_int("MAX_CONTEXT", 262144, 1024, 1 << 20);
-    const int mtp_gamma = cfg_int("MTP_GAMMA", 3, 1, 8);
+    const int mtp_gamma = cfg_int("MTP_GAMMA", 0, 0, 8);  // 0 = 引擎按模式自选
     const int kvsnap_max_gb = cfg_int("KVSNAP_MAX_GB", 20, 0, 1 << 16);
     const int rckpt_max = cfg_int("RCKPT_MAX", 8, 0, 1 << 16);
     // 分页 KV（见 service.conf）：默认开启，页池 = 一条 MAX_CONTEXT 序列。
@@ -361,7 +361,9 @@ int main(int argc, char** argv) {
 
     printf("项目：%s\n", g_root.c_str());
     printf("模型：%s\n", model_file.c_str());
-    printf("配置：%d 上下文，MTP gamma=%d，API %s:%d\n", max_context, mtp_gamma,
+    const std::string gamma_str =
+        mtp_gamma ? std::to_string(mtp_gamma) : "auto（greedy 4 / 采样 3）";
+    printf("配置：%d 上下文，MTP gamma=%s，API %s:%d\n", max_context, gamma_str.c_str(),
            api_host.c_str(), api_port);
     if (kv_paged) {
         printf("KV：分页，页池 %d token（%d 路并发共享），RAM 检查点 %d 个\n",
@@ -395,7 +397,9 @@ int main(int argc, char** argv) {
     SetEnvironmentVariableA("GDEC_KVSNAP_MAX_GB",
                             std::to_string(kvsnap_max_gb).c_str());
     SetEnvironmentVariableA("GDEC_RCKPT_MAX", std::to_string(rckpt_max).c_str());
-    SetEnvironmentVariableA("GDEC_SPEC_GAMMA", std::to_string(mtp_gamma).c_str());
+    // MTP_GAMMA=0：不设（并删掉外部残留），引擎按请求模式自选（greedy 4 / 采样 3）。
+    SetEnvironmentVariableA("GDEC_SPEC_GAMMA",
+                            mtp_gamma ? std::to_string(mtp_gamma).c_str() : nullptr);
     // 只在开启时设置；关闭时删掉外部环境的残留值（引擎子进程继承本进程环境）。
     SetEnvironmentVariableA("GDEC_KV_PAGED", kv_paged ? "1" : nullptr);
     SetEnvironmentVariableA("GDEC_KV_POOL_TOKENS",

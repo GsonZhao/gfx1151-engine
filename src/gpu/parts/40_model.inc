@@ -562,7 +562,7 @@ struct GpuModel {
       DALLOC(&d_rpos1, 4);
     }
     CK(hipHostMalloc((void**)&p_token, 4, hipHostMallocDefault));
-    CK(hipHostMalloc((void**)&p_vbase, 4, hipHostMallocDefault));
+    CK(hipHostMalloc((void**)&p_vbase, 4 * kVbRing, hipHostMallocDefault));
     DALLOC(&d_keys, 10240 * 4);
     DALLOC(&d_v, 2560 * 4);
     DALLOC(&d_kn, 10240 * 4);
@@ -1201,10 +1201,25 @@ struct GpuModel {
   // it before launching. GDEC_VBASE=0 falls back to scalar args everywhere.
   static bool vbase_on() { return !env_zero("GDEC_VBASE"); }
   const int* vbptr() const { return vbase_on() ? d_vbase : nullptr; }
+  // Staging is a small pinned ring, not one slot: a pinned async copy reads
+  // host memory when the stream reaches it, so rewriting a single slot before
+  // the GPU got there would hand an earlier chunk the later chunk's base.
+  // Each slot's copy is fenced by an event and waited on before reuse (in
+  // practice never blocks). NOTE (stage 2 / graph capture): hipEventSynchronize
+  // is illegal while capturing -- a captured round needs its own staging slot
+  // written before each replay, with the per-round readback as the fence.
+  static constexpr int kVbRing = 4;
+  hipEvent_t vb_ev[kVbRing] = {};
+  int vb_slot = 0;
   void set_vbase(int base) {
     if (!vbase_on()) return;
-    *p_vbase = base;
-    CK(hipMemcpyAsync(d_vbase, p_vbase, 4, hipMemcpyHostToDevice, g_str));
+    const int s = vb_slot;
+    vb_slot = (vb_slot + 1) % kVbRing;
+    if (vb_ev[s]) CK(hipEventSynchronize(vb_ev[s]));
+    else CK(hipEventCreateWithFlags(&vb_ev[s], hipEventDisableTiming));
+    p_vbase[s] = base;
+    CK(hipMemcpyAsync(d_vbase, p_vbase + s, 4, hipMemcpyHostToDevice, g_str));
+    CK(hipEventRecord(vb_ev[s], g_str));
   }
 
   // Refill the rope cos/sin table only when the chunk's (base, P) changes:
