@@ -2769,11 +2769,12 @@ struct GpuModel {
   void iproj_sgemm(const float* w, const float* x, float* y, int P) {
     const float one = 1.f, zero = 0.f;
     static const bool plain = getenv("GDEC_IPROJ_SGEMM") != nullptr;
-    // GDEC_IPROJ_GEMV=1: decode-P (<=8) multi-row fp32 GEMV in place of
-    // rocblas_sgemm's MT32x32x8 (20 blocks, ~110 us at P=4 vs ~36 us streaming
-    // the 6.5 MB weight once). NOT bit-exact vs sgemm (lane-split reorder) —
-    // opt-in pending KLD + sign-off.
-    static const bool use_gemv = getenv("GDEC_IPROJ_GEMV") != nullptr;
+    // decode-P (<=8) multi-row fp32 GEMV in place of rocblas_sgemm's
+    // MT32x32x8 (20 blocks, ~110 us at P=4 vs ~36 us streaming the 6.5 MB
+    // weight once). NOT bit-exact vs sgemm (lane-split reorder); ktest
+    // maxrel 1e-5 vs fp64 (same order as sgemm's own fp32 error) and
+    // 8K/32K MTP+chain ids matched base exactly. GDEC_IPROJ_GEMV=0 opt-out.
+    static const bool use_gemv = !env_zero("GDEC_IPROJ_GEMV");
     if (use_gemv && !plain && P >= 1 && P <= 8) {
       const unsigned blocks = (640 + 15) / 16;  // 16 warps (512 thr) per block
       switch (P) {

@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-# iproj_gemv_verify.sh — 验证 k_f32_gemv_mr 替换 decode 档 iproj_sgemm（GDEC_IPROJ_GEMV）。
+# iproj_gemv_verify.sh — 验证 decode 档 iproj 走 k_f32_gemv_mr（默认开，GDEC_IPROJ_GEMV=0 回退）。
 #   indexer 投影 fp32 N=640 K=2560：P<=8 时从 rocblas_sgemm（自选 MT32x32x8、20 块、
 #   P=4 实测 ~110us/次）改走 warp-per-row fp32 GEMV（流式读 6.5MB，~36us）。
 #   非逐 bit（fp32 累加顺序变）；ktest maxrel~1e-5（vs fp64，与 sgemm 自身误差同量级），
 #   实测 8K/32K greedy ids 与 BASE 逐 token 一致（indexer top-512 未发生边界翻转）。
 # 检查：
 #   1. ktest 单测：f32_gemv_mr PASS（vs fp64，tol 1e-4）+ P=1 与 P=4 第 0 行逐 bit
-#   2. 默认（不开关）ids 必须与 BASE 一致（默认路径未变）
-#   3. GDEC_IPROJ_GEMV=1：8K/32K ids vs BASE（报告 SAME/DIFF；DIFF 不判 FAIL——
+#   2. GDEC_IPROJ_GEMV=0（回退旧 sgemm 路径）ids 必须与 BASE 一致
+#   3. 默认开：8K/32K ids vs BASE（报告 SAME/DIFF；DIFF 不判 FAIL——
 #      top-512 边界翻转是已知良性机制，但须人工确认后更新本脚本预期）
-#   4. GDEC_IPROJ_GEMV=1 速度不慢于 BASE
+#   4. 默认开速度不慢于 BASE
 # 用法: bash tools/iproj_gemv_verify.sh   （约 8 分钟，结尾 PASS / FAIL）
 #   BIN=build/gdec（默认）  BASE=build/gdec.base（默认）  SKIP_KTEST=1 跳过单测
 # 日志: logs/igv_*.log，汇总 logs/iproj_gemv_verify.out
@@ -50,18 +50,18 @@ run() {  # run LABEL BIN PROMPT [K=V...]
 ids() { grep '^ids:' "logs/$1.log"; }
 toks() { grep -h 'spec: ' "logs/$1.log" | tail -1 | grep -o '[0-9.]* tok/s' | grep -o '^[0-9.]*'; }
 
-echo "-- 2. 默认（开关关）ids 一致：8K MTP"
-if run igv_off8 "$BIN" 8k && run igv_bs8 "$BASE" 8k; then
+echo "-- 2. GDEC_IPROJ_GEMV=0（回退路径）ids 一致：8K MTP"
+if run igv_off8 "$BIN" 8k GDEC_IPROJ_GEMV=0 && run igv_bs8 "$BASE" 8k; then
   [[ "$(ids igv_off8)" == "$(ids igv_bs8)" ]] \
-    && ok "默认 ids 一致" || bad "默认路径 ids 不一致（默认不应受影响）"
+    && ok "回退路径 ids 一致" || bad "回退路径 ids 不一致（回退不应受影响）"
 else
-  bad "默认路径运行失败"
+  bad "回退路径运行失败"
 fi
 
-echo "-- 3. GDEC_IPROJ_GEMV=1：ids 对比 + 速度"
+echo "-- 3. 默认开：ids 对比 + 速度"
 declare -A T
 for P in 8k 32k; do
-  if run igv_gv_$P "$BIN" "$P" GDEC_IPROJ_GEMV=1 && run igv_gb_$P "$BASE" "$P"; then
+  if run igv_gv_$P "$BIN" "$P" && run igv_gb_$P "$BASE" "$P"; then
     T[gv_$P]=$(toks igv_gv_$P); T[gb_$P]=$(toks igv_gb_$P)
     echo "  $P: GEMV ${T[gv_$P]} tok/s vs BASE ${T[gb_$P]} tok/s"
     if [[ "$(ids igv_gv_$P)" == "$(ids igv_gb_$P)" ]]; then
