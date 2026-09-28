@@ -913,6 +913,34 @@ static bool gemv_multi_q4cp(const WView& w, const void* x, float* y, int P,
     // bf16 x, few long rows (HC down 320x10240, out_proj 2560x6144 in spec
     // verify): one 128-thread block per row (bench P=4: 39->23 / 113->93 us).
     if (xbf16 && w.cols >= 4096 && w.rows <= 4096) {
+      // Row-tiled (RPB=4): x fetched once per (group, block) instead of once
+      // per row; bit-exact vs brow (ktest brow_r_bitexact). GDEC_BROW_R=0
+      // opt-out.
+      static const bool brow_r = [] {
+        const char* e = getenv("GDEC_BROW_R");
+        return !e || e[0] != '0';
+      }();
+      if (brow_r) {
+        switch (P) {
+#define GDEC_Q8BR(PP)                                                          \
+  case PP:                                                                     \
+    k_q8g32_gemv_brow_r<PP, 128, 4>                                            \
+        <<<(unsigned)((w.rows + 3) / 4), 128, 0, g_str>>>(                     \
+            q, s, x, y, w.rows, w.cols, xstride);                              \
+    return true;
+          GDEC_Q8BR(1)
+          GDEC_Q8BR(2)
+          GDEC_Q8BR(3)
+          GDEC_Q8BR(4)
+          GDEC_Q8BR(5)
+          GDEC_Q8BR(6)
+          GDEC_Q8BR(7)
+          GDEC_Q8BR(8)
+          default:
+            return false;
+        }
+#undef GDEC_Q8BR
+      }
       switch (P) {
 #define GDEC_Q8B(PP)                                                           \
   case PP:                                                                     \

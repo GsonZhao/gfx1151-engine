@@ -360,6 +360,57 @@ int main() {
     TCK(hipFree(dy1));
   }
 
+  // ---- 1d. k_q8g32_gemv_brow_r (row-tiled HC down): bit-exact vs brow + timing ----
+  {
+    const uint64_t rows = 320, cols = 10240, gpr = cols / 32;
+    std::vector<int8_t> hq(rows * cols);
+    for (auto& v : hq) v = (int8_t)(rng() % 256);
+    std::vector<__half> hs(rows * gpr);
+    for (auto& v : hs) v = __float2half(0.5f + 0.5f * frand());
+    std::vector<uint16_t> hx(4 * cols);
+    for (auto& v : hx) v = bf16_bits(frand());
+    int8_t* dq = dup(hq);
+    __half* ds = dup(hs);
+    uint16_t* dx = dup(hx);
+    float* dy0 = dalloc(4 * rows);
+    float* dy1 = dalloc(4 * rows);
+    auto timeit = [&](auto fn) {
+      hipEvent_t e0, e1;
+      TCK(hipEventCreate(&e0));
+      TCK(hipEventCreate(&e1));
+      fn(); fn();
+      TCK(hipEventRecord(e0));
+      for (int i = 0; i < 30; i++) fn();
+      TCK(hipEventRecord(e1));
+      TCK(hipEventSynchronize(e1));
+      float ms = 0;
+      TCK(hipEventElapsedTime(&ms, e0, e1));
+      TCK(hipEventDestroy(e0)); TCK(hipEventDestroy(e1));
+      return ms * 1000.0 / 30;
+    };
+    // timing: does brow P=4 cost >> P=1? (weights constant, only x traffic grows)
+    double t_b1 = timeit([&] { k_q8g32_gemv_brow<1, true, 128><<<(unsigned)rows, 128>>>(dq, ds, dx, dy0, rows, cols, cols); });
+    double t_b4 = timeit([&] { k_q8g32_gemv_brow<4, true, 128><<<(unsigned)rows, 128>>>(dq, ds, dx, dy0, rows, cols, cols); });
+    double t_r2 = timeit([&] { k_q8g32_gemv_brow_r<4, 128, 2><<<(unsigned)((rows + 1) / 2), 128>>>(dq, ds, dx, dy1, rows, cols, cols); });
+    double t_r4 = timeit([&] { k_q8g32_gemv_brow_r<4, 128, 4><<<(unsigned)((rows + 3) / 4), 128>>>(dq, ds, dx, dy1, rows, cols, cols); });
+    printf("%-28s brow_p1=%.1f brow_p4=%.1f tiled_r2=%.1f tiled_r4=%.1f us\n",
+           "brow_r_timing", t_b1, t_b4, t_r2, t_r4);
+    // bit-exactness, full + tail rows
+    size_t mism = 0;
+    for (uint64_t rr : {rows, rows - 1}) {
+      TCK(hipMemset(dy1, 0xCD, 4 * rows * 4));
+      k_q8g32_gemv_brow<4, true, 128><<<(unsigned)rr, 128>>>(dq, ds, dx, dy0, rr, cols, cols);
+      k_q8g32_gemv_brow_r<4, 128, 4><<<(unsigned)((rr + 3) / 4), 128>>>(dq, ds, dx, dy1, rr, cols, cols);
+      std::vector<float> y0 = dget(dy0, 4 * rows), y1 = dget(dy1, 4 * rows);
+      for (uint64_t i = 0; i < 4 * rr; i++) mism += (y0[i] != y1[i]);
+    }
+    printf("%-28s mismatches=%zu %s\n", "brow_r_bitexact", mism,
+           mism == 0 ? "PASS" : "FAIL");
+    if (mism) fails++;
+    TCK(hipFree(dq)); TCK(hipFree(ds)); TCK(hipFree(dx));
+    TCK(hipFree(dy0)); TCK(hipFree(dy1));
+  }
+
   // ---- 2. k_router_topk batched (P blocks, ids/ws rows of 16) ----
   {
     const int P = 3, N = 512, K = 10;
