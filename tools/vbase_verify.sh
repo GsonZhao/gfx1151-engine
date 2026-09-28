@@ -36,7 +36,9 @@ run() {
   fi
   grep -q 'dense: 8-bit' "logs/$L.log" || { echo "  $L: 不是 HQ 权重（无 dense: 8-bit）"; return 2; }
 }
-ids() { grep '^ids:' "logs/$1.log"; }
+# 只取 token 数字：GEN 模式下 stdout 的 ids 行不带换行，stderr 的
+# "decode: N tokens in T ms" 会接在同一行，耗时每次不同 → 必须截掉。
+ids() { grep -a '^ids:' "logs/$1.log" | sed -E 's/^ids://; s/[^0-9 ].*$//'; }
 speed() { grep -h 'spec: \| chain: \|decode' "logs/$1.log" | tail -1 | sed 's/.*tokens in/in/' | cut -c1-70; }
 nchunk() { grep -c '\] prefill: ' "logs/$1.log"; }  # 只数带时间戳的 chunk 行（不含 "moe prefill:"）
 
