@@ -1874,6 +1874,35 @@ static void yield_hook(GpuModel& m) {
   if (ab) throw KvOverflow("aborted: KV pool needed by an earlier request");
 }
 
+// D1b borrow callbacks (GpuModel::borrow_*_fn). borrow_turn runs on the
+// chunk owner's thread: it raises the light-round flag, hands the turnstile
+// around the FIFO once (borrowers may start only chunks of <= conc_rmax_
+// rows while it is up), then rebinds our slot. borrow_skip runs on a
+// borrower whose next chunk is heavy: requeue behind the owner and retry.
+static bool borrow_query() { return g_turn.contended(); }
+static void borrow_abort_check() {
+  bool ab;
+  {
+    std::lock_guard<std::mutex> lk(g_sm);
+    ab = g_slots[(size_t)tl_slot].abort;
+  }
+  if (ab) throw KvOverflow("aborted: KV pool needed by an earlier request");
+}
+static void borrow_turn(GpuModel& m) {
+  g_borrow_light.fetch_add(1, std::memory_order_acq_rel);
+  g_turn.release();
+  g_turn.acquire();
+  g_borrow_light.fetch_sub(1, std::memory_order_acq_rel);
+  m.bind(tl_slot);
+  borrow_abort_check();
+}
+static void borrow_skip(GpuModel& m) {
+  g_turn.release();
+  g_turn.acquire();
+  m.bind(tl_slot);
+  borrow_abort_check();
+}
+
 // GpuModel::kv_starve_fn (pool dry after rckpt eviction), GPU owner only.
 static bool starve(GpuModel& m) {
   const int cur = tl_slot;
@@ -2751,6 +2780,9 @@ static int run(GpuModel& m, int port) {
   if (m.nslots > 1) {
     m.kv_starve_fn = &starve;
     m.yield_fn = &yield_hook;
+    m.borrow_query_fn = &borrow_query;
+    m.borrow_fn = &borrow_turn;
+    m.borrow_skip_fn = &borrow_skip;
   }
   fprintf(stderr, "serve: listening on :%d (maxctx %d, %d slot%s)\n", port,
           m.maxctx, m.nslots, m.nslots > 1 ? "s" : "");

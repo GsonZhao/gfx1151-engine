@@ -104,6 +104,15 @@ struct GpuModel {
   void yield_point() {
     if (yield_fn) yield_fn(*this);
   }
+  // D1b mid-chunk GPU lending (serve mode, nslots > 1): while a long prompt
+  // chunk is enqueued layer by layer, queued decode workers may borrow the
+  // GPU for light rounds (chunks of at most conc_rmax_ rows) running on a
+  // second, small copy of the P-row workspaces. All callbacks null -> inert.
+  bool (*borrow_query_fn)() = nullptr;      // someone queued on the turnstile?
+  void (*borrow_fn)(GpuModel&) = nullptr;   // release+reacquire under g_borrow_light
+  void (*borrow_skip_fn)(GpuModel&) = nullptr;  // heavy chunk during borrow: requeue
+  int conc_rmax_ = 32;                      // borrow round row cap (= small ws rows)
+  float conc_quantum_ms_ = 300;             // min GPU-busy ms between lends
   int kv_nl = 0;                // layers in d_kc/d_vc/d_kcb/d_vcb/d_ik (+1 = MTP)
   size_t kv_layer_rows = 0;     // per-layer KV row stride (== maxctx unpaged)
   size_t ik_layer_blocks = 0;   // per-layer d_ik block stride (== index_blocks unpaged)
@@ -215,6 +224,7 @@ struct GpuModel {
   int* d_topidsb;
   float* d_topwb;
   int* d_slot_order = nullptr;  // verify MoE 槽序（k_moe_sort_slots，按专家排序）
+  int moe_dump_base_ = -1;      // GDEC_MOE_TOPIDS_DUMP：记录用的当前 chunk base
   float *d_guvb, *d_hidb, *d_moeaccb, *d_eyb, *d_sgb;
   float* d_eb;              // [maxctx, 2560] PLE embeddings
   float* ple_eb = nullptr;  // pinned staging [maxctx, 2560]
@@ -3200,6 +3210,24 @@ struct GpuModel {
         }
       S.n++; S.uni += u; S.slots += (long long)P * k;
     }
+    // GDEC_MOE_TOPIDS_DUMP=<file>: 把每次小 P 调用（2<=P<=32，即 verify/合批
+    // 场景）的 topids 追加到文件，供 tools/c0_union.py 做跨序列专家并集分析。
+    // 行格式：L <layer> B <base> P <P> 后接 P*k 个专家 id。默认零开销。
+    static FILE* moe_dump = [] {
+      const char* f = getenv("GDEC_MOE_TOPIDS_DUMP");
+      return f ? fopen(f, "w") : nullptr;
+    }();
+    if (moe_dump && P >= 2 && P <= 32) {
+      std::vector<int> hids((size_t)P * 16);
+      CK(hipMemcpy(hids.data(), d_topidsb, (size_t)P * 16 * 4,
+                   hipMemcpyDeviceToHost));
+      fprintf(moe_dump, "L %d B %d P %d", l, moe_dump_base_, P);
+      for (int t = 0; t < P; t++)
+        for (int s = 0; s < k; s++)
+          fprintf(moe_dump, " %d", hids[(size_t)t * 16 + s]);
+      fputc('\n', moe_dump);
+      fflush(moe_dump);
+    }
     if (gg_on()) {
       moe_gguf(g_ggx.at(l), d_xb, d_topidsb, d_topwb, acc, P);
       moe_b_shared(l, P, acc, direct_output);
@@ -3850,6 +3878,11 @@ struct GpuModel {
       // Absorb a small tail into this chunk instead of running a tiny final
       // chunk whose per-chunk fixed cost (~0.9 s) dwarfs its token count.
       if (rem > maxbatch && rem <= maxbatch_cap) n = rem;
+      // D1b: while the GPU is lent mid-chunk, only light rounds may start;
+      // a heavy chunk requeues behind the owner and retries.
+      while (n > conc_rmax_ && borrow_skip_fn &&
+             g_borrow_light.load(std::memory_order_acquire))
+        borrow_skip_fn(*this);
       id = prefill_chunk(
           std::vector<int>(tokens.begin() + off, tokens.begin() + off + n),
           base + off, final, quiet);
@@ -3881,6 +3914,7 @@ struct GpuModel {
               "(maxctx=%d maxbatch_cap=%d)\n", base, P, maxctx, maxbatch_cap);
       exit(1);
     }
+    moe_dump_base_ = base;
     kv_prepare(base, base + P);  // A2/A3: back (and unshare) rows [base, base+P)
     set_vbase(base);  // P3-A: all base-reading batch kernels this chunk read d_vbase
     static const bool phase_prof = getenv("GDEC_PHASE") != nullptr;
@@ -4091,11 +4125,13 @@ struct GpuModel {
       }
     }
     phase("ple", TP);
+    if (ws_ok_) CK(hipEventRecord(conc_ev_a_, g_str));  // D1b quantum clock
     for (int l = 1; l < g_cfg.layers; l++) {
       bool fuse_prev = gr_scatter_norm && l > 1;
       bool flush_mlp = !gr_scatter_norm || l == g_cfg.layers - 1;
       enq_layer_b(l, P, fuse_prev, flush_mlp, base);
       if (prog_total > 0) prog_probe(l, P);
+      conc_borrow_yield(base, P, l);  // D1b: no-op unless armed and contended
       if (l == 24) phase("L01-24", TP);
       if (phase_prof && getenv("GDEC_PHASE")[0] == '2') {
         char lbuf[16];
@@ -6541,6 +6577,198 @@ struct GpuModel {
     ropecs_base_ = -1;   // rope cos/sin table belongs to the previous slot
     xf16_src = nullptr;  // so does the bf16 conversion cache
   }
+
+  // ---- D1b borrow workspace ----------------------------------------------
+  // Second, small copy of every maxbatch_cap-sized row buffer a borrower can
+  // reach: spec verify runs the full prefill_chunk path at P <= conc_rmax_
+  // and mtp_step touches row 0 of d_mRb/d_xbf16/d_eb/d_xb/d_Gb/d_t320b/
+  // d_qnb/d_Unb/d_convoutb/d_tokarr; serial decode stays on the P=1 buffers
+  // and its graphs bake only those (never BP-sized ones). Buffers provably
+  // dead at a layer boundary stay shared: d_wbf16, d_gdn_ws, d_gdn_split_ws,
+  // d_logits_b, d_eoff, d_gg_uq, d_iscores tiles are row-windowed... (see
+  // HANDOFF-CONCURRENCY §5.2 audit), d_posarr/d_ringarr (constant).
+  // d_moetiles/d_moentiles/moe_routing/moe_lt/qsa_union paths are never taken
+  // at P <= conc_rmax_; conc_borrow_yield refuses to lend when they are on.
+#define GDEC_WS_FIELDS(X)                                                     \
+  X(d_Rb) X(d_Rhatb) X(d_Rhatbf16) X(d_xb) X(d_yb) X(d_Gb) X(d_t320b)        \
+  X(d_w4b) X(d_qkvb) X(d_zb) X(d_g48b) X(d_beta48b) X(d_qgb) X(d_qsb)        \
+  X(d_gsb) X(d_kbb) X(d_vbb) X(d_ropecs) X(d_attnb) X(d_routerb)             \
+  X(d_topidsb) X(d_topwb) X(d_slot_order) X(d_guvb) X(d_hidb) X(d_moeaccb)   \
+  X(d_eyb) X(d_sgb) X(d_eb) X(d_xbf16) X(d_xbf16b) X(d_tokidx) X(d_pweight)  \
+  X(d_pairids) X(d_convb) X(d_keysb) X(d_plevb) X(d_qnb) X(d_Ub) X(d_Unb)    \
+  X(d_convoutb) X(d_tokarr) X(d_img_inj) X(d_iproj) X(d_iq) X(d_iselected)   \
+  X(d_iscores) X(d_mRb) X(d_mRhatb) X(d_mtap)
+  struct WsPtrs {
+#define GDEC_WS_DECL(f) decltype(GpuModel::f) f = nullptr;
+    GDEC_WS_FIELDS(GDEC_WS_DECL)
+#undef GDEC_WS_DECL
+    float *d_injp0 = nullptr, *d_injp1 = nullptr;
+    float* ple_eb = nullptr;
+    uint8_t* ple_eb_dev = nullptr;
+  };
+  WsPtrs ws_small_, ws_saved_;
+  bool ws_lent_ = false, ws_ok_ = false;
+  hipEvent_t conc_ev_a_ = nullptr, conc_ev_b_ = nullptr;
+  long conc_lends_ = 0;  // D1b diagnostics: total lends since init
+
+  // Mirror of the constructor's BP-sized block at R rows. Each field is
+  // allocated only when the big counterpart exists (same feature flags), so
+  // "small == nullptr" always implies "big == nullptr" and the lend/takeback
+  // guards below never drop a live buffer.
+  void ws_alloc_small(int R) {
+    if (ws_ok_ || R < 1) return;
+    const size_t B = (size_t)R;
+#define GDEC_WS_DUP(p, bytes) \
+    if (p) DALLOC(&ws_small_.p, (bytes))
+    GDEC_WS_DUP(d_Rb, B * 10240 * 4);
+    GDEC_WS_DUP(d_Rhatb, B * 10240 * 4);
+    GDEC_WS_DUP(d_Rhatbf16, B * 10240 * 2);
+    GDEC_WS_DUP(d_xb, B * 2560 * 4);
+    GDEC_WS_DUP(d_yb, B * 2560 * 4);
+    GDEC_WS_DUP(d_Gb, B * 10240 * 4);
+    GDEC_WS_DUP(d_t320b, B * 320 * 4);
+    GDEC_WS_DUP(d_w4b, B * 4 * 4);
+    GDEC_WS_DUP(d_qkvb, B * 10240 * 4);
+    GDEC_WS_DUP(d_zb, B * 6144 * 4);
+    GDEC_WS_DUP(d_g48b, B * 48 * 4);
+    GDEC_WS_DUP(d_beta48b, B * 48 * 4);
+    GDEC_WS_DUP(d_qgb, B * 12288 * 4);
+    GDEC_WS_DUP(d_qsb, B * 6144 * 4);
+    GDEC_WS_DUP(d_gsb, B * 6144 * 4);
+    GDEC_WS_DUP(d_kbb, B * 512 * 4);
+    GDEC_WS_DUP(d_vbb, B * 512 * 4);
+    GDEC_WS_DUP(d_ropecs, B * 32 * sizeof(float2));
+    GDEC_WS_DUP(d_attnb, B * 6144 * 4);
+    GDEC_WS_DUP(d_routerb, B * 512 * 4);
+    GDEC_WS_DUP(d_topidsb, B * 16 * 4);
+    GDEC_WS_DUP(d_topwb, B * 16 * 4);
+    GDEC_WS_DUP(d_slot_order, 256 * 4);
+    GDEC_WS_DUP(d_guvb, B * g_cfg.topk * (moe_deterministic ? 2560 : 1280) * 4);
+    GDEC_WS_DUP(d_hidb, B * g_cfg.topk * 640 * 4);
+    GDEC_WS_DUP(d_moeaccb, B * 2560 * 4);
+    GDEC_WS_DUP(d_eyb, B * 2560 * 4);
+    GDEC_WS_DUP(d_sgb, B * 4);
+    GDEC_WS_DUP(d_eb, B * 2560 * 4);
+    GDEC_WS_DUP(d_xbf16, B * 10240 * 2);
+    GDEC_WS_DUP(d_xbf16b, B * 6144 * 2);
+    GDEC_WS_DUP(d_tokidx, B * g_cfg.topk * 4);
+    GDEC_WS_DUP(d_pweight, B * g_cfg.topk * 4);
+    GDEC_WS_DUP(d_pairids, B * g_cfg.topk * 4);
+    GDEC_WS_DUP(d_convb, B * 10240 * 4);
+    GDEC_WS_DUP(d_keysb, B * 10240 * 4);
+    GDEC_WS_DUP(d_plevb, B * 2560 * 4);
+    GDEC_WS_DUP(d_qnb, B * 10240 * 4);
+    GDEC_WS_DUP(d_Ub, B * 10240 * 4);
+    GDEC_WS_DUP(d_Unb, B * 10240 * 4);
+    GDEC_WS_DUP(d_convoutb, B * 10240 * 4);
+    GDEC_WS_DUP(d_tokarr, B * 4);
+    GDEC_WS_DUP(d_img_inj, B * sizeof(int2));
+    if (d_iproj) {  // !qsa_dense indexer block
+      DALLOC(&ws_small_.d_iproj, B * 640 * 4);
+      DALLOC(&ws_small_.d_iq, B * 512 * 4);
+      DALLOC(&ws_small_.d_iselected, B * INDEX_BUDGET * 4);
+      DALLOC(&ws_small_.d_iscores,
+             (size_t)std::min(R, INDEX_BATCH) * 4 * index_blocks * 4);
+    }
+    GDEC_WS_DUP(d_mRb, B * 10240 * 4);
+    GDEC_WS_DUP(d_mRhatb, B * 10240 * 4);
+    GDEC_WS_DUP(d_mtap, B * 10240 * 4);
+#undef GDEC_WS_DUP
+    if (d_injp[0]) {
+      DALLOC(&ws_small_.d_injp0, B * 16 * 4);
+      DALLOC(&ws_small_.d_injp1, B * 16 * 4);
+    }
+    if (ple_eb) {
+      CK(hipHostMalloc((void**)&ws_small_.ple_eb, B * 2560 * 4,
+                       hipHostMallocDefault));
+      CK(hipHostGetDevicePointer((void**)&ws_small_.ple_eb_dev,
+                                 ws_small_.ple_eb, 0));
+    }
+    CK(hipEventCreate(&conc_ev_a_));  // timing events: quantum clock
+    CK(hipEventCreate(&conc_ev_b_));
+    ws_ok_ = true;
+  }
+
+  void ws_lend() {  // members -> small set; big pointers saved in ws_saved_
+#define GDEC_WS_SAVE(f) \
+    ws_saved_.f = f;    \
+    if (ws_small_.f) f = ws_small_.f;
+    GDEC_WS_FIELDS(GDEC_WS_SAVE)
+#undef GDEC_WS_SAVE
+    ws_saved_.d_injp0 = d_injp[0];
+    ws_saved_.d_injp1 = d_injp[1];
+    if (ws_small_.d_injp0) {
+      d_injp[0] = ws_small_.d_injp0;
+      d_injp[1] = ws_small_.d_injp1;
+    }
+    ws_saved_.ple_eb = ple_eb;
+    ws_saved_.ple_eb_dev = ple_eb_dev;
+    if (ws_small_.ple_eb) {
+      ple_eb = ws_small_.ple_eb;
+      ple_eb_dev = ws_small_.ple_eb_dev;
+    }
+    ws_lent_ = true;
+  }
+  void ws_takeback() {  // members -> big set (exact inverse of ws_lend)
+#define GDEC_WS_REST(f) \
+    if (ws_small_.f) f = ws_saved_.f;
+    GDEC_WS_FIELDS(GDEC_WS_REST)
+#undef GDEC_WS_REST
+    if (ws_small_.d_injp0) {
+      d_injp[0] = ws_saved_.d_injp0;
+      d_injp[1] = ws_saved_.d_injp1;
+    }
+    if (ws_small_.ple_eb) {
+      ple_eb = ws_saved_.ple_eb;
+      ple_eb_dev = ws_saved_.ple_eb_dev;
+    }
+    ws_lent_ = false;
+  }
+
+  // Layer-boundary yield inside a big prefill chunk. Nobody queued: one
+  // atomic read. Contended: drain the layers enqueued so far (event sync),
+  // and if the GPU-busy quantum elapsed, lend the small workspace and block
+  // in borrow_fn until the turnstile comes back. The chunk's live state
+  // (residual stream in the big set, per-slot fields, KV pages) is untouched
+  // by the borrower; chunk-level member state is restored explicitly.
+  void conc_borrow_yield(int base, int P, int layer) {
+    if (!ws_ok_ || !borrow_query_fn || ws_lent_ || P <= conc_rmax_) return;
+    if (moe_lt || qsa_union) return;  // paths with unduplicated scratch
+    if (!borrow_query_fn()) return;
+    CK(hipEventRecord(conc_ev_b_, g_str));
+    CK(hipEventSynchronize(conc_ev_b_));  // GPU drained through this layer
+    float gpu_ms = 0;
+    CK(hipEventElapsedTime(&gpu_ms, conc_ev_a_, conc_ev_b_));
+    if (gpu_ms < conc_quantum_ms_) return;
+    fprintf(stderr, "%s [conc] prefill lends GPU at L%d (base=%d, %.0f ms since last)\n",
+            log_ts(), layer, base, (double)gpu_ms);
+    conc_lends_++;
+    // HC inject partials pipeline (injp_cur/injp_for -> big d_injp[]) is live
+    // across this layer boundary: park it, hand the borrower an empty
+    // pipeline, restore on return. The partial sums themselves sit in the
+    // big d_injp buffers, which the borrower never touches (small set).
+    const int saved_injp_cur = injp_cur;
+    const std::string saved_injp_for = injp_for;
+    injp_cur = -1;
+    injp_for.clear();
+    ws_lend();
+    try {
+      borrow_fn(*this);  // flag up; release; light borrowers run; reacquire; bind
+    } catch (...) {
+      ws_takeback();  // aborted mid-chunk: never leave members on the small set
+      injp_cur = saved_injp_cur;
+      injp_for = saved_injp_for;
+      throw;
+    }
+    ws_takeback();
+    injp_cur = saved_injp_cur;
+    injp_for = saved_injp_for;
+    set_vbase(base);    // the borrower's set_vbase rotated the ring
+    ropecs_base_ = -1;  // rope table and bf16 cache below are the borrower's
+    xf16_src = nullptr;
+    CK(hipEventRecord(conc_ev_a_, g_str));  // restart the quantum clock
+  }
+
   // Allocate slots 1..n-1 (slot 0 is the constructor's state) and capture
   // their decode graphs. Paged KV only: all slots map pages from one pool.
   void slots_init(int n) {
@@ -6596,6 +6824,15 @@ struct GpuModel {
       }
     }
     nslots = n;
+    if (!env_zero("GDEC_CONC_PREFILL")) {  // D1b: arm the borrow workspace
+      if (const char* v = getenv("GDEC_CONC_PREFILL_QUANTUM_MS"))
+        conc_quantum_ms_ = (float)atof(v);
+      if (const char* v = getenv("GDEC_CONC_RMAX")) conc_rmax_ = atoi(v);
+      ws_alloc_small(conc_rmax_);
+      if (ws_ok_)
+        fprintf(stderr, "gdec: prefill borrow armed (R<=%d rows, quantum %.0f ms)\n",
+                conc_rmax_, (double)conc_quantum_ms_);
+    }
     fprintf(stderr, "gdec: %d sequence slots (shared KV pool %d pages = %d tokens)\n",
             n, kv_pool_pages, kv_pool_pages * KV_PAGE);
   }
