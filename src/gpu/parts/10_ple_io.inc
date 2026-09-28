@@ -489,8 +489,10 @@ __device__ void index_norm_rope(float value, const float* weight, float* out,
 __global__ void k_index_q(const float* proj, const float* norm, float* queries,
                            int P, float eps, double theta, const int* pos = nullptr,
                            int base = 0, const float2* cs_tab = nullptr,
-                           const int* __restrict__ d_rdelta = nullptr) {
+                           const int* __restrict__ d_rdelta = nullptr,
+                           const int* __restrict__ d_vb = nullptr) {
   int t = blockIdx.x, h = blockIdx.y;
+  if (d_vb) base = *d_vb;  // P3-A: device-mirrored base (graph-replayable)
   // d_rdelta (M-RoPE decode): rope angle position += request rope_delta.
   // Only passed by decode callers (cs_tab == nullptr there); the prefill
   // cs_tab path must keep position-base == batch-local row.
@@ -509,7 +511,9 @@ __global__ void k_index_pool(const float* proj, const float* norm, float* keys,
                               float eps, double theta, int base = 0,
                               const float* ring = nullptr,
                               const float2* cs_tab = nullptr,
-                              const int* __restrict__ ptab = nullptr) {
+                              const int* __restrict__ ptab = nullptr,
+                              const int* __restrict__ d_vb = nullptr) {
+  if (d_vb) base = *d_vb;  // P3-A: device-mirrored base (graph-replayable)
   int b = blockIdx.x + (base / 4), d = threadIdx.x;  // absolute block id
   float v = 0.f;
   for (int j = 0; j < 4; j++) {
@@ -521,7 +525,9 @@ __global__ void k_index_pool(const float* proj, const float* norm, float* keys,
                   eps, theta, cs_tab, base);
 }
 
-__global__ void k_index_ring(const float* proj, float* ring, int P, int base = 0) {
+__global__ void k_index_ring(const float* proj, float* ring, int P, int base = 0,
+                             const int* __restrict__ d_vb = nullptr) {
+  if (d_vb) base = *d_vb;  // P3-A: device-mirrored base (graph-replayable)
   int t = max(0, P - 4) + (int)blockIdx.x;
   if (t < P)
     ring[((base + t) % 4) * 128 + threadIdx.x] = proj[(size_t)t * 640 + 512 + threadIdx.x];

@@ -277,6 +277,8 @@ struct GpuModel {
   int* d_pos = nullptr;
   int* d_ringpos = nullptr;
   int* p_token = nullptr;        // pinned staging for token id
+  int* d_vbase = nullptr;        // P3-A: device mirror of the batch base position
+  int* p_vbase = nullptr;        // pinned staging for d_vbase
   int pad_id = 248044;
 
   // ---- MTP speculative draft head (Phase A) ----
@@ -551,6 +553,7 @@ struct GpuModel {
     DALLOC(&d_pos, 4);
     DALLOC(&d_ringpos, 4);
     DALLOC(&d_rdelta, 4);
+    DALLOC(&d_vbase, 4);
     CK(hipMemset(d_pos, 0, 4));
     CK(hipMemset(d_ringpos, 0, 4));
     CK(hipMemset(d_rdelta, 0, 4));
@@ -559,6 +562,7 @@ struct GpuModel {
       DALLOC(&d_rpos1, 4);
     }
     CK(hipHostMalloc((void**)&p_token, 4, hipHostMallocDefault));
+    CK(hipHostMalloc((void**)&p_vbase, 4, hipHostMallocDefault));
     DALLOC(&d_keys, 10240 * 4);
     DALLOC(&d_v, 2560 * 4);
     DALLOC(&d_kn, 10240 * 4);
@@ -1190,6 +1194,19 @@ struct GpuModel {
     fflush(f);
   }
 
+  // P3-A: mirror the batch base position to device so batch-path kernels read
+  // it from memory (a fixed pointer arg replays correctly under graph capture;
+  // a baked scalar would freeze the capture-time base). Same value, same math
+  // -> bit-identical. Stream-ordered: every consumer's public entry re-writes
+  // it before launching. GDEC_VBASE=0 falls back to scalar args everywhere.
+  static bool vbase_on() { return !env_zero("GDEC_VBASE"); }
+  const int* vbptr() const { return vbase_on() ? d_vbase : nullptr; }
+  void set_vbase(int base) {
+    if (!vbase_on()) return;
+    *p_vbase = base;
+    CK(hipMemcpyAsync(d_vbase, p_vbase, 4, hipMemcpyHostToDevice, g_str));
+  }
+
   // Refill the rope cos/sin table only when the chunk's (base, P) changes:
   // one compute per chunk, shared by all 12 QSA layers (stream-ordered).
   // M-RoPE: host fill with the request's per-token 3-row positions,
@@ -1220,7 +1237,9 @@ struct GpuModel {
       CK(hipMemcpy(d_ropecs, h_ropecs_.data(),
                    (size_t)P * 32 * sizeof(float2), hipMemcpyHostToDevice));
     } else {
-      k_rope_cs<<<(P * 32 + 255) / 256, 256, 0, g_str>>>(d_ropecs, base, P);
+      set_vbase(base);
+      k_rope_cs<<<(P * 32 + 255) / 256, 256, 0, g_str>>>(d_ropecs, base, P,
+                                                         vbptr());
     }
     ropecs_base_ = base;
     ropecs_P_ = P;
@@ -2892,7 +2911,8 @@ struct GpuModel {
       float* keys = d_ik + (size_t)qi * ik_layer_blocks * 128;
       k_index_q<<<dim3(P, 4), 128, 0, g_str>>>(d_iproj, d_inorm + qi * 256, d_iq,
                                               P, g_cfg.norm_eps, g_cfg.rope_theta,
-                                              nullptr, base, d_ropecs);
+                                              nullptr, base, d_ropecs, nullptr,
+                                              vbptr());
       // absolute 4-token blocks [base/4, (base+P)/4); a left-straddling block
       // (base%4 != 0) is completed with history rows from the raw ring
       int nb = (base + P) / 4, b0 = base / 4;
@@ -2900,8 +2920,10 @@ struct GpuModel {
         k_index_pool<<<nb - b0, 128, 0, g_str>>>(d_iproj, d_inorm + qi * 256 + 128,
                                                  keys, g_cfg.norm_eps,
                                                  g_cfg.rope_theta, base,
-                                                 d_iraw + qi * 512, d_ropecs, kvpt());
-      k_index_ring<<<min(P, 4), 128, 0, g_str>>>(d_iproj, d_iraw + qi * 512, P, base);
+                                                 d_iraw + qi * 512, d_ropecs, kvpt(),
+                                                 vbptr());
+      k_index_ring<<<min(P, 4), 128, 0, g_str>>>(d_iproj, d_iraw + qi * 512, P, base,
+                                                 vbptr());
       if (spec_snap)
         k_iproj_snap<<<P, 128, 0, g_str>>>(
             d_iproj, d_iproj_snap + (size_t)qi * 9 * 128, P);
@@ -3687,10 +3709,10 @@ struct GpuModel {
                                                     2560, g_cfg.norm_eps, 4);
     int64_t tot = (int64_t)P * 10240;
     k_ple_conv_b<<<(unsigned)((tot + 255) / 256), 256, 0, g_str>>>(
-        d_Unb, d_ple_convw, d_convoutb, P, 10240, base, d_ring);
+        d_Unb, d_ple_convw, d_convoutb, P, 10240, base, d_ring, vbptr());
     k_add2<<<(unsigned)((tot + 255) / 256), 256, 0, g_str>>>(d_Rb, d_Ub, d_convoutb,
                                                              (int)tot);
-    k_ple_ring_wr<<<9, 256, 0, g_str>>>(d_Unb, d_ring, P, 10240, base);
+    k_ple_ring_wr<<<9, 256, 0, g_str>>>(d_Unb, d_ring, P, 10240, base, vbptr());
   }
 
   void enq_layer_b(int l, int P, bool fuse_prev_mlp = false,
@@ -3830,6 +3852,7 @@ struct GpuModel {
       exit(1);
     }
     kv_prepare(base, base + P);  // A2/A3: back (and unshare) rows [base, base+P)
+    set_vbase(base);  // P3-A: all base-reading batch kernels this chunk read d_vbase
     static const bool phase_prof = getenv("GDEC_PHASE") != nullptr;
     auto phase = [&](const char* tag, std::chrono::steady_clock::time_point& tp) {
       if (!phase_prof) return;

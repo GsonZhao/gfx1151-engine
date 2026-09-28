@@ -717,9 +717,11 @@ __global__ void k_rope_b(float* __restrict__ vec, int nheads, int dh, int rotary
 // consumers keep full thread parallelism. Values are bit-identical to the
 // inline expressions in k_rope_b / the fused QSA prep kernels (same libm,
 // same argument expression).
-__global__ void k_rope_cs(float2* __restrict__ tab, int base, int P) {
+__global__ void k_rope_cs(float2* __restrict__ tab, int base, int P,
+                          const int* __restrict__ d_vb = nullptr) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx >= P * 32) return;
+  if (d_vb) base = *d_vb;  // P3-A: device-mirrored base (graph-replayable)
   double ang = (base + (idx >> 5)) * g_rope_tab[idx & 31];
   tab[idx] = make_float2((float)cos(ang), (float)sin(ang));
 }

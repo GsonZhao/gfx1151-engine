@@ -33,9 +33,11 @@ __global__ void k_ple_gate_b(const float* __restrict__ kn,
 __global__ void k_ple_conv_b(const float* __restrict__ Un,
                              const float* __restrict__ cw, float* __restrict__ out,
                              int P, int n, int base = 0,
-                             const float* __restrict__ ring = nullptr) {
+                             const float* __restrict__ ring = nullptr,
+                             const int* __restrict__ d_vb = nullptr) {
   int64_t i = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
   if (i >= (int64_t)P * n) return;
+  if (d_vb) base = *d_vb;  // P3-A: device-mirrored base (graph-replayable)
   int t = (int)(i / n), ch = (int)(i % n);
   int a = base + t;  // absolute position
   const float* c4 = cw + (size_t)ch * 4;
@@ -52,9 +54,11 @@ __global__ void k_ple_conv_b(const float* __restrict__ Un,
 
 // --- PLE ring handoff: ring slot (base+P-9+j)%9 = Un[P-9+j] (negative pos skipped)
 __global__ void k_ple_ring_wr(const float* __restrict__ Un, float* __restrict__ ring,
-                              int P, int n, int base = 0) {
+                              int P, int n, int base = 0,
+                              const int* __restrict__ d_vb = nullptr) {
   int pos = P - 9 + blockIdx.x;
   if (pos < 0) return;
+  if (d_vb) base = *d_vb;  // P3-A: device-mirrored base (graph-replayable)
   const float* src = Un + (size_t)pos * n;
   float* dst = ring + (size_t)((base + pos) % 9) * n;
   for (int i = threadIdx.x; i < n; i += blockDim.x) dst[i] = src[i];

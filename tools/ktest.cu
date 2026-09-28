@@ -411,6 +411,91 @@ int main() {
     TCK(hipFree(dy0)); TCK(hipFree(dy1));
   }
 
+  // ---- 1e. P3-A d_vb device-base plumbing: scalar base vs device-mirrored ----
+  // base must give bit-identical outputs (same value, read from *d_vb).
+  {
+    ensure_rope_tab(1e7, 64);
+    const int P = 5;
+    int* dvb;
+    TCK(hipMalloc(&dvb, 4));
+    auto bit_eq = [&](const char* name, const float* a, const float* b,
+                      size_t n) {
+      std::vector<float> va = dget(a, n), vb2 = dget(b, n);
+      size_t mism = memcmp(va.data(), vb2.data(), n * 4) ? 1 : 0;
+      printf("%-28s bit_mism=%zu %s\n", name, mism, mism ? "FAIL" : "PASS");
+      if (mism) fails++;
+    };
+    for (int base : {0, 8191}) {  // 8191: base%4==3 exercises pool straddle
+      TCK(hipMemcpy(dvb, &base, 4, hipMemcpyHostToDevice));
+      char nm[64];
+      // k_rope_cs
+      float2 *cs0, *cs1;
+      TCK(hipMalloc(&cs0, (size_t)P * 32 * sizeof(float2)));
+      TCK(hipMalloc(&cs1, (size_t)P * 32 * sizeof(float2)));
+      k_rope_cs<<<(P * 32 + 255) / 256, 256>>>(cs0, base, P);
+      k_rope_cs<<<(P * 32 + 255) / 256, 256>>>(cs1, 0, P, dvb);
+      snprintf(nm, sizeof nm, "vbase_rope_cs@%d", base);
+      bit_eq(nm, (const float*)cs0, (const float*)cs1, (size_t)P * 64);
+      // shared inputs for the indexer kernels
+      std::vector<float> proj((size_t)P * 640), nrm(256), ring(4 * 128);
+      for (auto& v : proj) v = frand();
+      for (auto& v : nrm) v = frand() * 0.1f;
+      for (auto& v : ring) v = frand();
+      float *dp = dup(proj), *dn = dup(nrm), *dr = dup(ring);
+      const int nb = (base + P) / 4, b0 = base / 4;
+      // k_index_q
+      float *q0 = dalloc((size_t)P * 512), *q1 = dalloc((size_t)P * 512);
+      k_index_q<<<dim3(P, 4), 128>>>(dp, dn, q0, P, 1e-6f, 1e7, nullptr, base,
+                                     cs0);
+      k_index_q<<<dim3(P, 4), 128>>>(dp, dn, q1, P, 1e-6f, 1e7, nullptr, 0,
+                                     cs0, nullptr, dvb);
+      snprintf(nm, sizeof nm, "vbase_index_q@%d", base);
+      bit_eq(nm, q0, q1, (size_t)P * 512);
+      // k_index_pool
+      float *k0 = dalloc((size_t)nb * 128), *k1 = dalloc((size_t)nb * 128);
+      if (nb > b0) {
+        k_index_pool<<<nb - b0, 128>>>(dp, dn, k0, 1e-6f, 1e7, base, dr, cs0);
+        k_index_pool<<<nb - b0, 128>>>(dp, dn, k1, 1e-6f, 1e7, 0, dr, cs0,
+                                       nullptr, dvb);
+      }
+      snprintf(nm, sizeof nm, "vbase_index_pool@%d", base);
+      bit_eq(nm, k0, k1, (size_t)nb * 128);
+      // k_index_ring
+      float *r0 = dalloc(4 * 128), *r1 = dalloc(4 * 128);
+      k_index_ring<<<min(P, 4), 128>>>(dp, r0, P, base);
+      k_index_ring<<<min(P, 4), 128>>>(dp, r1, P, 0, dvb);
+      snprintf(nm, sizeof nm, "vbase_index_ring@%d", base);
+      bit_eq(nm, r0, r1, 4 * 128);
+      // k_ple_conv_b / k_ple_ring_wr (n=256 miniature)
+      const int n = 256;
+      std::vector<float> Un((size_t)P * n), cw((size_t)n * 4), pring(9 * n);
+      for (auto& v : Un) v = frand();
+      for (auto& v : cw) v = frand() * 0.2f;
+      for (auto& v : pring) v = frand();
+      float *dU = dup(Un), *dcw = dup(cw);
+      float *o0 = dalloc((size_t)P * n), *o1 = dalloc((size_t)P * n);
+      float *pr0 = dup(pring), *pr1 = dup(pring);
+      k_ple_conv_b<<<(P * n + 255) / 256, 256>>>(dU, dcw, o0, P, n, base, pr0);
+      k_ple_conv_b<<<(P * n + 255) / 256, 256>>>(dU, dcw, o1, P, n, 0, pr0,
+                                                 dvb);
+      snprintf(nm, sizeof nm, "vbase_ple_conv_b@%d", base);
+      bit_eq(nm, o0, o1, (size_t)P * n);
+      k_ple_ring_wr<<<9, 256>>>(dU, pr0, P, n, base);
+      k_ple_ring_wr<<<9, 256>>>(dU, pr1, P, n, 0, dvb);
+      snprintf(nm, sizeof nm, "vbase_ple_ring_wr@%d", base);
+      bit_eq(nm, pr0, pr1, (size_t)9 * n);
+      TCK(hipFree(cs0)); TCK(hipFree(cs1));
+      TCK(hipFree(dp)); TCK(hipFree(dn)); TCK(hipFree(dr));
+      TCK(hipFree(q0)); TCK(hipFree(q1));
+      TCK(hipFree(k0)); TCK(hipFree(k1));
+      TCK(hipFree(r0)); TCK(hipFree(r1));
+      TCK(hipFree(dU)); TCK(hipFree(dcw));
+      TCK(hipFree(o0)); TCK(hipFree(o1));
+      TCK(hipFree(pr0)); TCK(hipFree(pr1));
+    }
+    TCK(hipFree(dvb));
+  }
+
   // ---- 2. k_router_topk batched (P blocks, ids/ws rows of 16) ----
   {
     const int P = 3, N = 512, K = 10;
