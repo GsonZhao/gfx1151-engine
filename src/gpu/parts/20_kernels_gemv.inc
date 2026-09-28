@@ -1483,6 +1483,43 @@ __global__ void k_router_topk(const float* __restrict__ logits, int* __restrict_
   }
 }
 
+// Sort the P*k (expert, slot) pairs by expert id (ties by slot index) so
+// same-expert slots become adjacent in k_q4cp_gemv_gg's warp order: the
+// duplicate expert weight reads then execute in the same scheduling window
+// and get served by L2 / in-flight misses instead of DRAM (verify P=5:
+// union/slots ≈ 0.63, unsorted L2 catch only ~35%). Pure scheduling
+// permutation — every output element is computed by the same expression, so
+// results are bit-identical. Single block, bitonic over 256 padded keys
+// (key = expert << 8 | slot; sentinel UINT32_MAX sinks to the tail).
+__global__ void k_moe_sort_slots(const int* __restrict__ ids, int P, int k,
+                                 int id_stride, int* __restrict__ order) {
+  __shared__ unsigned keys[256];
+  const int n = P * k, t = threadIdx.x;
+  for (int i = t; i < 256; i += blockDim.x) {
+    unsigned key = 0xFFFFFFFFu;
+    if (i < n)
+      key = ((unsigned)ids[(i / k) * id_stride + (i % k)] << 8) | (unsigned)i;
+    keys[i] = key;
+  }
+  __syncthreads();
+  for (int size = 2; size <= 256; size <<= 1)
+    for (int stride = size >> 1; stride > 0; stride >>= 1) {
+      for (int i = t; i < 256; i += blockDim.x) {
+        int j = i ^ stride;
+        if (j > i) {
+          bool up = (i & size) == 0;
+          unsigned a = keys[i], b = keys[j];
+          if ((a > b) == up) {
+            keys[i] = b;
+            keys[j] = a;
+          }
+        }
+      }
+      __syncthreads();
+    }
+  for (int i = t; i < n; i += blockDim.x) order[i] = (int)(keys[i] & 0xFFu);
+}
+
 // --- grouped expert GEMV (shared x): slot-major y[(slot, r)] ---------------
 // Batched: nslots = P*kpt; slot -> token tok = slot/kpt, expert s = slot%kpt;
 // x = xs + tok*x_stride, expert id = ids[tok*id_stride + s].
@@ -1495,7 +1532,8 @@ __global__ void k_q4cp_gemv_gg(const uint8_t* __restrict__ codes,
                                const float* __restrict__ x, float* __restrict__ y,
                                const int* __restrict__ ids, uint64_t rows_per,
                                uint64_t cols, uint64_t scale_stride, int nslots,
-                               uint64_t x_stride, int id_stride, int kpt) {
+                               uint64_t x_stride, int id_stride, int kpt,
+                               const int* __restrict__ slot_order = nullptr) {
   __shared__ float cbf[16];
   if (threadIdx.x < 16) cbf[threadIdx.x] = cb[threadIdx.x];
   __syncthreads();
@@ -1503,6 +1541,7 @@ __global__ void k_q4cp_gemv_gg(const uint8_t* __restrict__ codes,
   uint64_t gw = blockIdx.x * (blockDim.x / warpSize) + threadIdx.x / warpSize;
   if (gw >= (uint64_t)nslots * pairs_per_slot) return;
   int slot = gw / pairs_per_slot;
+  if (slot_order) slot = slot_order[slot];  // 同专家相邻（纯调度排列，逐 bit）
   int tok = slot / kpt, s = slot - tok * kpt;
   uint64_t row0 =
       (uint64_t)ids[tok * id_stride + s] * rows_per + (gw % pairs_per_slot) * 2;

@@ -214,6 +214,7 @@ struct GpuModel {
   float* d_routerb;
   int* d_topidsb;
   float* d_topwb;
+  int* d_slot_order = nullptr;  // verify MoE 槽序（k_moe_sort_slots，按专家排序）
   float *d_guvb, *d_hidb, *d_moeaccb, *d_eyb, *d_sgb;
   float* d_eb;              // [maxctx, 2560] PLE embeddings
   float* ple_eb = nullptr;  // pinned staging [maxctx, 2560]
@@ -631,6 +632,7 @@ struct GpuModel {
       DALLOC(&d_routerb, BP * 512 * 4);
       DALLOC(&d_topidsb, BP * 16 * 4);
       DALLOC(&d_topwb, BP * 16 * 4);
+      DALLOC(&d_slot_order, 256 * 4);  // k_moe_sort_slots 输出（P*k ≤ 256）
       // Fused down reuses the otherwise idle gate/up workspace for pair outputs.
       DALLOC(&d_guvb, BP * g_cfg.topk * (moe_deterministic ? 2560 : 1280) * 4);
       DALLOC(&d_hidb, BP * g_cfg.topk * 640 * 4);
@@ -3236,12 +3238,25 @@ struct GpuModel {
       CK(hipMemsetAsync(acc, 0, (size_t)P * g_cfg.d * 4, g_str));
     const int* topidsb = d_topidsb;
     if (naive_path) {
+      // 同专家槽相邻化（k_moe_sort_slots 排序 + gg 查表，纯 warp 调度排列，逐 bit
+      // 不变）。09-28 HQ γ=4 实测：verify gg 351→338µs/层，减去 sort 7.3µs/层后
+      // 净 +0.26 ms/轮（0.3%）——Cache 层级已接住绝大部分重复专家读（未排序 gg 等效
+      // 262 GB/s，已超 DRAM 冷流率），单序列 P=5 收益低于门槛。
+      // 默认关，GDEC_MOE_SORT=1 启用（留待 D2 合批 R≥16、工作集远超 Cache 的场景）。
+      // P=1（串行/draft）单 token topk 专家天然不重复，跳过。
+      static const bool moe_sort =
+          getenv("GDEC_MOE_SORT") != nullptr && !env_zero("GDEC_MOE_SORT");
+      const int* slot_order = nullptr;
+      if (moe_sort && P >= 2 && P * k <= 256) {
+        k_moe_sort_slots<<<1, 128, 0, g_str>>>(topidsb, P, k, 16, d_slot_order);
+        slot_order = d_slot_order;
+      }
       // v3 kernels: 2 rows per warp -> halved warp counts
       uint64_t pairs = (uint64_t)P * k * g_cfg.moe_mid;
       k_q4cp_gemv_gg<<<(unsigned)((pairs + 15) / 16), 512, 0, g_str>>>(
           gu.data + 64, gu.data + 64 + gu.rows * gu.cols / 2, (const float*)gu.data,
           d_xb, d_guvb, topidsb, (uint64_t)2 * g_cfg.moe_mid, gu.cols,
-          gu.scale_stride, P * k, (uint64_t)g_cfg.d, 16, k);
+          gu.scale_stride, P * k, (uint64_t)g_cfg.d, 16, k, slot_order);
       k_silu_mul_g<<<(P * k * g_cfg.moe_mid + 255) / 256, 256, 0, g_str>>>(
           d_guvb, d_hidb, g_cfg.moe_mid, P * k);
       if (direct_down) {

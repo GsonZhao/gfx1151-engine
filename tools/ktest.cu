@@ -496,6 +496,72 @@ int main() {
     TCK(hipFree(dvb));
   }
 
+  // ---- 1f. k_moe_sort_slots + k_q4cp_gemv_gg slot_order: 纯调度排列逐 bit ----
+  {
+    const int P = 5, k = 10, E = 32;  // E 小 → 强制大量重复专家
+    // 独立随机源：不消耗共享 rng，否则其后所有测试的输入整体错位
+    // （gr_combine_b 等按相对误差判定的测试会撞上抵消点而误报）。
+    std::mt19937 rng(0x1f);
+    auto frand = [&] { return std::uniform_real_distribution<float>(-1.f, 1.f)(rng); };
+    const int n = P * k;
+    std::vector<int> ids(P * 16, 0);
+    for (int t = 0; t < P; t++)
+      for (int s = 0; s < k; s++) ids[t * 16 + s] = rng() % E;
+    int* dids = dup(ids);
+    int* dord;
+    TCK(hipMalloc(&dord, 256 * 4));
+    k_moe_sort_slots<<<1, 128>>>(dids, P, k, 16, dord);
+    std::vector<int> ord(n);
+    TCK(hipMemcpy(ord.data(), dord, n * 4, hipMemcpyDeviceToHost));
+    // 合法性：[0,n) 的排列 + 按 (expert, slot) 升序 + 确实打乱了顺序
+    std::vector<char> seen(n, 0);
+    int moved = 0;
+    bool ok = true;
+    for (int i = 0; i < n; i++) {
+      if (ord[i] < 0 || ord[i] >= n || seen[ord[i]]) ok = false;
+      else seen[ord[i]] = 1;
+      if (ord[i] != i) moved++;
+      if (i) {
+        int e0 = ids[(ord[i - 1] / k) * 16 + ord[i - 1] % k];
+        int e1 = ids[(ord[i] / k) * 16 + ord[i] % k];
+        if (e0 > e1 || (e0 == e1 && ord[i - 1] > ord[i])) ok = false;
+      }
+    }
+    printf("%-28s perm_ok=%d moved=%d %s\n", "moe_sort_slots", (int)ok, moved,
+           ok && moved > 0 ? "PASS" : "FAIL");
+    if (!ok || moved == 0) fails++;
+    // gg 带 slot_order vs 不带：逐 bit
+    const uint64_t rows_per = 8, cols = 1024, gpr = cols / 32;
+    std::vector<uint8_t> codes((size_t)E * rows_per * cols / 2);
+    for (auto& v : codes) v = (uint8_t)rng();
+    std::vector<uint8_t> scales((size_t)E * rows_per * gpr * 2);
+    __half* sh = (__half*)scales.data();
+    for (size_t i = 0; i < (size_t)E * rows_per * gpr; i++)
+      sh[i] = __float2half(0.01f + 0.005f * frand());
+    std::vector<float> cb(16), x((size_t)P * cols);
+    for (auto& v : cb) v = frand();
+    for (auto& v : x) v = frand();
+    uint8_t* dc = dup(codes);
+    uint8_t* dsc = dup(scales);
+    float *dcb = dup(cb), *dx = dup(x);
+    float *y0 = dalloc((size_t)n * rows_per), *y1 = dalloc((size_t)n * rows_per);
+    uint64_t pairs = (uint64_t)n * ((rows_per + 1) / 2);
+    k_q4cp_gemv_gg<<<(unsigned)((pairs + 15) / 16), 512>>>(
+        dc, dsc, dcb, dx, y0, dids, rows_per, cols, gpr * 2, n, cols, 16, k);
+    k_q4cp_gemv_gg<<<(unsigned)((pairs + 15) / 16), 512>>>(
+        dc, dsc, dcb, dx, y1, dids, rows_per, cols, gpr * 2, n, cols, 16, k,
+        dord);
+    std::vector<float> va = dget(y0, (size_t)n * rows_per),
+                       vb2 = dget(y1, (size_t)n * rows_per);
+    size_t mism = memcmp(va.data(), vb2.data(), va.size() * 4) ? 1 : 0;
+    printf("%-28s bit_mism=%zu %s\n", "gg_slot_order", mism,
+           mism ? "FAIL" : "PASS");
+    if (mism) fails++;
+    TCK(hipFree(dids)); TCK(hipFree(dord));
+    TCK(hipFree(dc)); TCK(hipFree(dsc)); TCK(hipFree(dcb)); TCK(hipFree(dx));
+    TCK(hipFree(y0)); TCK(hipFree(y1));
+  }
+
   // ---- 2. k_router_topk batched (P blocks, ids/ws rows of 16) ----
   {
     const int P = 3, N = 512, K = 10;
