@@ -17,7 +17,7 @@ gfx1151)**, 122 GiB RAM:
 
 | Metric | Value |
 | --- | --- |
-| Prefill (128K context) | ~1200–1400 tok/s |
+| Prefill (128K context) | ~1400–1470 tok/s |
 | Decode (speculative) | ~54–55 tok/s at 8K/32K context, ~36–45 tok/s at 64K (depends on weight format) |
 | Decode (no speculation) | ~25–30 tok/s (depends on weight format) |
 | Average power draw | ~120 W |
