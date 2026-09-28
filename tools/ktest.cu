@@ -325,6 +325,41 @@ int main() {
     TCK(hipFree(dx16));
   }
 
+  // ---- 1c. k_f32_gemv_mr (iproj P<=8 decode path): vs fp64 CPU ref ----
+  {
+    const int rows = 640, cols = 2560;
+    std::vector<float> w((size_t)rows * cols), x4((size_t)4 * cols);
+    for (auto& v : w) v = frand();
+    for (auto& v : x4) v = frand();
+    float* dw = dup(w);
+    float* dx4 = dup(x4);
+    float* dy4 = dalloc((size_t)4 * rows);
+    float* dy1 = dalloc((size_t)rows);
+    k_f32_gemv_mr<4><<<(rows + 15) / 16, 512>>>(dw, dx4, dy4, rows, cols);
+    k_f32_gemv_mr<1><<<(rows + 15) / 16, 512>>>(dw, dx4, dy1, rows, cols);
+    std::vector<float> y4 = dget(dy4, (size_t)4 * rows);
+    std::vector<float> y1 = dget(dy1, rows);
+    double mx = 0;
+    size_t p1mism = 0;
+    for (int p = 0; p < 4; p++)
+      for (int r = 0; r < rows; r++) {
+        double ref = 0;
+        for (int k = 0; k < cols; k++)
+          ref += (double)w[(size_t)r * cols + k] * x4[(size_t)p * cols + k];
+        mx = std::max(mx, fabs(y4[(size_t)p * rows + r] - ref) /
+                              std::max(1.0, fabs(ref)));
+        if (p == 0 && y1[r] != y4[r]) p1mism++;
+      }
+    printf("%-28s p1_vs_p4row0_mism=%zu %s\n", "f32_gemv_mr_p1", p1mism,
+           p1mism == 0 ? "PASS" : "FAIL");
+    if (p1mism) fails++;
+    check("f32_gemv_mr", mx, 1e-4);
+    TCK(hipFree(dw));
+    TCK(hipFree(dx4));
+    TCK(hipFree(dy4));
+    TCK(hipFree(dy1));
+  }
+
   // ---- 2. k_router_topk batched (P blocks, ids/ws rows of 16) ----
   {
     const int P = 3, N = 512, K = 10;

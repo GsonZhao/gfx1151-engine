@@ -2769,6 +2769,30 @@ struct GpuModel {
   void iproj_sgemm(const float* w, const float* x, float* y, int P) {
     const float one = 1.f, zero = 0.f;
     static const bool plain = getenv("GDEC_IPROJ_SGEMM") != nullptr;
+    // GDEC_IPROJ_GEMV=1: decode-P (<=8) multi-row fp32 GEMV in place of
+    // rocblas_sgemm's MT32x32x8 (20 blocks, ~110 us at P=4 vs ~36 us streaming
+    // the 6.5 MB weight once). NOT bit-exact vs sgemm (lane-split reorder) —
+    // opt-in pending KLD + sign-off.
+    static const bool use_gemv = getenv("GDEC_IPROJ_GEMV") != nullptr;
+    if (use_gemv && !plain && P >= 1 && P <= 8) {
+      const unsigned blocks = (640 + 15) / 16;  // 16 warps (512 thr) per block
+      switch (P) {
+#define GDEC_IPROJ_GV(PP)                                                \
+  case PP:                                                               \
+    k_f32_gemv_mr<PP><<<blocks, 512, 0, g_str>>>(w, x, y, 640, 2560);    \
+    break;
+        GDEC_IPROJ_GV(1)
+        GDEC_IPROJ_GV(2)
+        GDEC_IPROJ_GV(3)
+        GDEC_IPROJ_GV(4)
+        GDEC_IPROJ_GV(5)
+        GDEC_IPROJ_GV(6)
+        GDEC_IPROJ_GV(7)
+        GDEC_IPROJ_GV(8)
+#undef GDEC_IPROJ_GV
+      }
+      return;
+    }
     auto sol_run = [&](int idx) {
       return rocblas_gemm_ex(
           rbh, rocblas_operation_transpose, rocblas_operation_none, 640, P,

@@ -222,6 +222,42 @@ __global__ void k_bf16_gemv_mr(const uint16_t* __restrict__ w,
   }
 }
 
+// --- fp32-weight multi-row GEMV: y[P,N] = x[P,K] . W[N,K]^T (fp32 weights) ---
+// One warp per row, lane-strided float4. For small-N fp32 projections at
+// decode P (indexer iproj N=640 K=2560) where rocBLAS picks latency-bound
+// tiles (MT32x32x8, 20 blocks, ~110 us); this streams W once (~36 us).
+// NOT bit-exact vs rocblas_sgemm (lane-split + tree reduce reorder the sum).
+template <int P>
+__global__ void k_f32_gemv_mr(const float* __restrict__ w,
+                              const float* __restrict__ x,
+                              float* __restrict__ y, uint64_t rows,
+                              uint64_t cols) {
+  uint64_t row = blockIdx.x * (blockDim.x / warpSize) + threadIdx.x / warpSize;
+  if (row >= rows) return;
+  int lane = threadIdx.x % warpSize;
+  const float* rw = w + row * cols;
+  float acc[P];
+#pragma unroll
+  for (int p = 0; p < P; p++) acc[p] = 0.f;
+  for (uint64_t c = lane * 4; c < cols; c += warpSize * 4) {
+    float4 wv = *(const float4*)(rw + c);
+#pragma unroll
+    for (int p = 0; p < P; p++) {
+      float4 xv = *(const float4*)(x + (size_t)p * cols + c);
+      acc[p] += wv.x * xv.x;
+      acc[p] += wv.y * xv.y;
+      acc[p] += wv.z * xv.z;
+      acc[p] += wv.w * xv.w;
+    }
+  }
+#pragma unroll
+  for (int p = 0; p < P; p++) {
+    for (int off = warpSize / 2; off > 0; off >>= 1)
+      acc[p] += __shfl_down_sync(~0ull, acc[p], off);
+    if (lane == 0) y[(size_t)p * rows + row] = acc[p];
+  }
+}
+
 // --- q8g64 multi-row GEMV (overlay o_proj): [codes uint8 x cols][(s,m) fp16 per 64] ---
 template <int P, bool XBF16 = false>
 __global__ void k_q8g64_gemv_mr(const uint8_t* __restrict__ w,
