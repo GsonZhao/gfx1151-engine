@@ -1633,29 +1633,10 @@ struct GpuModel {
   // Batched GEMM: Y[P,N] = X[P,K] . W[N,K]^T. W dequanted to bf16 workspace,
   // X converted to bf16; rocBLAS col-major mapping: C_cm[N,P] with
   // A = W (transa=T, lda=K), B = X (transb=N, ldb=K), C = Y (ldc=N).
-  void gemm(const WView& w, const float* x, float* y, int P, uint64_t xstride = 0,
-            const uint16_t* xbf = nullptr) {
-    auto pt0 = std::chrono::steady_clock::now();
+  // W -> bf16 for the LT / WMMA paths: dense bf16 is used in place, the
+  // quantized dtypes dequant into the shared d_wbf16 scratch (<= 64 MiB).
+  const uint16_t* gemm_wbf16(const WView& w) {
     uint64_t N = w.rows, K = w.cols;
-    if (!xstride) xstride = K;
-    // Small P: direct multi-row q4 gemv reads the weight once (~0.56x bytes
-    // of the dequant->bf16->LT path's traffic) and skips 3 launches/gemm.
-    // xbf inputs are bf16 with row stride K (the LT B layout).
-    bool mr_done =
-        xbf ? gemv_multi_q4cp(w, xbf, y, P, K, true)
-            : gemv_multi_q4cp(w, x, y, P, xstride);
-    if (mr_done) {
-      if (prof)
-        p_gemm += std::chrono::duration<double, std::milli>(
-                      std::chrono::steady_clock::now() - pt0)
-                      .count();
-      return;
-    }
-    static const bool gemm_dbg = getenv("GDEC_GEMM_DBG") != nullptr;
-    if (gemm_dbg)
-      fprintf(stderr, "gemm-LT: dtype=%d N=%llu K=%llu P=%d xbf=%d xs=%llu\n",
-              w.dtype, (unsigned long long)N, (unsigned long long)K, P,
-              (int)(xbf != nullptr), (unsigned long long)xstride);
     const uint16_t* wp = nullptr;
     if (w.dtype == 0) {
       wp = (const uint16_t*)w.data;
@@ -1684,6 +1665,33 @@ struct GpuModel {
     } else {
       throw std::runtime_error("gemm: unsupported dtype");
     }
+    return wp;
+  }
+
+  void gemm(const WView& w, const float* x, float* y, int P, uint64_t xstride = 0,
+            const uint16_t* xbf = nullptr) {
+    auto pt0 = std::chrono::steady_clock::now();
+    uint64_t N = w.rows, K = w.cols;
+    if (!xstride) xstride = K;
+    // Small P: direct multi-row q4 gemv reads the weight once (~0.56x bytes
+    // of the dequant->bf16->LT path's traffic) and skips 3 launches/gemm.
+    // xbf inputs are bf16 with row stride K (the LT B layout).
+    bool mr_done =
+        xbf ? gemv_multi_q4cp(w, xbf, y, P, K, true)
+            : gemv_multi_q4cp(w, x, y, P, xstride);
+    if (mr_done) {
+      if (prof)
+        p_gemm += std::chrono::duration<double, std::milli>(
+                      std::chrono::steady_clock::now() - pt0)
+                      .count();
+      return;
+    }
+    static const bool gemm_dbg = getenv("GDEC_GEMM_DBG") != nullptr;
+    if (gemm_dbg)
+      fprintf(stderr, "gemm-LT: dtype=%d N=%llu K=%llu P=%d xbf=%d xs=%llu\n",
+              w.dtype, (unsigned long long)N, (unsigned long long)K, P,
+              (int)(xbf != nullptr), (unsigned long long)xstride);
+    const uint16_t* wp = gemm_wbf16(w);
     uint64_t tot = (uint64_t)P * K;
     bool residual_ready =
         !xbf && prefill_fused && x == d_Rhatb && K == 10240 && xstride == K;
@@ -1933,6 +1941,42 @@ struct GpuModel {
     }
   }
 
+  // #51 HC gate fusion: the mix-up GEMM (N=10240 K=320) with the
+  // k_gr_combine_b_hc_bf16 epilogue folded in (k_gemm_wmma Epi=1, W rows
+  // permuted at LDS staging so one lane holds the 4 branch gates of its
+  // channel). Same X and W bf16 prep as the gw_d9n route in gemm(); the
+  // tile / column->block assignment changes but not the K order -> G and x are
+  // bit-identical, and the P x 10240 fp32 G never goes to DRAM. Writes d_xb
+  // (fp32) + d_xbf16 exactly like the unfused pair. Returns false (caller
+  // runs the unfused pair) unless that exact route would have been taken.
+  // Opt-out GDEC_HC_FUSE=0 (tools/hcmix_verify.sh).
+  bool hc_up_fused(const WView& w, int P) {
+    static const bool on = !env_zero("GDEC_HC_FUSE") &&
+                           getenv("GDEC_GEMM_WMMA") != nullptr &&
+                           getenv("GDEC_GEMM_RB") == nullptr;
+    const uint64_t N = w.rows, K = w.cols;
+    if (!on || P < 1024 || N != 10240 || K != 320 || g_cfg.branches != 4 ||
+        (uint64_t)g_cfg.d * 4 != N)
+      return false;
+    if ((((uintptr_t)d_t320b | (uintptr_t)d_xbf16b) & 15) != 0) return false;
+    auto pt0 = std::chrono::steady_clock::now();
+    const uint16_t* wp = gemm_wbf16(w);
+    const uint64_t tot = (uint64_t)P * K;
+    k_f32_to_bf16_v4<<<(unsigned)((tot / 4 + 255) / 256), 256, 0, g_str>>>(
+        d_t320b, d_xbf16b, K, P, (int)K);
+    // 128x128 w4x2 f2x4 (tools/hcmix_proto.cu tile sweep): the fused epilogue
+    // favours the narrower tile — 2.33 vs 2.80 ms at P=8192 (pair 4.92 ms),
+    // still bit-identical (K accumulation order is tile-independent).
+    const unsigned grid = (unsigned)(((P + 127) / 128) * (int)(N / 128));
+    k_gemm_wmma<128, 128, 4, 2, 2, 4, 32, 256, 1><<<grid, 256, 0, g_str>>>(
+        d_xbf16b, wp, d_xb, P, (int)K, (int)N, 2, d_Rhatbf16, d_xbf16);
+    if (prof)
+      p_gemm += std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - pt0)
+                    .count();
+    return true;
+  }
+
   void gr_mix_b(const std::string& prefix, int P) {
     char buf[128];
     snprintf(buf, sizeof buf, "%s.input_mix_weight_down.weight", prefix.c_str());
@@ -1940,7 +1984,14 @@ struct GpuModel {
          gr_bf16 ? d_Rhatbf16 : nullptr);
     k_silu_scale<<<(P * 320 + 255) / 256, 256, 0, g_str>>>(d_t320b, 0.25f, P * 320);
     snprintf(buf, sizeof buf, "%s.input_mix_weight_up.weight", prefix.c_str());
-    gemm(wview(ckpt.at(buf)), d_t320b, d_Gb, P);
+    const WView wup = wview(ckpt.at(buf));
+    if (prefill_fused && gr_bf16 && hc_up_fused(wup, P)) {
+      xf16_src = d_xb;
+      xf16_xs = xf16_K = g_cfg.d;
+      xf16_P = P;
+      return;
+    }
+    gemm(wup, d_t320b, d_Gb, P);
     if (prefill_fused) {
       if (gr_bf16)
         k_gr_combine_b_hc_bf16<<<P, 256, 0, g_str>>>(

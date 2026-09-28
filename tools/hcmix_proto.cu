@@ -142,9 +142,9 @@ int main(int argc, char** argv) {
     auto comb = [&] {
       k_gr_combine_b_hc_bf16<<<P, 256>>>(G, R, x0, d, 4, P, xb0);
     };
-    auto fused = [&] {
-      k_gemm_wmma<128, 256, 2, 4, 4, 4, 32, 256, 1>
-          <<<grid, 256>>>(X, W, x1, P, K, N, 2, R, xb1);
+    auto fused = [&] {  // engine config (40_model.inc hc_up_fused)
+      k_gemm_wmma<128, 128, 4, 2, 2, 4, 32, 256, 1>
+          <<<(unsigned)(((P + 127) / 128) * (N / 128)), 256>>>(X, W, x1, P, K, N, 2, R, xb1);
     };
     CK(hipMemset(x1, 0xff, (size_t)P * d * 4));
     CK(hipMemset(xb1, 0xff, (size_t)P * d * 2));

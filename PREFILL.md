@@ -198,6 +198,7 @@ kernel 链演进（头注释 gdec.cpp:6-15）：
 | `GDEC_INDEX_OLDSEL=1` | top-512 回退 rocPRIM 排序版 |
 | `GDEC_INDEX_SCORE64=0` | fused 打分回退旧 `k_index_scores_tiled`（16q×32k；新版默认开，逐 bit 一致） |
 | `GDEC_INDEX_SEL2P=0` | n>8192 选块回退旧 stream / rocPRIM 版（两遍精确 `k_index_select_2p` 默认开，逐 bit 一致） |
+| `GDEC_HC_FUSE=0` | HC mix-up GEMM 回退“GEMM 写 fp32 G + `k_gr_combine_b_hc_bf16`”两 kernel（融合版 `hc_up_fused` 默认开，需 `GDEC_GEMM_WMMA=1` + `GDEC_GR_BF16=1`，逐 bit 一致） |
 | `GDEC_MROPE_DUMP=<file>` | dump RoPE 表（调试用，会同步流） |
 | `GDEC_PREFILL_TAIL_SLACK=<n>` | 尾包合并上限（默认 Linux 1024 / Windows 0；0 禁用） |
 | `GDEC_GR_SCAT4=1` | GR scatter+norm 单 block/token 实验（实测 -0.8%，勿开） |
@@ -467,6 +468,31 @@ kernel 链演进（头注释 gdec.cpp:6-15）：
       （例如边打分边做直方图）。打分还有约 2× 的余地，要么继续调 fp32，
       要么换 bf16/fp8 WMMA（不再 bit-exact，要先做长上下文 KLD）。再就是
       和上下文无关的恒定差距：8K chunk 5.72 s，halogen 是 5.17 s。
+
+11. **HC 门控融合 #51（2026-09-28 完成，逐 bit 等价，默认开）**：
+    - 恒定差距 profile（rocprofv3，32K 第 3 个 8K chunk，kernel 合计 5746 ms）：
+      dense `k_gemm_wmma<128,256>` 1107 ms，MoE `k_moe_lut` 925 + 560 ms，
+      `k_qsa_wmma` 443，`k_gemm_wmma<64,128>` 420，`k_gdn_fused` 328；
+      HC 链合计约 990 ms（17%），其中 `gr_combine` 309、`scatter_norm` 264、
+      down mix `<64,160>` 237，up GEMM 约 180。可做 epilogue 融合的小 kernel：
+      gdn_conv_b 105、gatednorm 86、l2norm_qk 44、qsplit 43、sigmoid_gate 31，
+      各类转换约 80，dequant 25。
+    - 改动：`gr_mix_b` 在 `prefill_fused && gr_bf16` 时改走 `Model::hc_up_fused`，
+      用 `k_gemm_wmma<128,128,4,2,2,4,32,256,Epi=1>`（gm=2）一次算完 up GEMM
+      (N=10240, K=320) 加 sigmoid 门控和 4 branch 平均，直接写 d_xb（fp32）和
+      d_xbf16。P×10240 的 fp32 G 不再落 DRAM。W 行在 LDS staging 时重排（逻辑列
+      r → W 行 `((r>>4)&3)*d + (r>>6)*16 + (r&15)`），一个 lane 拿到自己通道的
+      4 个门控。K 累加顺序不变，所以结果逐 bit 一致。W→bf16 的逻辑抽成了
+      `gemm_wbf16()`，和 `gemm()` 共用。MTP batch 路径和非 WMMA 路径不变。
+    - tile 选择：原型 tile 扫描显示，融合 epilogue 下 128×128 w4x2 比生产用的
+      128×256 快：P=8192 时 2.33 vs 2.80 ms（原两 kernel 合计 4.92 ms，×2.11）。
+    - 验证（`bash tools/hcmix_verify.sh`，约 5 分钟，PASS）：原型 P=16384 / 8192
+      / 8199 / 1024 加 13 个 tile 配置，fp32 和 bf16 都 0 diff。2051（P 尾块）和
+      32K `--ppl` 新旧 ppl_token 加 summary 逐字节一致（32K mean_nll
+      4.1262937295）。32K prefill 23.44 → 22.47 s（1398 → 1458 tok/s，+4.3%），
+      每个 chunk 提升约 60 tok/s。
+    - Windows 启动器没开 `GDEC_GEMM_WMMA`（README 已注明，TheRock 下未验证），
+      所以融合在 Windows 上不生效。
 
 ## 附：本文档的未复核项
 
