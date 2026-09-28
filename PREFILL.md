@@ -95,6 +95,10 @@ MoE 激活同样直传 bf16（`GDEC_MOE_FP32_IO=1` 回退）。
   radix，sort-free，n≤8192）或 rocPRIM block radix sort 版
   `k_index_select`（613）；调度 `index_select()`（954-969）。raw 尾部
   由 4-slot ring `k_index_ring`（574）提供。
+  2026-09-28 起 fused 路径（`GDEC_INDEX_FUSED2=1`，生产默认）默认改用
+  `src/gpu/parts/09_kernels_index.inc` 里的两个逐 bit 等价快版：打分
+  `k_index_scores_t64`（64q×128k，旧 kernel 也搬到了这个文件），n>8192
+  时选块用 `k_index_select_2p`（两遍精确 top-512）。详见 §11 第 10 条。
 - 主 kernel `k_qsa_flash`（gdec.cpp:3003，配置注释 2983-2996）：
   128 线程（4 warp）× 16 q 行 × 1 head/block；K/V 以 8 宽块流式；
   q、K 块驻 LDS（pitch 260 floats 防 bank 冲突）；V 直读全局走 L2；
@@ -192,6 +196,8 @@ kernel 链演进（头注释 gdec.cpp:6-15）：
 | `GDEC_MOE_HOST_ROUTE=1` / `GDEC_MOE_UNTILED=1` | MoE 路由/切分回退 |
 | `GDEC_MOE_FP32_IO=1` | MoE 激活回退 fp32 staging |
 | `GDEC_INDEX_OLDSEL=1` | top-512 回退 rocPRIM 排序版 |
+| `GDEC_INDEX_SCORE64=0` | fused 打分回退旧 `k_index_scores_tiled`（16q×32k；新版默认开，逐 bit 一致） |
+| `GDEC_INDEX_SEL2P=0` | n>8192 选块回退旧 stream / rocPRIM 版（两遍精确 `k_index_select_2p` 默认开，逐 bit 一致） |
 | `GDEC_MROPE_DUMP=<file>` | dump RoPE 表（调试用，会同步流） |
 | `GDEC_PREFILL_TAIL_SLACK=<n>` | 尾包合并上限（默认 Linux 1024 / Windows 0；0 禁用） |
 | `GDEC_GR_SCAT4=1` | GR scatter+norm 单 block/token 实验（实测 -0.8%，勿开） |
@@ -425,6 +431,42 @@ kernel 链演进（头注释 gdec.cpp:6-15）：
      1.76 s、GDN fused 1.26 s、GR combine/scatter 2.3 s（§11.7 已关闭）。
      还没做的方向只剩 k_qsa_wmma 调优（大工程）以及 MoE 小形状 Lt
      solution 挑选（每个形状收益 <0.3 s，需逐形状确认确定性）。
+10. **2026-09-28 长上下文 indexer（128K 掉速）**。先做了归因：pp.sh 同款
+    env、128K、chunk 8192，工具是 rocprofv3 + GDEC_PHASE=2。GDN 层每
+    chunk 恒定 3.7–3.8 s，上下文变长后的增量全在 12 个 QSA 层。按 kernel
+    看，每 8K chunk 从最早一个到最后一个（120K–128K）：
+    - `k_index_scores_tiled`：65 → 708 ms（fp32 约 4.5 TFLOPS，卡在 LDS
+      带宽：每 8 个 FMA 要读 6 次 LDS）；
+    - 选块：rs 52 ms → stream 212 ms（stream 版每行要扫 5 遍全局分数）；
+    - `k_qsa_wmma`：431 → 640 ms；
+    - 其余 kernel 恒定约 4.86 s。
+    PLE 已排除（ple_wait ≤6 ms）。`GDEC_QSA_UNION=1` 实测几乎不变。
+    改动（逐 bit 等价，默认开，opt-out 见 §9）：
+    - **`k_index_scores_t64`**：64 query × 128 key 瓦片，每线程 4q×4h×8k =
+      128 个累加器，16-d 分段 LDS（q `[16][260]` / k `[16][132]`）加寄存器预取，
+      191 VGPR，无 spill。bit-exact 的关键是同一个 block 里的 key 必须
+      K 循环起点相同：d0=((b/32)&1)*64。所以一个 block 取 256-key 超块里
+      同奇偶的 4 组 32 key（blockIdx.x=2m+p → key 256m+32p+64g）。每个
+      分数仍是从 0 开始的同一条 fmaf 链，head ReLU 求和顺序和 ×0.0883883
+      都不变。grid = `index_t64_grid(nb,count)`。
+    - **`k_index_select_2p`**：第 1 遍用 LDS 做 8192 桶直方图（fp32 位型
+      >>18；分数 ≥0，位型单调），找出第 512 名所在的桶 T。第 2 遍把桶 >T
+      的直接收下，桶 ==T 的进 LDS 候选区（上限 4096）。在 LDS 里用 4×8-bit
+      MSD 定出精确阈值；平分时按 ~id 再做一次 radix，保证“分高优先，同分
+      取小 id”。最后用 bitonic 排序输出 512 个升序 id。候选超出上限时，
+      回退成流式 radix 遍，结果仍然精确。
+    - 单测 `tools/index_fast_test.cu`：9 组形状打分全矩阵 memcmp，选块和
+      stream/rs 对比，包括平分极多的合成行，以及强制走 fallback 的 cap=0/64，
+      全部一致。kernel 速度：128K 最后一批打分 7.54 → 3.84 ms（×1.96，
+      8.9 TFLOPS），选块 1.99 → 1.14 ms；256K 分别 ×2.11 和 ×2.9。
+    - 端到端（`bash tools/index_fast_verify.sh`，约 12 分钟，PASS）：128K
+      `--ppl` 新旧的 131071 个 ppl_token 行加 summary 逐字节一致（mean_nll
+      3.8209512576）。128K prefill 整体 101.1 → 97.4 s（1296 → 1345 tok/s，
+      +3.8%），最后一个 chunk 1198 → 1285（+7.2%），首个 chunk 持平。
+    - 还剩的 128K 差距：选块已经是两遍读分数、贴着带宽，再往下只能改算法
+      （例如边打分边做直方图）。打分还有约 2× 的余地，要么继续调 fp32，
+      要么换 bf16/fp8 WMMA（不再 bit-exact，要先做长上下文 KLD）。再就是
+      和上下文无关的恒定差距：8K chunk 5.72 s，halogen 是 5.17 s。
 
 ## 附：本文档的未复核项
 

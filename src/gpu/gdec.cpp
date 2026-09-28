@@ -144,6 +144,7 @@
 #include "parts/00_platform.inc"
 #include "parts/05_config.inc"
 #include "parts/06_memstats.inc"
+#include "parts/09_kernels_index.inc"
 #include "parts/10_ple_io.inc"
 #include "parts/20_kernels_gemv.inc"
 #include "parts/21_kernels_ple.inc"

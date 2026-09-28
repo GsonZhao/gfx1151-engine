@@ -51,6 +51,15 @@ struct GpuModel {
   bool index_f32 = getenv("GDEC_INDEX_BF16") == nullptr;
   bool index_fused2 = getenv("GDEC_INDEX_FUSED2") != nullptr;
   bool index_stream_select = getenv("GDEC_INDEX_STREAM_SELECT") != nullptr;
+  // Fused-path fast kernels (09_kernels_index.inc), bit-exact, default on:
+  // GDEC_INDEX_SCORE64=0 -> old k_index_scores_tiled; GDEC_INDEX_SEL2P=0 ->
+  // old selector for n > 8192 (stream / rocPRIM per GDEC_INDEX_STREAM_SELECT).
+  bool index_score64 = !env_zero("GDEC_INDEX_SCORE64");
+  bool index_sel2p = !env_zero("GDEC_INDEX_SEL2P");
+  static bool env_zero(const char* k) {
+    const char* v = getenv(k);
+    return v && v[0] == '0' && v[1] == 0;
+  }
   int* d_iselected = nullptr;
   int index_blocks = 0;
   // Paged QSA KV (memory model Phase A1). The trunk FP32 KV cache (d_kc/d_vc)
@@ -2642,12 +2651,18 @@ struct GpuModel {
                                : min(first + INDEX_BATCH, base + P);
         int count = nxt - first;
         if (index_fused2 && count >= 16 && getenv("GDEC_INDEX_OLDSEL") == nullptr) {
-          k_index_scores_tiled<<<dim3((nb + 31) / 32, (count + 15) / 16), 256, 0, g_str>>>(
-              d_iq + (size_t)(first - base) * 512, skeys, d_iscores, nb, count, first);
+          if (index_score64)
+            k_index_scores_t64<<<index_t64_grid(nb, count), 256, 0, g_str>>>(
+                d_iq + (size_t)(first - base) * 512, skeys, d_iscores, nb, count, first);
+          else
+            k_index_scores_tiled<<<dim3((nb + 31) / 32, (count + 15) / 16), 256, 0, g_str>>>(
+                d_iq + (size_t)(first - base) * 512, skeys, d_iscores, nb, count, first);
           int* const selrow = d_iselected + (size_t)(first - base) * 512;  // batch-local
           if ((first + count) / 4 <= 8192)
             k_index_select_rs<true><<<count, 256, 0, g_str>>>(
                 d_iscores, nb, selrow, first);
+          else if (index_sel2p)
+            k_index_select_2p<<<count, 256, 0, g_str>>>(d_iscores, nb, selrow, first);
           else if (index_stream_select)
             k_index_select_stream<true><<<count, 256, 0, g_str>>>(
                 d_iscores, nb, selrow, first);
@@ -4086,12 +4101,18 @@ struct GpuModel {
         static const bool mtp_sgemm = getenv("GDEC_MTP_INDEX_SGEMM") != nullptr;
         if (index_fused2 && !mtp_sgemm && count >= 16 &&
             getenv("GDEC_INDEX_OLDSEL") == nullptr) {
-          k_index_scores_tiled<<<dim3((nb + 31) / 32, (count + 15) / 16), 256, 0, g_str>>>(
-              d_iq + (size_t)(first - base) * 512, skeys, d_iscores, nb, count, first);
+          if (index_score64)
+            k_index_scores_t64<<<index_t64_grid(nb, count), 256, 0, g_str>>>(
+                d_iq + (size_t)(first - base) * 512, skeys, d_iscores, nb, count, first);
+          else
+            k_index_scores_tiled<<<dim3((nb + 31) / 32, (count + 15) / 16), 256, 0, g_str>>>(
+                d_iq + (size_t)(first - base) * 512, skeys, d_iscores, nb, count, first);
           int* const selrow = d_iselected + (size_t)(first - base) * 512;
           if ((first + count) / 4 <= 8192)
             k_index_select_rs<true><<<count, 256, 0, g_str>>>(
                 d_iscores, nb, selrow, first);
+          else if (index_sel2p)
+            k_index_select_2p<<<count, 256, 0, g_str>>>(d_iscores, nb, selrow, first);
           else if (index_stream_select)
             k_index_select_stream<true><<<count, 256, 0, g_str>>>(
                 d_iscores, nb, selrow, first);
