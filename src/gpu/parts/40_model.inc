@@ -387,6 +387,14 @@ struct GpuModel {
   // via D2D, one blocking D2H collects the chain. 0 restores per-step sync.
   const bool draft_desync =
       !getenv("GDEC_DRAFT_DESYNC") || atoi(getenv("GDEC_DRAFT_DESYNC")) != 0;
+  // Draft-only vocab subset (first N rows of lm_head, FR-Spec style): greedy
+  // draft argmax over the subset; verify is untouched, so committed output is
+  // unchanged even when the true argmax lies outside. 0 = full vocab.
+  // Greedy argmax path only; sampling drafts keep the full distribution.
+  const int draft_vocab = [] {
+    const char* e = getenv("GDEC_DRAFT_VOCAB");
+    return e ? atoi(e) : 0;
+  }();
 
   explicit GpuModel(const Checkpoint& c, int mc) : ckpt(c), maxctx(mc) {
     // Prefill workspace is sized by maxbatch, NOT maxctx: long prompts are
@@ -4220,7 +4228,14 @@ struct GpuModel {
     mtp_moe(d_x, d_y);
     mtp_gr_write("mtp.layers.0.mlp_hyper_connection", d_y);
     mtp_gr_read("mtp.hyper_connection_mixer", d_x);
-    gemv(dlm_on ? w_dlm : wview(ckpt.at("lm_head.weight")), d_x, d_logits);
+    WView lm = dlm_on ? w_dlm : wview(ckpt.at("lm_head.weight"));
+    const int dvn =
+        (draft_vocab > 0 && !host_logits) ? std::min(draft_vocab, g_cfg.vocab)
+                                          : 0;
+    if (dvn)  // q4cp scales sit behind a codes region sized by lm.rows; nrows
+      gemv(lm, d_x, d_logits, 0, (uint64_t)dvn);  // keeps that base intact
+    else
+      gemv(lm, d_x, d_logits);
     int id = -1;
     if (host_logits) {
       host_logits->resize(g_cfg.vocab);
@@ -4228,7 +4243,8 @@ struct GpuModel {
                    hipMemcpyDeviceToHost));
     } else if (argmax_out) {
       int* dst = d_amx_out ? d_amx_out : d_argmax;
-      argmax_rows(d_logits, g_cfg.vocab, 1, d_amx_cand, dst, g_str);
+      argmax_rows(d_logits, dvn ? dvn : g_cfg.vocab, 1, d_amx_cand, dst,
+                  g_str);
       if (!d_amx_out) CK(hipMemcpy(&id, d_argmax, 4, hipMemcpyDeviceToHost));
     }
     mtp_pos++;
