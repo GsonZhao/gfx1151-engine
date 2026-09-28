@@ -2167,10 +2167,20 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
     // MTP speculation is available for greedy and rejection-sampled
     // requests when its KV can be made complete: a fresh prefill, or a
     // restore (rckpt/kvsnap) of a state saved with the MTP layer live.
-    static const int spec_gamma = std::max(
-        1, std::min(8, getenv("GDEC_SPEC_GAMMA")
-                           ? atoi(getenv("GDEC_SPEC_GAMMA"))
-                           : 3));
+    // GDEC_SPEC_GAMMA 覆盖；未设时按模式自选：greedy 4（09-28 重扫 γ=4：MTP 8K
+    // +6%/32K +9%，chain-greedy +5.6%/+11.5%），采样 3（拒绝采样验收率低，
+    // 深链不划算：8K 三种子 γ=3 46.7 vs γ=4 44.8 tok/s，32K 持平）。
+    static const char* sg_env = getenv("GDEC_SPEC_GAMMA");
+    const int spec_gamma =
+        std::max(1, std::min(8, sg_env ? atoi(sg_env) : (g.sample ? 3 : 4)));
+    if (!sg_env) {  // 让 auto 默认在 serve 日志里可观测（每模式只打一次）
+      static bool said[2] = {false, false};
+      if (!said[g.sample]) {
+        said[g.sample] = true;
+        fprintf(stderr, "[gamma] GDEC_SPEC_GAMMA 未设：%s 请求默认 gamma=%d\n",
+                g.sample ? "采样" : "greedy", spec_gamma);
+      }
+    }
     if (g.drafter == 1 && !m.mtp_avail) {
       finish(err_line());
       return;

@@ -43,11 +43,11 @@ serve_init() {
     done
   fi
   local key value cmd
-  for key in ENGINE_PORT API_PORT MAX_CONTEXT MTP_GAMMA MEMORY_CAP_GB MIN_AVAILABLE_GB START_TIMEOUT STALL_TIMEOUT; do
+  for key in ENGINE_PORT API_PORT MAX_CONTEXT MEMORY_CAP_GB MIN_AVAILABLE_GB START_TIMEOUT STALL_TIMEOUT; do
     value="${!key}"
     [[ "$value" =~ ^[1-9][0-9]*$ && ${#value} -le 8 ]] || fail "$key 必须为正整数"
   done
-  for key in KVSNAP_MAX_GB RCKPT_MAX KV_POOL_TOKENS; do
+  for key in KVSNAP_MAX_GB RCKPT_MAX KV_POOL_TOKENS MTP_GAMMA; do
     value="${!key}"
     [[ "$value" =~ ^(0|[1-9][0-9]*)$ && ${#value} -le 8 ]] || fail "$key 必须为非负整数"
   done
@@ -56,7 +56,7 @@ serve_init() {
   [[ "$PARALLEL" =~ ^[1-8]$ ]] || fail 'PARALLEL 范围为 1–8'
   (( PARALLEL == 1 || KV_PAGED )) || fail 'PARALLEL>1 需要 KV_PAGED=1'
   (( ENGINE_PORT <= 65535 && API_PORT <= 65535 && ENGINE_PORT != API_PORT )) || fail '端口必须为不同的 1–65535 整数'
-  (( MTP_GAMMA <= 8 )) || fail 'MTP_GAMMA 范围为 1–8'
+  (( MTP_GAMMA <= 8 )) || fail 'MTP_GAMMA 范围为 0–8（0=引擎按模式自选 greedy 4 / 采样 3）'
   for cmd in flock ss systemctl stat awk pgrep setsid; do command -v "$cmd" >/dev/null || fail "缺少命令：$cmd"; done
   systemctl --user show-environment >/dev/null || fail 'systemd 用户会话不可用，请通过普通用户 SSH 登录运行'
   [[ -x build/gdec && -x build/gdec-api ]] || fail '缺少编译产物，请先运行 bash build.sh'
@@ -114,13 +114,14 @@ serve_run() {
   fi
   export GDEC_PARALLEL="$PARALLEL"
   # --serve reads GDEC_SPEC_GAMMA; --gamma is for offline --spec-gen.
-  export GDEC_SPEC_GAMMA="$MTP_GAMMA"
+  # MTP_GAMMA=0：不导出，引擎按请求模式自选（greedy 4 / 采样 3）。
+  if (( MTP_GAMMA > 0 )); then export GDEC_SPEC_GAMMA="$MTP_GAMMA"; fi
   local engine=("$ROOT/build/gdec" "${MODEL_ARGS[@]}" --serve --port "$ENGINE_PORT" --maxctx "$MAX_CONTEXT")
   [[ -z "$VISION" ]] || engine+=(--vision-tower "$VISION")
 
   echo "项目：$ROOT"
   echo "权重：$FORMAT，$MAIN_MODEL"
-  echo "配置：${MAX_CONTEXT} 上下文，MTP gamma=${MTP_GAMMA}，API ${API_HOST}:${API_PORT}"
+  echo "配置：${MAX_CONTEXT} 上下文，MTP gamma=$([[ $MTP_GAMMA == 0 ]] && echo 'auto（greedy 4 / 采样 3）' || echo "$MTP_GAMMA")，API ${API_HOST}:${API_PORT}"
   if (( KV_PAGED )); then
     echo "KV：分页，页池 $(( (KV_POOL_TOKENS > MAX_CONTEXT ? KV_POOL_TOKENS : MAX_CONTEXT) )) token（${PARALLEL} 路并发共享），RAM 检查点 ${RCKPT_MAX} 个"
   else
