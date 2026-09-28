@@ -251,7 +251,22 @@ static void devarena_init(const Checkpoint& ck, int maxctx) {
             need / 1073741824.0, slack_gb, cap_gb);
     target = cap;
   }
-  CK(hipMalloc(&g_devarena, target));
+  fprintf(stderr, "devarena: requesting %.2f GiB (estimate %.2f + slack %.2f GiB)\n",
+          target / 1073741824.0, need / 1073741824.0, slack_gb);
+  hipError_t aerr = hipMalloc(&g_devarena, target);
+  if (aerr != hipSuccess) {
+    fprintf(stderr,
+            "devarena: hipMalloc(%.2f GiB) failed: %s\n"
+            "  this is the process's first large allocation and must land entirely\n"
+            "  in VRAM as one block. Check:\n"
+            "  1) BIOS VRAM carve-out (256K config needs ~95 GiB; assign 96 GiB),\n"
+            "     or shrink MAX_CONTEXT / GDEC_ARENA_CAP_GB to fit a smaller carve-out\n"
+            "  2) no other process holding VRAM (single engine; close browsers/games)\n"
+            "  3) TheRock DLLs from build/ sit next to the exe — stale HIP SDK DLLs\n"
+            "     in System32 cap one allocation at 41 GiB and fail here\n",
+            target / 1073741824.0, hipGetErrorString(aerr));
+  }
+  CK(aerr);
   g_devarena_sz = target;
   fprintf(stderr, "devarena: %.2f GiB reserved (estimate %.2f GiB)\n",
           target / 1073741824.0, need / 1073741824.0);
