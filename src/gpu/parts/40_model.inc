@@ -383,6 +383,10 @@ struct GpuModel {
   float* d_csnap = nullptr;    // [maxbatch+1][ngdn][3*10240]
   float* d_iproj_snap = nullptr;  // [nqsa][maxbatch+1][128]
   bool spec_snap = false;         // set around spec verify chunks only
+  // Greedy draft chain without per-step D2H: step j reads step j-1's argmax
+  // via D2D, one blocking D2H collects the chain. 0 restores per-step sync.
+  const bool draft_desync =
+      !getenv("GDEC_DRAFT_DESYNC") || atoi(getenv("GDEC_DRAFT_DESYNC")) != 0;
 
   explicit GpuModel(const Checkpoint& c, int mc) : ckpt(c), maxctx(mc) {
     // Prefill workspace is sized by maxbatch, NOT maxctx: long prompts are
@@ -4194,13 +4198,19 @@ struct GpuModel {
 
   // One full MTP draft step: appends (tap, tok) at mtp_pos. Greedy callers get
   // the argmax; sampling callers request the full logits instead.
+  // d_tok_in: read the input token from this device pointer instead of the
+  // host `tok`. d_amx_out: write argmax here on-device and skip the D2H.
   int mtp_step(const float* tap, int tok,
                std::vector<float>* host_logits = nullptr,
-               bool argmax_out = true) {
+               bool argmax_out = true, const int* d_tok_in = nullptr,
+               int* d_amx_out = nullptr) {
     // B0: row mtp_pos is in the shared pool; drafts run ahead of the trunk
     // (rows pos-1 .. pos+gamma-2), so map / un-share the page first
     kv_prepare(mtp_pos, mtp_pos + 1);
-    CK(hipMemcpyAsync(d_mtok, &tok, 4, hipMemcpyHostToDevice, g_str));
+    if (d_tok_in)
+      CK(hipMemcpyAsync(d_mtok, d_tok_in, 4, hipMemcpyDeviceToDevice, g_str));
+    else
+      CK(hipMemcpyAsync(d_mtok, &tok, 4, hipMemcpyHostToDevice, g_str));
     CK(hipMemcpyAsync(d_mpos, &mtp_pos, 4, hipMemcpyHostToDevice, g_str));
     mtp_input_1(tap);
     mtp_gr_read("mtp.layers.0.attn_hyper_connection", d_x);
@@ -4217,8 +4227,9 @@ struct GpuModel {
       CK(hipMemcpy(host_logits->data(), d_logits, (size_t)g_cfg.vocab * 4,
                    hipMemcpyDeviceToHost));
     } else if (argmax_out) {
-      argmax_rows(d_logits, g_cfg.vocab, 1, d_amx_cand, d_argmax, g_str);
-      CK(hipMemcpy(&id, d_argmax, 4, hipMemcpyDeviceToHost));
+      int* dst = d_amx_out ? d_amx_out : d_argmax;
+      argmax_rows(d_logits, g_cfg.vocab, 1, d_amx_cand, dst, g_str);
+      if (!d_amx_out) CK(hipMemcpy(&id, d_argmax, 4, hipMemcpyDeviceToHost));
     }
     mtp_pos++;
     return id;
@@ -5018,12 +5029,23 @@ struct GpuModel {
       size_t chist_sz = chist.size();
       mtp_ckpt_save();
       auto t0 = std::chrono::steady_clock::now();
-      drafts[0] = mtp_step(d_R, cur);
       // draft 1 used the committed (h_q, cur): its indexer ring rows are
       // truth. Later drafts pollute the ring; save/restore around them.
-      CK(hipMemcpyAsync(d_mring_ckpt, d_miraw, 512 * 4, hipMemcpyDeviceToDevice,
-                        g_str));
-      for (int j = 1; j < g; j++) drafts[j] = mtp_step(d_mR, drafts[j - 1]);
+      if (draft_desync) {
+        mtp_step(d_R, cur, nullptr, true, nullptr, d_argmax_arr);
+        CK(hipMemcpyAsync(d_mring_ckpt, d_miraw, 512 * 4, hipMemcpyDeviceToDevice,
+                          g_str));
+        for (int j = 1; j < g; j++)
+          mtp_step(d_mR, 0, nullptr, true, d_argmax_arr + j - 1,
+                   d_argmax_arr + j);
+        CK(hipMemcpy(drafts.data(), d_argmax_arr, (size_t)g * sizeof(int),
+                     hipMemcpyDeviceToHost));
+      } else {
+        drafts[0] = mtp_step(d_R, cur);
+        CK(hipMemcpyAsync(d_mring_ckpt, d_miraw, 512 * 4, hipMemcpyDeviceToDevice,
+                          g_str));
+        for (int j = 1; j < g; j++) drafts[j] = mtp_step(d_mR, drafts[j - 1]);
+      }
       auto t1 = std::chrono::steady_clock::now();
       std::vector<int> vt;
       vt.reserve(g + 1);
@@ -5353,11 +5375,22 @@ struct GpuModel {
         size_t chist_sz = chist.size();
         mtp_ckpt_save();
         auto t0 = std::chrono::steady_clock::now();
-        drafts[0] = mtp_step(d_R, cur);
         // draft 1's indexer ring rows are truth; later drafts pollute them.
-        CK(hipMemcpyAsync(d_mring_ckpt, d_miraw, 512 * 4,
-                          hipMemcpyDeviceToDevice, g_str));
-        for (int j = 1; j < g; j++) drafts[j] = mtp_step(d_mR, drafts[j - 1]);
+        if (draft_desync) {
+          mtp_step(d_R, cur, nullptr, true, nullptr, d_argmax_arr);
+          CK(hipMemcpyAsync(d_mring_ckpt, d_miraw, 512 * 4,
+                            hipMemcpyDeviceToDevice, g_str));
+          for (int j = 1; j < g; j++)
+            mtp_step(d_mR, 0, nullptr, true, d_argmax_arr + j - 1,
+                     d_argmax_arr + j);
+          CK(hipMemcpy(drafts.data(), d_argmax_arr, (size_t)g * sizeof(int),
+                       hipMemcpyDeviceToHost));
+        } else {
+          drafts[0] = mtp_step(d_R, cur);
+          CK(hipMemcpyAsync(d_mring_ckpt, d_miraw, 512 * 4,
+                            hipMemcpyDeviceToDevice, g_str));
+          for (int j = 1; j < g; j++) drafts[j] = mtp_step(d_mR, drafts[j - 1]);
+        }
         std::vector<int> vt;
         vt.reserve(g + 1);
         vt.push_back(cur);
