@@ -395,6 +395,12 @@ struct GpuModel {
     const char* e = getenv("GDEC_DRAFT_VOCAB");
     return e ? atoi(e) : 0;
   }();
+  // Dump top-2 verify logits for rows near absolute position N (draft
+  // dependence forensics: tiny margin at a fork = fp tie-flip, large = leak).
+  const int fork_dump = [] {
+    const char* e = getenv("GDEC_FORK_DUMP");
+    return e ? atoi(e) : 0;
+  }();
 
   explicit GpuModel(const Checkpoint& c, int mc) : ckpt(c), maxctx(mc) {
     // Prefill workspace is sized by maxbatch, NOT maxctx: long prompts are
@@ -5071,6 +5077,22 @@ struct GpuModel {
       prefill_batch(vt, q + 1, true, true);
       spec_snap = false;
       batch_argmax(g + 1, v.data());
+      if (fork_dump) {
+        for (int j = 0; j <= g; j++) {
+          int apos = q + 1 + j;
+          if (apos < fork_dump - 4 || apos > fork_dump + 4) continue;
+          std::vector<float> L(g_cfg.vocab);
+          CK(hipMemcpy(L.data(), d_logits_b + (size_t)j * g_cfg.vocab,
+                       (size_t)g_cfg.vocab * 4, hipMemcpyDeviceToHost));
+          int t1 = 0, t2 = 1;
+          for (int i = 1; i < g_cfg.vocab; i++)
+            if (L[i] > L[t1]) { t2 = t1; t1 = i; }
+            else if (t2 == t1 || L[i] > L[t2]) t2 = i;
+          fprintf(stderr,
+                  "[fork] pos=%d row=%d top1=%d %.4f top2=%d %.4f margin=%.6f\n",
+                  apos, j, t1, L[t1], t2, L[t2], L[t1] - L[t2]);
+        }
+      }
       auto t2 = std::chrono::steady_clock::now();
       int a = 0;
       while (a < g && drafts[a] == v[a]) a++;
