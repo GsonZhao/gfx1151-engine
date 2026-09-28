@@ -92,6 +92,33 @@ __global__ void k_moe_reduce_pw(const float* __restrict__ pairs,
   out[(size_t)t * Dd + d] = sum;
 }
 
+// k_moe_reduce_pw + the shared-expert add of k_axpy_sg (40_model.inc) in one
+// pass: out = reduce + sigmoid(sg[t]) * ey[t][d]. Same expressions as the two
+// kernels (the add contracts to the same fma as `acc[i] += s * y[i]`), so the
+// result is bit-identical; saves the second read + write of out.
+template <int K>
+__global__ void k_moe_reduce_pw_sg(const float* __restrict__ pairs,
+                                   const int* __restrict__ pairids,
+                                   const float* __restrict__ pw,
+                                   const float* __restrict__ ey,
+                                   const float* __restrict__ sg,
+                                   float* __restrict__ out, int P, int Dd) {
+  __shared__ int ids[K];
+  int tid = threadIdx.x;
+  int t = blockIdx.y, d = tid + (int)blockIdx.x * blockDim.x;
+  if (t >= P) return;
+  if (tid < K) ids[tid] = pairids[t * K + tid];
+  __syncthreads();
+  if (d >= Dd) return;
+  float sum = 0.f;
+#pragma unroll
+  for (int s = 0; s < K; s++) sum += pw[ids[s]] * pairs[(size_t)ids[s] * Dd + d];
+  const size_t i = (size_t)t * Dd + d;
+  float s = 1.f / (1.f + expf(-sg[t]));
+  sum += s * ey[i];
+  out[i] = sum;
+}
+
 // bf16 pair variant (fp32 accumulate).
 template <int K>
 __global__ void k_moe_reduce_pw_bf16(const __hip_bfloat16* __restrict__ pairs,

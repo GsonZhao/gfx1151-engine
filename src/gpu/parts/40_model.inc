@@ -1331,8 +1331,8 @@ struct GpuModel {
   // hgn q4cp routed experts through the LUT-decode WMMA kernels (GDEC_MOE_Q4W):
   // same prefill workspaces / dataflow as moe_gguf's P > 1 branch; acc f32
   // [P][d] fully overwritten. Returns false (nothing launched) if unsupported.
-  bool moe_q4w_run(const WView& gu, const WView& dn, const float* x, const int* topids,
-                   const float* topw, float* acc, int P) {
+  // Whether moe_q4w_run(gu, dn, ..., P) will take the LUT path (no launches).
+  bool moe_q4w_ok(const WView& gu, const WView& dn, int P) const {
     const int k = g_cfg.topk, E = g_cfg.experts, d = g_cfg.d, mid = g_cfg.moe_mid;
     if (!moe_q4w || k != 10 || !moe_deterministic || moe_host_route || moe_ordered ||
         moe_untiled || P > maxbatch_cap || gu.dtype != 5 || dn.dtype != 5 ||
@@ -1341,9 +1341,18 @@ struct GpuModel {
       return false;
     const moelut::LutW pgu = lut_q4cp_view(gu.data, gu.rows, gu.cols, gu.scale_stride, 2 * mid, mid);
     const moelut::LutW pdn = lut_q4cp_view(dn.data, dn.rows, dn.cols, dn.scale_stride, d, 0);
-    if (mid % 64 || d % 128 || !moelut::lut_ok(moelut::kQ4CP, pgu, true, d) ||
-        !moelut::lut_ok(moelut::kQ4CP, pdn, false, mid))
-      return false;
+    return !(mid % 64 || d % 128 || !moelut::lut_ok(moelut::kQ4CP, pgu, true, d) ||
+             !moelut::lut_ok(moelut::kQ4CP, pdn, false, mid));
+  }
+  // ey/sg (optional): shared-expert output + gate logit, added in the reduce
+  // (k_moe_reduce_pw_sg) instead of by k_axpy_sg afterwards.
+  bool moe_q4w_run(const WView& gu, const WView& dn, const float* x, const int* topids,
+                   const float* topw, float* acc, int P, const float* ey = nullptr,
+                   const float* sg = nullptr) {
+    const int k = g_cfg.topk, E = g_cfg.experts, d = g_cfg.d, mid = g_cfg.moe_mid;
+    if (!moe_q4w_ok(gu, dn, P)) return false;
+    const moelut::LutW pgu = lut_q4cp_view(gu.data, gu.rows, gu.cols, gu.scale_stride, 2 * mid, mid);
+    const moelut::LutW pdn = lut_q4cp_view(dn.data, dn.rows, dn.cols, dn.scale_stride, d, 0);
     static bool logged = false;
     if (!logged) {
       logged = true;
@@ -1360,8 +1369,12 @@ struct GpuModel {
                g_str);
     moe_lut_down(moelut::kQ4CP, pdn, hid, d_moetiles, d_moentiles, max_tiles, d_guvb, d, mid,
                  g_str);
-    k_moe_reduce_pw<10><<<dim3((d + 255) / 256, P), 256, 0, g_str>>>(d_guvb, d_pairids, d_pweight,
-                                                                     acc, P, d);
+    if (ey)
+      k_moe_reduce_pw_sg<10><<<dim3((d + 255) / 256, P), 256, 0, g_str>>>(
+          d_guvb, d_pairids, d_pweight, ey, sg, acc, P, d);
+    else
+      k_moe_reduce_pw<10><<<dim3((d + 255) / 256, P), 256, 0, g_str>>>(d_guvb, d_pairids,
+                                                                       d_pweight, acc, P, d);
     return true;
   }
 
@@ -2660,6 +2673,7 @@ struct GpuModel {
   // positions. GDEC_QSA_LOOP=1 falls back to the per-token loop (debug).
   void qsa_b(int l, int qi, int P, int base = 0) {
     char buf[128];
+    const uint16_t* attn_bf = nullptr;  // gated o_proj input already in bf16
     if (!qsa_dense) {
       // rope cos/sin table for the indexer kernels below (idempotent; the QSA
       // prep path re-ensures the same (base, P) later and hits the cache)
@@ -2762,9 +2776,15 @@ struct GpuModel {
       ensure_rope_cs(base, P);
       // fused: qsplit+rope (K1) and knorm+rope[+bf16 store] (K2), bit-exact
       // vs the previous qsplit / rmsnorm_zc / rope_b x2 / convert chain
-      k_qsa_qsplit<true><<<dim3(24, P), 256, 0, g_str>>>(d_qgb, qnw, d_qsb, d_gsb,
-                                                         256, g_cfg.norm_eps, base,
-                                                         d_ropecs);
+      // P > 8: o_proj takes the dequant->bf16->GEMM path (P <= 8 would run
+      // the multi-row GEMV on fp32 x), so the output gate + bf16 convert fuse
+      // into k_sigmoid_gate_bf16_v4, which reads the gate half of d_qgb
+      // directly (qsplit skips its gs copy). GDEC_QSA_GATE_BF16=0 disables.
+      static const bool gate_bf16_on = !env_zero("GDEC_QSA_GATE_BF16");
+      const bool gate_bf16 = gate_bf16_on && P > 8;
+      k_qsa_qsplit<true><<<dim3(24, P), 256, 0, g_str>>>(
+          d_qgb, qnw, d_qsb, gate_bf16 ? nullptr : d_gsb, 256, g_cfg.norm_eps, base,
+          d_ropecs);
       int dense_P = qsa_dense ? P : min(P, std::max(0, 2051 - base));
       if (qsa_kv_fp32) {
         float* kc = d_kc + qsa_off;
@@ -2851,8 +2871,15 @@ struct GpuModel {
         qsa_flash_b(kc, vc, P, dense_P, base, vct, kvpt());
         if (base > 0 && getenv("GDEC_ATTN_HASH")) dbg_attn_hash(qi, base, P, kc, vc, vct);
       }
-      k_sigmoid_gate<<<(P * 6144 + 255) / 256, 256, 0, g_str>>>(d_attnb, d_gsb,
-                                                                d_attnb, P * 6144);
+      if (gate_bf16) {  // see qsplit above
+        const uint64_t n4 = (uint64_t)P * 6144 / 4;
+        k_sigmoid_gate_bf16_v4<<<(unsigned)((n4 + 255) / 256), 256, 0, g_str>>>(
+            d_attnb, d_qgb, d_xbf16b, n4);
+        attn_bf = d_xbf16b;
+      } else {
+        k_sigmoid_gate<<<(P * 6144 + 255) / 256, 256, 0, g_str>>>(d_attnb, d_gsb,
+                                                                  d_attnb, P * 6144);
+      }
     } else {
       for (int t = 0; t < P; t++) {
         const int* pabs = d_posarr + base + t;  // absolute position
@@ -2889,7 +2916,7 @@ struct GpuModel {
       }
     }
     snprintf(buf, sizeof buf, "layers.%d.self_attn.o_proj.weight", l);
-    gemm(wview(ckpt.at(buf)), d_attnb, d_yb, P);
+    gemm(wview(ckpt.at(buf)), d_attnb, d_yb, P, 0, attn_bf);
   }
 
   // MoE: router batched; expert GEMVs grouped over P*k slots (naive: full
@@ -2911,6 +2938,18 @@ struct GpuModel {
     WView gu = wview(ckpt.at(buf));
     snprintf(buf, sizeof buf, "layers.%d.mlp.experts.down_proj.weight", l);
     WView dn = wview(ckpt.at(buf));
+    // Shared expert first (its scratch d_guvb/d_hidb/d_xbf16b is dead before
+    // the routed experts reuse it), so its add folds into the routed reduce.
+    // GDEC_MOE_SG_FUSE=0: old order + k_axpy_sg.
+    static const bool sg_fuse = !env_zero("GDEC_MOE_SG_FUSE");
+    if (!moe_naive && P > moe_naive_max && sg_fuse && moe_q4w_ok(gu, dn, P)) {
+      moe_b_shared_ey(l, P);
+      moe_q4w_run(gu, dn, d_xb, d_topidsb, d_topwb, acc, P, d_eyb, d_sgb);
+      if (!direct_output)
+        CK(hipMemcpyAsync(d_yb, acc, (size_t)P * g_cfg.d * 4, hipMemcpyDeviceToDevice,
+                          g_str));
+      return;
+    }
     if (!moe_naive && P > moe_naive_max &&
         moe_q4w_run(gu, dn, d_xb, d_topidsb, d_topwb, acc, P)) {
       moe_b_shared(l, P, acc, direct_output);
@@ -3357,6 +3396,15 @@ struct GpuModel {
 
   // Shared expert of trunk layer l added into acc (routed sum), then acc -> d_yb.
   void moe_b_shared(int l, int P, float* acc, bool direct_output) {
+    moe_b_shared_ey(l, P);
+    k_axpy_sg<<<(P * 2560 + 255) / 256, 256, 0, g_str>>>(acc, d_eyb, d_sgb,
+                                                         g_cfg.d, P * g_cfg.d);
+    if (!direct_output)
+      CK(hipMemcpyAsync(d_yb, acc, (size_t)P * g_cfg.d * 4, hipMemcpyDeviceToDevice,
+                        g_str));
+  }
+  // Shared expert output d_eyb [P][d] and gate logit d_sgb [P].
+  void moe_b_shared_ey(int l, int P) {
     char buf[128];
     // shared expert (gate/up scratch in d_guvb head, silu out in d_hidb head)
     snprintf(buf, sizeof buf, "layers.%d.mlp.shared_expert.gate_proj.weight", l);
@@ -3369,11 +3417,6 @@ struct GpuModel {
     gemm(wview(ckpt.at(buf)), d_hidb, d_eyb, P);
     snprintf(buf, sizeof buf, "layers.%d.mlp.shared_expert_gate.weight", l);
     gemm(wview(ckpt.at(buf)), d_xb, d_sgb, P);
-    k_axpy_sg<<<(P * 2560 + 255) / 256, 256, 0, g_str>>>(acc, d_eyb, d_sgb,
-                                                         g_cfg.d, P * g_cfg.d);
-    if (!direct_output)
-      CK(hipMemcpyAsync(d_yb, acc, (size_t)P * g_cfg.d * 4, hipMemcpyDeviceToDevice,
-                        g_str));
   }
 
   // PLE device phase for one prefill token (embeddings already in d_eb).
@@ -5968,7 +6011,7 @@ __global__ void k_qsa_qsplit(const float* __restrict__ qg, const float* __restri
     __syncthreads();
   }
   float inv = rsqrtf(sm[0] / dh + eps);
-  if (t < dh) gs[h * dh + t] = qg[h * 2 * dh + dh + t];
+  if (gs && t < dh) gs[h * dh + t] = qg[h * 2 * dh + dh + t];  // null: gate read from qg
   if (!Rope) {
     if (t < dh) qs[h * dh + t] = v * inv * (1.f + qnw[t]);
     return;

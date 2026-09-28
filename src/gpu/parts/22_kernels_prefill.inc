@@ -162,6 +162,26 @@ __global__ void k_f32_to_bf16_v4(const float* __restrict__ x,
   *(uint2*)(out + i4 * 4) = pk;
 }
 
+// k_sigmoid_gate (a / (1 + exp(-g)), same expression) + the o_proj input
+// conversion k_f32_to_bf16_v4 in one pass, bf16 out. The gate is read straight
+// from the q_proj output qg [P][24][2][256] (the half k_qsa_qsplit would copy
+// into gs), so qsplit skips that copy. a/out: [P][6144] flat, n4 = P*6144/4.
+__global__ void k_sigmoid_gate_bf16_v4(const float* __restrict__ a,
+                                       const float* __restrict__ qg,
+                                       uint16_t* __restrict__ out, uint64_t n4) {
+  uint64_t i4 = blockIdx.x * (uint64_t)blockDim.x + threadIdx.x;
+  if (i4 >= n4) return;
+  const uint64_t i = i4 * 4, t = i / 6144, r = i - t * 6144;
+  float4 v = *(const float4*)(a + i);
+  float4 w = *(const float4*)(qg + t * 12288 + (r >> 8) * 512 + 256 + (r & 255));
+  uint16_t o[4] = {f2bf(v.x / (1.f + expf(-w.x))), f2bf(v.y / (1.f + expf(-w.y))),
+                   f2bf(v.z / (1.f + expf(-w.z))), f2bf(v.w / (1.f + expf(-w.w)))};
+  uint2 pk;
+  pk.x = (uint32_t)o[0] | ((uint32_t)o[1] << 16);
+  pk.y = (uint32_t)o[2] | ((uint32_t)o[3] << 16);
+  *(uint2*)(out + i) = pk;
+}
+
 // Compact BF16 [P,512] V rows into block-transposed
 // [block][kvh][dim][slot] storage. Each thread owns one dimension of one KV
 // head and packs the four token slots, so the WMMA V gather can issue one

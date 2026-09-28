@@ -200,6 +200,8 @@ kernel 链演进（头注释 gdec.cpp:6-15）：
 | `GDEC_INDEX_SEL2P=0` | n>8192 选块回退旧 stream / rocPRIM 版（两遍精确 `k_index_select_2p` 默认开，逐 bit 一致） |
 | `GDEC_HC_FUSE=0` | HC mix-up GEMM 回退“GEMM 写 fp32 G + `k_gr_combine_b_hc_bf16`”两 kernel（融合版 `hc_up_fused` 默认开，需 `GDEC_GEMM_WMMA=1` + `GDEC_GR_BF16=1`，逐 bit 一致） |
 | `GDEC_GDN_CONVL2=0` | GDN conv+silu 与 q/k L2 norm 回退 `k_gdn_conv_b` + `k_l2norm_qk_b` 两 kernel（融合版 `k_gdn_conv_l2n_b` 默认开，逐 bit 一致） |
+| `GDEC_MOE_SG_FUSE=0` | 共享专家加法回退路由 reduce 之后单独的 `k_axpy_sg`（融合版先算共享专家，再由 `k_moe_reduce_pw_sg` 一并加上；只在 q4cp LUT 路由路径生效，逐 bit 一致） |
+| `GDEC_QSA_GATE_BF16=0` | QSA 输出门控回退 `k_sigmoid_gate` 就地写 fp32 + o_proj 自行转 bf16（融合版 `k_sigmoid_gate_bf16_v4` 直接读 d_qgb 的 gate 半边，qsplit 不再拷 gs；P>8 生效，逐 bit 一致） |
 | `GDEC_MROPE_DUMP=<file>` | dump RoPE 表（调试用，会同步流） |
 | `GDEC_PREFILL_TAIL_SLACK=<n>` | 尾包合并上限（默认 Linux 1024 / Windows 0；0 禁用） |
 | `GDEC_GR_SCAT4=1` | GR scatter+norm 单 block/token 实验（实测 -0.8%，勿开） |
@@ -511,6 +513,33 @@ kernel 链演进（头注释 gdec.cpp:6-15）：
         4.12 → 3.03 ms（×1.36，36 层每个 chunk 约省 39 ms）。
       - 2051 和 32K `--ppl` 逐字节一致（32K mean_nll 4.1262937295）。
       - 32K prefill 新旧各跑 2 次取最快：1463.5 → 1472.7 tok/s（+0.63%）。
+
+13. **共享专家加法 + QSA 输出门控融合（2026-09-28 完成，逐 bit 等价，默认开）**：
+    - `k_axpy_sg`（每 chunk 50 ms）折进路由 reduce：`moe_b` 先调
+      `moe_b_shared_ey` 算出 d_eyb / d_sgb。此时它的 scratch（d_guvb 头部、
+      d_hidb、d_xbf16b）还没被路由路径占用，之后路由路径覆盖它们也无妨。然后
+      `moe_q4w_run` 用 `k_moe_reduce_pw_sg` 在 reduce 收尾时做
+      `sum += sigmoid(sg)*ey`，和原来 `acc += s*y` 收缩成同一个 FMA。
+      `moe_q4w_ok()` 抽成了不发 kernel 的判定函数。
+    - QSA：`k_sigmoid_gate`（31 ms）加 o_proj 输入转换 `k_f32_to_bf16_v4`
+      （P×6144，16 ms）合成 `k_sigmoid_gate_bf16_v4`，直接写 d_xbf16b，gemm 走
+      `xbf` 入口。gate 直接从 d_qgb 读，`k_qsa_qsplit` 传 gs=nullptr，省掉
+      P×6144 的拷贝。只在 P>8 时启用：P≤8 时 gemm 走 fp32 x 的多行 GEMV，传
+      bf16 会改变数值。
+    - 验证（`bash tools/epi_verify.sh`，约 4 分钟，PASS）：
+      - 2051 `--ppl` 全关、单开、全开三种都逐字节一致；32K 全关 vs 全开逐字节
+        一致（mean_nll 4.1262937295）。
+      - 32K prefill 新旧各跑 2 次取最快：1472.1 → 1488.8 tok/s（+1.13%，基线已含
+        第 12 项）。
+    - 评估过、没做的：
+      - gatednorm 折进 `k_gdn_fused`：逐 bit 复现它的 stride 64→1 归约树，需要
+        在 LDS 里暂存 64×128 的 f32 tile（32 KB），而 kernel 已用 56 KB / 64 KB，
+        放不下。改成回读 L2 的方案净收益约 10 ms，还会拉长关键路径。
+      - MoE 输入 f32→f16（24 ms）由 `hc_up_fused` 顺带输出：要和共享专家抢
+        d_xbf16b / d_hidb，收益约 17 ms。
+      - `k_gdn_fused` 尾波：192 VGPR 加 1024 线程，一个 WGP 只能放一个 block。
+        20 个 WGP 跑 48 个头要 3 轮（20+20+8），效率约 80%。理论上每个 chunk
+        能省约 66 ms，但要按 v 列重新切分并重复算 k 侧的 solve，改动大。
 
 ## 附：本文档的未复核项
 
