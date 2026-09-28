@@ -2212,10 +2212,20 @@ struct GpuModel {
       static bool said = false;
       if (!said) { said = true; fprintf(stderr, "[hc-inj-fuse] on (inject GEMM folded into scatter_norm)\n"); }
       const int nxt = injp_cur == 0 ? 1 : 0;  // pin != pout
-      k_gr_scatter_norm_inj_bf16<4><<<4 * ((P + 3) / 4), 256, 0, g_str>>>(
-          have_p ? nullptr : d_w4b, have_p ? d_injp[injp_cur] : nullptr,
-          (uint16_t*)d_Rb, d_yb, hw, d_Rhatbf16, wn, d_injp[nxt], g_cfg.d, P,
-          g_cfg.norm_eps);
+      // Verify sizes (P<=8): 1 token/block -> 4P blocks instead of 4*ceil(P/4).
+      // Per-(t,b) arithmetic is T-invariant (proto: R/Rhat bit-identical), the
+      // 4-token serial loop was pure latency at 4 blocks. GDEC_SCAT_T1=0: T=4.
+      static const bool scat_t1 = !env_zero("GDEC_SCAT_T1");
+      if (scat_t1 && P <= 8)
+        k_gr_scatter_norm_inj_bf16<1><<<4 * P, 256, 0, g_str>>>(
+            have_p ? nullptr : d_w4b, have_p ? d_injp[injp_cur] : nullptr,
+            (uint16_t*)d_Rb, d_yb, hw, d_Rhatbf16, wn, d_injp[nxt], g_cfg.d, P,
+            g_cfg.norm_eps);
+      else
+        k_gr_scatter_norm_inj_bf16<4><<<4 * ((P + 3) / 4), 256, 0, g_str>>>(
+            have_p ? nullptr : d_w4b, have_p ? d_injp[injp_cur] : nullptr,
+            (uint16_t*)d_Rb, d_yb, hw, d_Rhatbf16, wn, d_injp[nxt], g_cfg.d, P,
+            g_cfg.norm_eps);
       injp_cur = nxt;
       injp_for = read_prefix;
     } else if (gr_bf16)

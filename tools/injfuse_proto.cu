@@ -113,7 +113,7 @@ int main(int argc, char** argv) {
   CK(hipMemcpy(pin, hpin.data(), hpin.size() * 4, hipMemcpyHostToDevice));
   CK(hipGetLastError());
 
-  struct V { int T; NewFn f; } vars[] = {{4, launch_new<4>}, {8, launch_new<8>}, {16, launch_new<16>}};
+  struct V { int T; NewFn f; } vars[] = {{1, launch_new<1>}, {4, launch_new<4>}, {8, launch_new<8>}, {16, launch_new<16>}};
   std::vector<uint16_t> a((size_t)PM * K), b((size_t)PM * K), ra((size_t)PM * K), rb((size_t)PM * K);
   std::vector<float> hpo((size_t)PM * 16);
   const int Ps[] = {1, 3, 1024, 2051, 8192};
@@ -173,6 +173,31 @@ int main(int argc, char** argv) {
                P, src ? "pin  " : "pfull", v.T, mr, mh, rel, rel_seq, pass ? "" : "  <-- FAIL");
         if (!pass) ok = false;
       }
+    }
+  }
+  // timing at P=4 (verify shape): the production T=4 runs 4 blocks; T=1 runs 16
+  {
+    const int P = 4;
+    hipEvent_t e0, e1;
+    CK(hipEventCreate(&e0));
+    CK(hipEventCreate(&e1));
+    auto med = [&](auto fn) {
+      std::vector<float> ts;
+      for (int r = 0; r < reps * 10; ++r) {
+        CK(hipMemcpy(R2, R0, (size_t)P * K * 2, hipMemcpyDeviceToDevice));
+        float m;
+        CK(hipEventRecord(e0)); fn(); CK(hipEventRecord(e1));
+        CK(hipEventSynchronize(e1)); CK(hipEventElapsedTime(&m, e0, e1));
+        ts.push_back(m);
+      }
+      std::sort(ts.begin(), ts.end());
+      return ts[ts.size() / 2];
+    };
+    printf("P=4 timing (verify shape):\n");
+    for (auto& v : vars) {
+      float t = med([&] { v.f(nullptr, pin, R2, y, w, Rh2, Wi, po, d, P, eps); });
+      printf("               fused T=%-2d %.1f us  (%u blocks)\n", v.T, t * 1e3f,
+             4u * ((P + v.T - 1) / v.T));
     }
   }
   // timing at P=8192
