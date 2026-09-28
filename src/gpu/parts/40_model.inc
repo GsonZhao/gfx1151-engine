@@ -197,6 +197,12 @@ struct GpuModel {
   int2* d_img_inj = nullptr;       // [maxbatch] chunk-local upload scratch
   std::vector<int2> h_img_inj;     // host staging for the chunk slice
   float *d_Rb, *d_Rhatb, *d_xb, *d_yb, *d_Gb, *d_t320b, *d_w4b;
+  // HC inject fusion (gr_write_read_b): double-buffered [BP][4][4] partials of
+  // the site injp_for's w4, valid while injp_cur >= 0 (see inj_fuse_on()).
+  float* d_injp[2] = {nullptr, nullptr};
+  int injp_cur = -1;
+  std::string injp_for;
+  std::unordered_map<std::string, uint16_t*> inj_wcache_;  // bf16 inject W per site
   float *d_qkvb, *d_zb, *d_g48b, *d_beta48b;
   float *d_qgb, *d_qsb, *d_gsb, *d_kbb, *d_vbb, *d_attnb;
   float* d_routerb;
@@ -537,6 +543,8 @@ struct GpuModel {
       DALLOC(&d_Gb, BP * 10240 * 4);
       DALLOC(&d_t320b, BP * 320 * 4);
       DALLOC(&d_w4b, BP * 4 * 4);
+      DALLOC(&d_injp[0], BP * 16 * 4);
+      DALLOC(&d_injp[1], BP * 16 * 4);
       DALLOC(&d_qkvb, BP * 10240 * 4);
       DALLOC(&d_zb, BP * 6144 * 4);
       DALLOC(&d_g48b, BP * 48 * 4);
@@ -2035,14 +2043,56 @@ struct GpuModel {
       k_rmsnorm_zc_grouped<<<4 * P, 1024, 0, g_str>>>(
           d_Rb, hw, d_Rhatb, 2560, g_cfg.norm_eps, 4);
     if (xf16_src == d_Rhatb) xf16_src = nullptr;  // d_Rhatb overwritten
+    injp_cur = -1;  // new Rhat without inject partials
     gr_mix_b(prefix, P);
+  }
+
+  // HC inject fusion (k_gr_scatter_norm_inj_bf16): the scatter+norm that
+  // produces a site's Rhat also emits that site's inject projection as
+  // per-branch partials, so the later N=4 inject GEMM (which re-read the
+  // whole P x 10240 bf16 Rhat, ~0.97 ms at P=8192) is skipped. R / Rhat are
+  // bit-identical; w4 differs in summation order only (fp32, err/sum|terms|
+  // ~1e-8 vs ~1e-7 for any sequential fp32 dot; tools/injfuse_proto.cu).
+  // Opt-out GDEC_HC_INJ_FUSE=0 (tools/injfuse_verify.sh: KLD + speed).
+  bool inj_fuse_on() const {
+    static const bool on = !env_zero("GDEC_HC_INJ_FUSE");
+    return on && gr_bf16 && prefill_fused && !gr_scat4 && g_cfg.d <= 2560 &&
+           g_cfg.branches == 4;
+  }
+  // Private bf16 copy of a site's inject weight (4 x 4d). gemm_wbf16 dequants
+  // quantized weights into the shared d_wbf16 scratch, which later GEMMs
+  // overwrite, so quantized ones are copied out once (~80 KB per site).
+  const uint16_t* inj_wbf16(const std::string& prefix) {
+    auto it = inj_wcache_.find(prefix);
+    if (it != inj_wcache_.end()) return it->second;
+    char buf[128];
+    snprintf(buf, sizeof buf, "%s.block_inject_weight.weight", prefix.c_str());
+    const auto* ct = ckpt.find(buf);
+    if (!ct) return inj_wcache_[prefix] = nullptr;
+    const WView w = wview(*ct);
+    if ((uint64_t)w.rows != 4 || (uint64_t)w.cols != (uint64_t)4 * g_cfg.d ||
+        !(w.dtype == 0 || w.dtype == 5 || w.dtype == 7 || w.dtype == 8))
+      return inj_wcache_[prefix] = nullptr;
+    const uint16_t* src = gemm_wbf16(w);
+    uint16_t* dst = (uint16_t*)src;
+    if (w.dtype != 0) {
+      CK(hipMalloc(&dst, (size_t)w.rows * w.cols * 2));
+      CK(hipMemcpyAsync(dst, src, (size_t)w.rows * w.cols * 2,
+                        hipMemcpyDeviceToDevice, g_str));
+    }
+    return inj_wcache_[prefix] = dst;
   }
 
   void gr_write_b(const std::string& prefix, int P) {
     char buf[128];
-    snprintf(buf, sizeof buf, "%s.block_inject_weight.weight", prefix.c_str());
-    gemm(wview(ckpt.at(buf)), d_Rhatb, d_w4b, P, 0,
-         gr_bf16 ? d_Rhatbf16 : nullptr);
+    if (injp_cur >= 0 && injp_for == prefix) {
+      k_inj_psum<<<(P * 4 + 255) / 256, 256, 0, g_str>>>(d_injp[injp_cur], d_w4b, P);
+      injp_cur = -1;
+    } else {
+      snprintf(buf, sizeof buf, "%s.block_inject_weight.weight", prefix.c_str());
+      gemm(wview(ckpt.at(buf)), d_Rhatb, d_w4b, P, 0,
+           gr_bf16 ? d_Rhatbf16 : nullptr);
+    }
     if (gr_bf16)
       k_gr_write_b_hc_bf16<<<(P * 2560 + 255) / 256, 256, 0, g_str>>>(
           d_w4b, (uint16_t*)d_Rb, d_yb, g_cfg.d, g_cfg.branches, P);
@@ -2054,12 +2104,28 @@ struct GpuModel {
   void gr_write_read_b(const std::string& write_prefix,
                        const std::string& read_prefix, int P) {
     char buf[128];
-    snprintf(buf, sizeof buf, "%s.block_inject_weight.weight",
-             write_prefix.c_str());
-    gemm(wview(ckpt.at(buf)), d_Rhatb, d_w4b, P, 0,
-         gr_bf16 ? d_Rhatbf16 : nullptr);
+    const bool have_p = injp_cur >= 0 && injp_for == write_prefix;
+    if (!have_p) {
+      snprintf(buf, sizeof buf, "%s.block_inject_weight.weight",
+               write_prefix.c_str());
+      gemm(wview(ckpt.at(buf)), d_Rhatb, d_w4b, P, 0,
+           gr_bf16 ? d_Rhatbf16 : nullptr);
+    }
     float* hw = ensure_hcnorm(read_prefix);
-    if (gr_bf16)
+    const uint16_t* wn = inj_fuse_on() ? inj_wbf16(read_prefix) : nullptr;
+    if (!wn && have_p)  // partials exist but this site can't fuse (defensive)
+      k_inj_psum<<<(P * 4 + 255) / 256, 256, 0, g_str>>>(d_injp[injp_cur], d_w4b, P);
+    if (wn) {
+      static bool said = false;
+      if (!said) { said = true; fprintf(stderr, "[hc-inj-fuse] on (inject GEMM folded into scatter_norm)\n"); }
+      const int nxt = injp_cur == 0 ? 1 : 0;  // pin != pout
+      k_gr_scatter_norm_inj_bf16<4><<<4 * ((P + 3) / 4), 256, 0, g_str>>>(
+          have_p ? nullptr : d_w4b, have_p ? d_injp[injp_cur] : nullptr,
+          (uint16_t*)d_Rb, d_yb, hw, d_Rhatbf16, wn, d_injp[nxt], g_cfg.d, P,
+          g_cfg.norm_eps);
+      injp_cur = nxt;
+      injp_for = read_prefix;
+    } else if (gr_bf16)
       if (gr_scat4 && g_cfg.d <= 2560)
         k_gr_scatter_norm_b_hc_bf16_f4<<<P, 256, 0, g_str>>>(
             d_w4b, (uint16_t*)d_Rb, d_yb, hw, d_Rhatbf16, g_cfg.d,
@@ -2076,6 +2142,7 @@ struct GpuModel {
       k_gr_scatter_norm_b<<<4 * P, 1024, 0, g_str>>>(
           d_w4b, d_Rb, d_yb, hw, d_Rhatb, g_cfg.d, g_cfg.branches, P,
           g_cfg.norm_eps);
+    if (!wn) injp_cur = -1;
     if (xf16_src == d_Rhatb) xf16_src = nullptr;
     gr_mix_b(read_prefix, P);
   }

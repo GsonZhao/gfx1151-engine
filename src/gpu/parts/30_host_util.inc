@@ -184,6 +184,7 @@ static size_t devarena_estimate(const Checkpoint& ck, int maxctx) {
   add(BP * 512 * 4 * 3);      // kbb vbb routerb
   add(BP * 32 * sizeof(float2));  // ropecs
   add(BP * 4 * 4 + BP * 16 * 4 * 2 + BP * 4);  // w4b topidsb topwb sgb
+  add(BP * 16 * 4 * 2);       // injp[2] (HC inject fusion partials)
   add(BP * g_cfg.topk * (moe_det ? 2560 : 1280) * 4);  // guvb
   add(BP * g_cfg.topk * 640 * 4);                    // hidb
   add(BP * 10240 * 2 + BP * 6144 * 2);               // xbf16 xbf16b

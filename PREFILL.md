@@ -202,6 +202,7 @@ kernel 链演进（头注释 gdec.cpp:6-15）：
 | `GDEC_GDN_CONVL2=0` | GDN conv+silu 与 q/k L2 norm 回退 `k_gdn_conv_b` + `k_l2norm_qk_b` 两 kernel（融合版 `k_gdn_conv_l2n_b` 默认开，逐 bit 一致） |
 | `GDEC_MOE_SG_FUSE=0` | 共享专家加法回退路由 reduce 之后单独的 `k_axpy_sg`（融合版先算共享专家，再由 `k_moe_reduce_pw_sg` 一并加上；只在 q4cp LUT 路由路径生效，逐 bit 一致） |
 | `GDEC_QSA_GATE_BF16=0` | QSA 输出门控回退 `k_sigmoid_gate` 就地写 fp32 + o_proj 自行转 bf16（融合版 `k_sigmoid_gate_bf16_v4` 直接读 d_qgb 的 gate 半边，qsplit 不再拷 gs；P>8 生效，逐 bit 一致） |
+| `GDEC_HC_INJ_FUSE=0` | HC inject 回退独立的 N=4 inject GEMM（融合版 `k_gr_scatter_norm_inj_bf16` 在写 Rhat 时顺带算出下一处 inject 的 4 路部分和，`k_inj_psum` 收尾；需 `GDEC_GR_BF16=1`，默认开。R/Rhat 逐 bit 一致，w4 求和顺序不同 → **非逐 bit**，KLD +0.0001） |
 | `GDEC_MROPE_DUMP=<file>` | dump RoPE 表（调试用，会同步流） |
 | `GDEC_PREFILL_TAIL_SLACK=<n>` | 尾包合并上限（默认 Linux 1024 / Windows 0；0 禁用） |
 | `GDEC_GR_SCAT4=1` | GR scatter+norm 单 block/token 实验（实测 -0.8%，勿开） |
@@ -540,6 +541,33 @@ kernel 链演进（头注释 gdec.cpp:6-15）：
       - `k_gdn_fused` 尾波：192 VGPR 加 1024 线程，一个 WGP 只能放一个 block。
         20 个 WGP 跑 48 个头要 3 轮（20+20+8），效率约 80%。理论上每个 chunk
         能省约 66 ms，但要按 v 列重新切分并重复算 k 侧的 solve，改动大。
+
+14. **HC inject 融合（2026-09-28 完成，非逐 bit，KLD 把关，默认开）**：
+    - 原来每个 HC 写回点（attn / mlp）先跑一次 N=4、K=10240 的 inject GEMM
+      （hipBLASLt MT32x32x32，P=8192 约 0.97 ms，每 8K chunk 94 次 ≈ 92 ms），
+      它要把 P×10240 的 bf16 Rhat 从 DRAM 整个再读一遍。
+    - 改动：`gr_write_read_b` 里产生 read_prefix 的 Rhat 的那次 scatter+norm
+      换成 `k_gr_scatter_norm_inj_bf16<4>`（22_kernels_prefill.inc）：scatter /
+      平方和 / 树归约 / inv 原样照抄 `k_gr_scatter_norm_b_hc_bf16`，写出 bf16 Rhat
+      后，用寄存器里的 Winj 行（4×10 个 bf16）对刚写的值累加 4 个 inject 输出，
+      wave 内 shfl + 8 wave LDS 按固定顺序求和，写 `[P][branch][4]` 部分和到
+      `d_injp[2]`（乒乓，pin≠pout）。下一次写回同一个 prefix 时，用
+      `k_inj_psum`（4 路按固定顺序相加）代替 GEMM；融合 kernel 自己也可直接吃
+      部分和（pin）。grid 为一维 `4*ceil(P/4)`，branch 变化最快，y 由 L2 复用
+      （branch 放 blockIdx.y 会 4 倍读 y，慢 2×）。
+    - Winj 通过 `inj_wbf16()` 按 prefix 缓存 bf16 副本（量化权重从 d_wbf16
+      scratch 拷出，每处约 80 KB）。条件：`gr_bf16 && prefill_fused &&
+      !gr_scat4 && d<=2560 && branches==4`，首次启用在 stderr 打
+      `[hc-inj-fuse] on`。R / Rhat 逐 bit 不变，只有 w4 的 fp32 求和顺序变了。
+    - 验证（`bash tools/injfuse_verify.sh`，约 7 分钟）：
+      - 原型 `tools/injfuse_proto.cu`（kernel 从源文件 sed 提取到
+        `tools/gr_injfuse_kernel.inc`）：P=1/3/1024/2051/8192 × pfull/pin ×
+        T=4/8/16，R/Rhat 0 mismatch；w4 误差 / sum|terms| 8.1e-9（fp32 顺序点积
+        1.7e-7）；P=8192 融合 3.09 ms vs 原 scatter_norm 2.88 + GEMM 0.97。
+      - KLD（CHUNKS=8 MAXCTX=8192，bf16_c8192.kld，生产 env）：关 0.039056 /
+        开 0.039168（+0.00011，基线噪声 ±0.0001），same_top 93.669 → 93.581。
+      - 32K prefill 新旧各 2 次取最快：1495.6 → 1510.7 tok/s（+1.01%）。
+      - 注：ppl 对这类 1e-8 级扰动是混沌的（2051 mean_nll 3.79 ↔ 3.92），只能看 KLD。
 
 ## 附：本文档的未复核项
 
