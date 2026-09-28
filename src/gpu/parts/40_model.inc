@@ -3089,6 +3089,34 @@ struct GpuModel {
     gemm(wview(ckpt.at(buf)), d_xb, d_routerb, P);
     int k = g_cfg.topk;
     k_router_topk<<<P, 512, 0, g_str>>>(d_routerb, d_topidsb, d_topwb, g_cfg.experts, k);
+    // GDEC_MOE_UNION_LOG=1: distinct experts across the P rows (P<=8, i.e.
+    // verify); decides whether naive-MoE expert dedup is worth it.
+    static const bool moe_union_log = getenv("GDEC_MOE_UNION_LOG") != nullptr;
+    if (moe_union_log && P <= 8) {
+      struct UStat {
+        long long n = 0, uni = 0, slots = 0;
+        ~UStat() {
+          if (n)
+            fprintf(stderr,
+                    "moe-union: layers=%lld avg_union=%.2f avg_slots=%.2f "
+                    "union/slots=%.3f\n",
+                    n, (double)uni / n, (double)slots / n,
+                    (double)uni / slots);
+        }
+      };
+      static UStat S;
+      std::vector<int> hids((size_t)P * 16);
+      CK(hipMemcpy(hids.data(), d_topidsb, (size_t)P * 16 * 4,
+                   hipMemcpyDeviceToHost));
+      std::vector<char> seen(g_cfg.experts, 0);
+      int u = 0;
+      for (int t = 0; t < P; t++)
+        for (int s = 0; s < k; s++) {
+          int e = hids[(size_t)t * 16 + s];
+          if (!seen[e]) { seen[e] = 1; u++; }
+        }
+      S.n++; S.uni += u; S.slots += (long long)P * k;
+    }
     if (gg_on()) {
       moe_gguf(g_ggx.at(l), d_xb, d_topidsb, d_topwb, acc, P);
       moe_b_shared(l, P, acc, direct_output);
