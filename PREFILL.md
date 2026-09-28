@@ -199,6 +199,7 @@ kernel 链演进（头注释 gdec.cpp:6-15）：
 | `GDEC_INDEX_SCORE64=0` | fused 打分回退旧 `k_index_scores_tiled`（16q×32k；新版默认开，逐 bit 一致） |
 | `GDEC_INDEX_SEL2P=0` | n>8192 选块回退旧 stream / rocPRIM 版（两遍精确 `k_index_select_2p` 默认开，逐 bit 一致） |
 | `GDEC_HC_FUSE=0` | HC mix-up GEMM 回退“GEMM 写 fp32 G + `k_gr_combine_b_hc_bf16`”两 kernel（融合版 `hc_up_fused` 默认开，需 `GDEC_GEMM_WMMA=1` + `GDEC_GR_BF16=1`，逐 bit 一致） |
+| `GDEC_GDN_CONVL2=0` | GDN conv+silu 与 q/k L2 norm 回退 `k_gdn_conv_b` + `k_l2norm_qk_b` 两 kernel（融合版 `k_gdn_conv_l2n_b` 默认开，逐 bit 一致） |
 | `GDEC_MROPE_DUMP=<file>` | dump RoPE 表（调试用，会同步流） |
 | `GDEC_PREFILL_TAIL_SLACK=<n>` | 尾包合并上限（默认 Linux 1024 / Windows 0；0 禁用） |
 | `GDEC_GR_SCAT4=1` | GR scatter+norm 单 block/token 实验（实测 -0.8%，勿开） |
@@ -493,6 +494,23 @@ kernel 链演进（头注释 gdec.cpp:6-15）：
       每个 chunk 提升约 60 tok/s。
     - Windows 启动器没开 `GDEC_GEMM_WMMA`（README 已注明，TheRock 下未验证），
       所以融合在 Windows 上不生效。
+
+12. **GDN conv+l2norm 融合（2026-09-28 完成，逐 bit 等价，默认开）**：
+    - `k_gdn_conv_l2n_b`（25_kernels_gdn.inc）：一个 wave 负责一个 token 的一个
+      128 通道 slice（lane 管 4 个通道，grid (10, P) × 256），conv+silu 表达式
+      原样照抄 `k_gdn_conv_b`。前 32 个 slice（16 个 q 头 + 16 个 k 头）在寄存器里
+      接着做 L2 norm，省掉 `k_l2norm_qk_b` 对 P×4096 的读回和写出。
+    - 逐 bit 的关键：`k_l2norm_qk_b` 的 128 线程 LDS 树（off 64..4）等价于每个
+      lane 4 个通道各自做 `__shfl_down` 16..1，最后的 off 2、1 等价于
+      `(s0+s2)+(s1+s3)`。**坑**：HIP 默认 `-ffp-contract=fast`，
+      `__fmul_rn`/`__fadd_rn` 在 amdgcn 上就是普通 `*`/`+`，第一次平方会被合进加法
+      变成 FMA，q/k 整头差 1–4 ulp。所以归约块里加了
+      `#pragma clang fp contract(off)`。
+    - 验证（`bash tools/convl2_verify.sh`，约 5 分钟，PASS）：
+      - 原型 P=1/3/1024/2051/8192（含极端行）0 mismatch；P=8192 两 kernel
+        4.12 → 3.03 ms（×1.36，36 层每个 chunk 约省 39 ms）。
+      - 2051 和 32K `--ppl` 逐字节一致（32K mean_nll 4.1262937295）。
+      - 32K prefill 新旧各跑 2 次取最快：1463.5 → 1472.7 tok/s（+0.63%）。
 
 ## 附：本文档的未复核项
 

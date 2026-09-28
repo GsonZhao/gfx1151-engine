@@ -1,5 +1,6 @@
 // ================== GDN chunked prefill (Phase 3b) kernels ===================
 
+// [gdn-convl2-begin]  (sed-extracted by tools/convl2_proto.cu — keep self-contained)
 // --- batched conv+silu: out[t][ch] = silu(sum_j cw[ch][j]*hist_j + cw[ch][3]*x[t])
 // hist_j = x[t-3+j], t-3+j < 0 reads convst (recent 3 pre-prefill inputs, oldest
 // first — matches k_gdn_conv). Not in-place: out must differ from x.
@@ -83,6 +84,80 @@ __global__ void k_l2norm_qk_b(float* __restrict__ qkv, int dk, float qscale,
     kh[t] = kv * ik;
   }
 }
+
+// --- fused k_gdn_conv_b + k_l2norm_qk_b (dk == 128 only). One wave32 per
+// 128-channel slice of one token, float4 per lane; slices [0, nqk) are q heads
+// (l2norm + qscale), [nqk, 2*nqk) k heads (l2norm), the rest v (conv only).
+// Bit-identical to the pair: the conv expressions are copied verbatim (same
+// fp-contraction), and the l2norm LDS tree (off = 64,32,16,8,4,2,1 over
+// elements) is replayed exactly — element 4*lane+c, so off 64..4 are lane
+// offsets 16..1 per component c and off 2,1 end in lane 0 as
+// (s0+s2)+(s1+s3). fp contract is off in the reduction scope so v*v is not
+// fused into the first add (the unfused kernel squares into LDS first).
+// Saves the l2norm read+write of the q/k columns (~268 MB/layer at P=8192).
+// grid (ceil(qkv/1024), P), 256 threads.
+__global__ void __launch_bounds__(256)
+    k_gdn_conv_l2n_b(const float* __restrict__ x, const float* __restrict__ cw,
+                     const float* __restrict__ convst, float* __restrict__ out,
+                     int P, int qkv, int nqk, float qscale) {
+  const int lane = threadIdx.x & 31;
+  const int slice = blockIdx.x * 8 + (threadIdx.x >> 5);
+  if (slice * 128 >= qkv) return;  // wave-uniform
+  const int t = blockIdx.y, ch = slice * 128 + lane * 4;
+  const int64_t i = (int64_t)t * qkv + ch;
+  float4 xv = *(const float4*)(x + i);
+  float4 a;
+  a.x = cw[(ch + 0) * 4 + 3] * xv.x;
+  a.y = cw[(ch + 1) * 4 + 3] * xv.y;
+  a.z = cw[(ch + 2) * 4 + 3] * xv.z;
+  a.w = cw[(ch + 3) * 4 + 3] * xv.w;
+#pragma unroll
+  for (int j = 0; j < 3; j++) {
+    int tt = t - 3 + j;
+    const float* src =
+        tt >= 0 ? x + (size_t)tt * qkv + ch : convst + (tt + 3) * qkv + ch;
+    float4 v = *(const float4*)src;
+    a.x += cw[(ch + 0) * 4 + j] * v.x;
+    a.y += cw[(ch + 1) * 4 + j] * v.y;
+    a.z += cw[(ch + 2) * 4 + j] * v.z;
+    a.w += cw[(ch + 3) * 4 + j] * v.w;
+  }
+  float4 o;
+  o.x = a.x / (1.f + expf(-a.x));
+  o.y = a.y / (1.f + expf(-a.y));
+  o.z = a.z / (1.f + expf(-a.z));
+  o.w = a.w / (1.f + expf(-a.w));
+  if (slice < 2 * nqk) {  // wave-uniform
+    // contract(off): HIP's __fmul_rn/__fadd_rn are plain * / + on amdgcn and
+    // would still fuse the first square into fma(x, x, shfl) (measured).
+#pragma clang fp contract(off)
+    float s0 = o.x * o.x, s1 = o.y * o.y;
+    float s2 = o.z * o.z, s3 = o.w * o.w;
+#pragma unroll
+    for (int d = 16; d >= 1; d >>= 1) {
+      s0 = s0 + __shfl_down(s0, d, 32);
+      s1 = s1 + __shfl_down(s1, d, 32);
+      s2 = s2 + __shfl_down(s2, d, 32);
+      s3 = s3 + __shfl_down(s3, d, 32);
+    }
+    float tot = (s0 + s2) + (s1 + s3);
+    tot = __shfl(tot, 0, 32);
+    const float inv = rsqrtf(tot + 1e-6f);
+    if (slice < nqk) {
+      o.x = o.x * inv * qscale;
+      o.y = o.y * inv * qscale;
+      o.z = o.z * inv * qscale;
+      o.w = o.w * inv * qscale;
+    } else {
+      o.x = o.x * inv;
+      o.y = o.y * inv;
+      o.z = o.z * inv;
+      o.w = o.w * inv;
+    }
+  }
+  *(float4*)(out + i) = o;
+}
+// [gdn-convl2-end]
 
 // --- GDN chunked prefill (torch_chunk_gated_delta_rule equivalent), fp32.
 // One block (256 threads) per v-head; chunks of 64 tokens serially.

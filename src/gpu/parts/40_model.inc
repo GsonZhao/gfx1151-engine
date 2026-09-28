@@ -2088,9 +2088,17 @@ struct GpuModel {
     const float* gnw = d_gdnnorm + (size_t)gi * 128;
     float qscale = 1.f / sqrtf(128.f);
     if (!gdn_loop) {
+      // conv+silu and the q/k l2norm in one pass (k_gdn_conv_l2n_b, bit-exact
+      // vs the pair, tools/convl2_verify.sh); opt-out GDEC_GDN_CONVL2=0.
+      static const bool convl2 = !env_zero("GDEC_GDN_CONVL2");
+      const bool cl2 = convl2 && P <= 65535;
       int64_t tot = (int64_t)P * 10240 / 4;  // 4 channels per thread (float4)
-      k_gdn_conv_b<<<(unsigned)((tot + 255) / 256), 256, 0, g_str>>>(
-          d_qkvb, cw, convst, d_convb, P, 10240);
+      if (cl2)
+        k_gdn_conv_l2n_b<<<dim3(10, (unsigned)P), 256, 0, g_str>>>(
+            d_qkvb, cw, convst, d_convb, P, 10240, 16, qscale);
+      else
+        k_gdn_conv_b<<<(unsigned)((tot + 255) / 256), 256, 0, g_str>>>(
+            d_qkvb, cw, convst, d_convb, P, 10240);
       if (spec_snap) {
         int ngdn = g_cfg.layers - g_cfg.layers / 4;
         k_convst_snap<<<P, 512, 0, g_str>>>(
@@ -2099,7 +2107,8 @@ struct GpuModel {
       }
       k_convst_update<<<(10240 + 255) / 256, 256, 0, g_str>>>(convst, d_qkvb, P,
                                                               10240);
-      k_l2norm_qk_b<<<dim3(16, P), 128, 0, g_str>>>(d_convb, 128, qscale, 10240, 16);
+      if (!cl2)
+        k_l2norm_qk_b<<<dim3(16, P), 128, 0, g_str>>>(d_convb, 128, qscale, 10240, 16);
       k_gdn_gates<<<P, 64, 0, g_str>>>(d_g48b, d_beta48b, Alog, dtb, d_g48b, d_beta48b,
                                        48, 48);
       if (spec_snap) {
