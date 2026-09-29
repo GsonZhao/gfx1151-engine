@@ -245,9 +245,32 @@ static std::string path_of(const std::string& name) { return g_dir + "/" + name;
 static int64_t now_t() {
   return (int64_t)std::filesystem::file_time_type::clock::now().time_since_epoch().count();
 }
+// Log lines produced while g_mtx is held are buffered per thread and printed
+// by flush_log() after the lock is released: a stderr write can block (a
+// paused Windows console behind the launcher's pipe), and blocking while
+// holding g_mtx froze the GPU thread at its next match/enqueue/Turn.
+static thread_local std::string tl_log;
+__attribute__((format(printf, 1, 2))) static void logf_locked(const char* fmt, ...) {
+  char b[512];
+  va_list ap;
+  va_start(ap, fmt);
+  const int k = vsnprintf(b, sizeof b, fmt, ap);
+  va_end(ap);
+  if (k > 0) tl_log.append(b, std::min((size_t)k, sizeof b - 1));
+}
+static void flush_log() {  // call with g_mtx NOT held
+  if (tl_log.empty()) return;
+  fputs(tl_log.c_str(), stderr);
+  tl_log.clear();
+}
 static void rm_file(const std::string& name) {
   std::error_code ec;
   std::filesystem::remove(path_of(name), ec);
+  // Windows: a sharing violation (antivirus scan, indexer, an open handle)
+  // leaves the file on disk although the index already dropped its bytes
+  if (ec)
+    logf_locked("kvsnap: cannot delete %s (error %d); the file stays on disk\n",
+                name.c_str(), ec.value());
 }
 static bool wr_all(int fd, const char* p, size_t n) {
   while (n) {
@@ -361,8 +384,8 @@ static void evict_locked(const CkEnt* keep) {
     for (auto& e : g_ck)
       if (e->pub && !e->busy && e.get() != keep && (!v || e->t < v->t)) v = e;
     if (!v) break;
-    fprintf(stderr, "kvsnap: evicted %s (LRU, cap %.1f GB)\n", v->name.c_str(),
-            g_cap / 1073741824.0);
+    logf_locked("kvsnap: evicted %s (LRU, cap %.1f GB)\n", v->name.c_str(),
+                g_cap / 1073741824.0);
     drop_ck_locked(v, true);
   }
 }
@@ -436,13 +459,13 @@ static void writer() {
           g_total += len;
         } else {
           f->second.st = ST_FAIL;  // erased with its last reference
-          fprintf(stderr, "kvsnap: write of %s failed (non-fatal)\n", name.c_str());
+          logf_locked("kvsnap: write of %s failed (non-fatal)\n", name.c_str());
         }
       } else {
         const auto& e = it.ck;
         if (!ok) {
-          fprintf(stderr, "kvsnap: save of %d tokens failed (%s, non-fatal)\n", e->n,
-                  go ? "write error" : "a page write failed");
+          logf_locked("kvsnap: save of %d tokens failed (%s, non-fatal)\n", e->n,
+                      go ? "write error" : "a page write failed");
           drop_ck_locked(e, false);
         } else {
           // same state saved before without MTP state: this file replaced it
@@ -455,18 +478,18 @@ static void writer() {
           e->bytes = len;
           e->t = now_t();
           g_total += len;
-          fprintf(stderr,
-                  "%s kvsnap: saved %d tokens -> %s (ckpt %.1f MB + %d new pages%s "
-                  "%.1f MB; capture %.2fs, write %.2fs%s; total %.2f GB)\n",
-                  log_ts(), e->n, e->name.c_str(), len / 1048576.0, it.new_ch,
-                  it.new_mt ? " + mtp" : "", it.new_b / 1048576.0, it.cap_s, ws,
-                  e->mtp ? ", mtp" : "", g_total / 1073741824.0);
+          logf_locked("%s kvsnap: saved %d tokens -> %s (ckpt %.1f MB + %d new pages%s "
+                      "%.1f MB; capture %.2fs, write %.2fs%s; total %.2f GB)\n",
+                      log_ts(), e->n, e->name.c_str(), len / 1048576.0, it.new_ch,
+                      it.new_mt ? " + mtp" : "", it.new_b / 1048576.0, it.cap_s, ws,
+                      e->mtp ? ", mtp" : "", g_total / 1073741824.0);
           evict_locked(e.get());
         }
       }
       g_wbusy = false;
     }
     g_cv.notify_all();
+    flush_log();  // g_mtx released: a blocked stderr no longer stalls the GPU thread
     buf_put(std::move(it.buf));
   }
 }
@@ -997,6 +1020,7 @@ static bool restore(GpuModel& m, const std::shared_ptr<CkEnt>& e,
       for (auto& o : v) drop_ck_locked(o, true);
     }
   }
+  flush_log();
   const double s =
       std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
   if (rc != RS_OK) {
@@ -1113,7 +1137,7 @@ static void init(GpuModel& m, Cfg& cfg) {
       cks.push_back(e);
     }
   }
-  std::lock_guard<std::mutex> lk(g_mtx);
+  std::unique_lock<std::mutex> lk(g_mtx);
   for (auto& e : cks) {
     bool whole = true;
     for (uint64_t k : e->chunks) whole = whole && g_ch.count(k);
@@ -1143,13 +1167,15 @@ static void init(GpuModel& m, Cfg& cfg) {
         ++it;
       }
     }
+  evict_locked(nullptr);
+  lk.unlock();  // writer not started, no request yet: the index is ours alone
+  flush_log();
   if (legacy)
     fprintf(stderr, "kvsnap: removed %zu pre-A4 snapshot director%s (old format)\n",
             legacy, legacy == 1 ? "y" : "ies");
   if (bad || orphans)
     fprintf(stderr, "kvsnap: removed %zu unusable and %zu unreferenced files\n", bad,
             orphans);
-  evict_locked(nullptr);
   fprintf(stderr, "kvsnap: index %zu checkpoints, %zu pages, %zu mtp sections, %.2f GB "
           "(cap %.1f GB, queue %.0f MB)\n",
           g_ck.size(), g_ch.size(), g_mt.size(), g_total / 1073741824.0,

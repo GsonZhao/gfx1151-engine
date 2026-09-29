@@ -11,6 +11,8 @@
 // START_TIMEOUT 等计时项与平台相关，不读 conf（Windows 冷加载分钟级）。
 //
 // 子进程输出实时透传到本控制台，同时写入 logs\*-win-<时间戳>.log。
+// 控制台卡住（选择文本、终端忙）不会阻塞子进程：日志文件照写，控制台显示最多
+// 缓冲 8 MiB，超出部分只在控制台上丢弃并提示。快速编辑模式运行期间关闭。
 #include <windows.h>
 #include <cctype>
 #include <cstdio>
@@ -26,11 +28,16 @@ std::string g_root;
 HANDLE g_children[2] = {nullptr, nullptr};
 bool g_own_console = false;
 
+void console_drain(DWORD ms);  // 定义在下方"控制台输出"一节
+void console_mode_restore();
+
 void pause_if_own_console() {
+    console_mode_restore();
     if (g_own_console) system("pause");
 }
 
 [[noreturn]] void fail(const std::string& msg) {
+    console_drain(2000);  // 先让子进程最后的输出上屏，错误信息排在其后
     fprintf(stderr, "错误：%s\n", msg.c_str());
     fflush(stderr);
     for (HANDLE h : g_children)
@@ -221,18 +228,117 @@ struct Child {
     std::string name;
 };
 
+// ---- 控制台输出：永不阻塞子进程 ------------------------------------------
+// 子进程 stdout/stderr → 匿名管道 → tee_thread：先写日志文件（始终完整），
+// 再放进有界内存队列，由唯一的 console_thread 写控制台。
+// 旧实现在 tee_thread 里同步 WriteFile 控制台：控制台一暂停（快速编辑模式下
+// 鼠标点一下进入"选择"、终端忙），tee 不再读管道，管道写满后引擎/API 的每个
+// fprintf 都阻塞——decode 停在半路，kvsnap 写线程持锁打印还会连带卡住 GPU 线程，
+// 日志也同时停住。现在控制台卡住最多丢掉控制台上的文字（队列满之后），
+// 子进程照常跑，日志文件不丢。
+struct ConsoleQueue {
+    SRWLOCK lock = SRWLOCK_INIT;
+    CONDITION_VARIABLE cv = CONDITION_VARIABLE_INIT;
+    std::string buf;        // 待写控制台的字节
+    size_t dropped = 0;     // buf 之后被丢弃的字节数
+    bool busy = false;      // console_thread 正在 WriteFile
+};
+ConsoleQueue g_cq;
+const size_t kConsoleQueueMax = 8u << 20;  // 8 MiB ≈ 数万行日志
+
+void console_push(const char* p, size_t n) {
+    AcquireSRWLockExclusive(&g_cq.lock);
+    // 一旦开始丢弃就一直丢到 console_thread 取走 buf，保证丢弃段是连续的
+    if (g_cq.dropped || g_cq.buf.size() + n > kConsoleQueueMax)
+        g_cq.dropped += n;
+    else
+        g_cq.buf.append(p, n);
+    ReleaseSRWLockExclusive(&g_cq.lock);
+    WakeAllConditionVariable(&g_cq.cv);
+}
+
+bool console_write_all(HANDLE out, const char* p, size_t n) {
+    while (n) {
+        DWORD w = 0;
+        const DWORD want = n > (1u << 20) ? (1u << 20) : static_cast<DWORD>(n);
+        if (!WriteFile(out, p, want, &w, nullptr) || w == 0) return false;
+        p += w;
+        n -= w;
+    }
+    return true;
+}
+
+DWORD WINAPI console_thread(LPVOID) {
+    HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
+    std::string chunk;
+    for (;;) {
+        AcquireSRWLockExclusive(&g_cq.lock);
+        while (g_cq.buf.empty() && !g_cq.dropped)
+            SleepConditionVariableSRW(&g_cq.cv, &g_cq.lock, INFINITE, 0);
+        chunk.swap(g_cq.buf);
+        g_cq.buf.clear();
+        const size_t dropped = g_cq.dropped;
+        g_cq.dropped = 0;
+        g_cq.busy = true;
+        ReleaseSRWLockExclusive(&g_cq.lock);
+
+        console_write_all(out, chunk.data(), chunk.size());  // 可能在这里卡住，但只卡本线程
+        if (dropped) {
+            char m[200];
+            snprintf(m, sizeof m,
+                     "\n[启动器] 控制台输出曾暂停，期间丢弃 %zu 字节（仅控制台显示，"
+                     "logs\\ 下的日志文件完整）\n",
+                     dropped);
+            console_write_all(out, m, strlen(m));
+        }
+        chunk.clear();
+
+        AcquireSRWLockExclusive(&g_cq.lock);
+        g_cq.busy = false;
+        ReleaseSRWLockExclusive(&g_cq.lock);
+        WakeAllConditionVariable(&g_cq.cv);
+    }
+}
+
+// 退出前把队列里剩下的输出写完（最多等 ms 毫秒，控制台卡住也不会永久挂起）
+void console_drain(DWORD ms) {
+    const ULONGLONG deadline = GetTickCount64() + ms;
+    AcquireSRWLockExclusive(&g_cq.lock);
+    while (!g_cq.buf.empty() || g_cq.dropped || g_cq.busy) {
+        const ULONGLONG now = GetTickCount64();
+        if (now >= deadline) break;
+        SleepConditionVariableSRW(&g_cq.cv, &g_cq.lock, static_cast<DWORD>(deadline - now), 0);
+    }
+    ReleaseSRWLockExclusive(&g_cq.lock);
+}
+
+// 关闭控制台"快速编辑模式"：它让鼠标单击就进入选择状态并暂停所有输出。
+// 退出时恢复原模式（从 cmd 窗口启动时不改变用户的窗口设置）。
+HANDLE g_con_in = INVALID_HANDLE_VALUE;
+DWORD g_con_in_mode = 0;
+bool g_con_mode_saved = false;
+void console_quickedit_off() {
+    g_con_in = GetStdHandle(STD_INPUT_HANDLE);
+    DWORD mode = 0;
+    if (g_con_in == INVALID_HANDLE_VALUE || !GetConsoleMode(g_con_in, &mode)) return;
+    g_con_in_mode = mode;
+    g_con_mode_saved = true;
+    SetConsoleMode(g_con_in, (mode | ENABLE_EXTENDED_FLAGS) & ~ENABLE_QUICK_EDIT_MODE);
+}
+void console_mode_restore() {
+    if (g_con_mode_saved) SetConsoleMode(g_con_in, g_con_in_mode);
+}
+
 DWORD WINAPI tee_thread(LPVOID param) {
     Child* c = static_cast<Child*>(param);
-    HANDLE console = GetStdHandle(STD_OUTPUT_HANDLE);
-    char buf[4096];
+    char buf[65536];
     DWORD n = 0;
     while (ReadFile(c->pipe_read, buf, sizeof(buf), &n, nullptr) && n > 0) {
-        DWORD written = 0;
-        WriteFile(console, buf, n, &written, nullptr);
-        if (c->log) {
+        if (c->log) {  // 日志先写：控制台怎样都不影响它
             fwrite(buf, 1, n, c->log);
             fflush(c->log);
         }
+        console_push(buf, n);
     }
     return 0;
 }
@@ -243,7 +349,8 @@ Child spawn(const std::string& name, const std::string& exe,
     sa.nLength = sizeof(sa);
     sa.bInheritHandle = TRUE;
     HANDLE pipe_read = nullptr, pipe_write = nullptr;
-    if (!CreatePipe(&pipe_read, &pipe_write, &sa, 0))
+    // 1 MiB 管道缓冲（默认只有约 4 KB）：tee 线程短暂落后时子进程也不必等
+    if (!CreatePipe(&pipe_read, &pipe_write, &sa, 1u << 20))
         fail("CreatePipe 失败");
     SetHandleInformation(pipe_read, HANDLE_FLAG_INHERIT, 0);
 
@@ -291,6 +398,7 @@ BOOL WINAPI on_ctrl(DWORD ev) {
     if (ev == CTRL_C_EVENT || ev == CTRL_BREAK_EVENT || ev == CTRL_CLOSE_EVENT) {
         for (HANDLE h : g_children)
             if (h) TerminateProcess(h, 1);
+        console_mode_restore();
         ExitProcess(1);
     }
     return FALSE;
@@ -428,6 +536,13 @@ int main(int argc, char** argv) {
                                                  {"--vision-tower", vision_file});
 
     printf("加载模型中，日志：%s；Ctrl+C 停止。\n", engine_log.c_str());
+    fflush(stdout);
+    console_quickedit_off();
+    {
+        HANDLE t = CreateThread(nullptr, 0, console_thread, nullptr, 0, nullptr);
+        if (!t) fail("无法创建控制台输出线程");
+        CloseHandle(t);
+    }
     Child engine = spawn("engine", "build\\gdec-win.exe", engine_args, engine_log);
     g_children[0] = engine.proc;
 
@@ -467,6 +582,7 @@ int main(int argc, char** argv) {
     const char* which = who == WAIT_OBJECT_0 ? "引擎" : "API";
     DWORD code = 1;
     GetExitCodeProcess(both[who - WAIT_OBJECT_0], &code);
+    console_drain(3000);  // 退出进程最后的输出（如错误原因）先上屏
     fprintf(stderr, "%s进程退出（%lu），正在停止服务。\n", which, code);
     kill_child(engine);
     kill_child(api);
