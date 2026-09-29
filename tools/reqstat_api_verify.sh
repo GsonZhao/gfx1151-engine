@@ -89,6 +89,11 @@ else
     check "summary 输入 token 求和" "$S" '"input_tokens":219900'
     check "summary chain 接受率 0.375" "$S" '"acceptance":0.375'
     check "summary decode tok/s" "$S" '"decode_tok_per_s":10'
+    # 分起草器速度：chain 与 serial 桶都是 50 tok / 5 s = 10 tok/s；
+    # serial 桶 proposed=0 也必须出现（它正是拖低总速度的那类）。
+    check "summary serial 桶" "$S" '"serial":{"requests":40,"accepted":0,"proposed":0,"acceptance":null'
+    n_dps="$(printf '%s' "$S" | grep -o '"decode_tok_per_s":10' | wc -l)"
+    [[ "$n_dps" == 3 ]] && echo "ok   分起草器 decode tok/s（总+chain+serial）" || fail "decode_tok_per_s 出现 $n_dps 次（期望 3）"
     check "summary 文件数与坏记录" "$S" '"files_total":2'
     check "summary bad_crc=1" "$S" '"bad_crc":1'
     check "summary 窗口 requests=100" "$S2" '"requests":100'

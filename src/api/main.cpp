@@ -1684,7 +1684,8 @@ void handle_reqstat_summary(const http::Request& q, http::Response* r,
     std::vector<uint32_t> ttfts;
     std::map<std::string, uint64_t> finish;
     struct DStat {
-        uint64_t requests = 0, accepted = 0, proposed = 0;
+        uint64_t requests = 0, accepted = 0, proposed = 0, gen = 0;
+        double decode_s = 0;
     };
     std::map<std::string, DStat> drafters;
     reqstat::ScanInfo info;
@@ -1700,9 +1701,13 @@ void handle_reqstat_summary(const http::Request& q, http::Response* r,
                 dec_s += e.decode_us / 1e6;
                 if (e.ttft_us > 0) ttfts.push_back(e.ttft_us);
                 finish[finish_name(e.flags & 0xF)]++;
+                // 速度按起草器分桶（串行也要出现：它就是拉低总速度的那类）；
+                // 接受率只在真正起草过的请求上有意义。
+                auto& s = drafters[drafter_name((e.flags >> 4) & 0xF)];
+                s.requests++;
+                s.gen += e.n_gen;
+                s.decode_s += e.decode_us / 1e6;
                 if (e.proposed > 0) {
-                    auto& s = drafters[drafter_name((e.flags >> 4) & 0xF)];
-                    s.requests++;
                     s.proposed += e.proposed;
                     s.accepted +=
                         e.commit >= e.rounds ? e.commit - e.rounds : 0;
@@ -1744,7 +1749,10 @@ void handle_reqstat_summary(const http::Request& q, http::Response* r,
                     {"proposed", s.proposed},
                     {"acceptance",
                      s.proposed ? json(s.accepted * 1.0 / s.proposed)
-                                : json(nullptr)}};
+                                : json(nullptr)},
+                    {"decode_tok_per_s",
+                     s.decode_s > 0 ? json(s.gen / s.decode_s)
+                                    : json(nullptr)}};
     }
     j["drafters"] = dj;
     j["files_total"] = info.files_total;

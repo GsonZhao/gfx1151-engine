@@ -762,12 +762,18 @@ function renderReqSummary(j) {
   for (const k of order) {
     const d = (j.drafters || {})[k];
     if (!d) continue;
-    parts.push('<div><span style="color:var(--dim)">' + names[k] + ' 接受率</span> <span class="mono">' +
-               fmtPct(d.acceptance) + '</span> <span style="color:var(--dim);font-size:12px">（' +
-               fmtTok(d.accepted) + "/" + fmtTok(d.proposed) + "，" + d.requests + " 请求）</span></div>");
+    let s = '<div><span style="color:var(--dim)">' + names[k] + '</span> <span class="mono">' +
+            (d.decode_tok_per_s == null ? "-" : d.decode_tok_per_s.toFixed(1) + " tok/s") + "</span>";
+    if (d.proposed > 0)
+      s += ' <span style="color:var(--dim)">接受率</span> <span class="mono">' + fmtPct(d.acceptance) +
+           '</span> <span style="color:var(--dim);font-size:12px">（' +
+           fmtTok(d.accepted) + "/" + fmtTok(d.proposed) + "，" + d.requests + " 请求）</span>";
+    else
+      s += ' <span style="color:var(--dim);font-size:12px">（' + d.requests + " 请求）</span>";
+    parts.push(s + "</div>");
   }
   $("reqs-acc").innerHTML = parts.join("") ||
-    '<span style="color:var(--dim);font-size:12px">窗口内没有投机请求</span>';
+    '<span style="color:var(--dim);font-size:12px">窗口内没有请求记录</span>';
 }
 
 function renderReqTable(j) {
@@ -788,7 +794,9 @@ function renderReqTable(j) {
       fmtTok(r.prompt_tokens) + (r.cached_tokens ? "（" + fmtTok(r.cached_tokens) + "）" : ""),
       fmtTok(r.output_tokens),
       r.ttft_ms ? Math.round(r.ttft_ms) + " ms" : "-",
-      fmtMs(r.decode_ms),
+      r.decode_ms > 0 && r.output_tokens > 1
+        ? (r.output_tokens / (r.decode_ms / 1000)).toFixed(1) + " tok/s（" + fmtMs(r.decode_ms) + "）"
+        : fmtMs(r.decode_ms),
       fmtPct(r.acceptance),
     ];
     const tr = document.createElement("tr");
