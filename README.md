@@ -1,5 +1,7 @@
 # gfx1151-engine
 
+![Strix Halo — Qwen3.8-Flash-Next](media/strix_banner_21x9_v2.png)
+
 *English: [README_EN.md](README_EN.md)*
 
 在单张 AMD Strix Halo APU(gfx1151)上运行 177B MoE 模型的本地推理引擎,
