@@ -934,6 +934,7 @@ int main(int argc, char** argv) {
         "GDEC_QSA_KV_BF16", "GDEC_QSA_WMMA", "GDEC_QSA_WMMA_BTV",
         "GDEC_MOE_LT", "GDEC_MOE_LT_BF16", "GDEC_GR_BF16",
         "GDEC_GDN_STREAM", "GDEC_GDN_WAVE", "GDEC_NOWARMUP",
+        "GDEC_GEMM_WMMA", "GDEC_GDN_FUSED",
         "GDEC_INDEX_FUSED2", "GDEC_PP_MOE_OUT", "GDEC_INDEX_STREAM_SELECT",
     };
     for (const char* f : flags) SetEnvironmentVariableA(f, "1");

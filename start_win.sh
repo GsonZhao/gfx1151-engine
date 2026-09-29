@@ -51,6 +51,8 @@ RCKPT_MAX="${RCKPT_MAX:-8}"
 KV_PAGED="${KV_PAGED:-1}"
 KV_POOL_TOKENS="${KV_POOL_TOKENS:-0}"
 PARALLEL="${PARALLEL:-1}"
+# 单请求图片数上限（1–256）：多轮绘图/视觉对话会累计历史图片，按需调大。
+MAX_IMAGES="${MAX_IMAGES:-8}"
 # 本机 68 GiB 权重 cold-load 实测 ~9 分钟（NVMe 弱盘），超时给足。
 START_TIMEOUT="${START_TIMEOUT:-1800}"
 
@@ -63,6 +65,7 @@ START_TIMEOUT="${START_TIMEOUT:-1800}"
 [[ "$KV_PAGED" =~ ^[01]$ ]] || fail 'KV_PAGED 必须为 0 或 1'
 [[ "$KV_POOL_TOKENS" =~ ^(0|[1-9][0-9]*)$ && ${#KV_POOL_TOKENS} -le 8 ]] || fail 'KV_POOL_TOKENS 必须为非负整数'
 [[ "$PARALLEL" =~ ^[1-8]$ ]] || fail 'PARALLEL 范围为 1–8'
+[[ "$MAX_IMAGES" =~ ^[1-9][0-9]*$ && "$MAX_IMAGES" -le 256 ]] || fail 'MAX_IMAGES 范围为 1–256'
 (( PARALLEL == 1 || KV_PAGED )) || fail 'PARALLEL>1 需要 KV_PAGED=1'
 [[ -f build/gdec-win.exe ]] || fail '缺少 build/gdec-win.exe，请先运行 bash build_win.sh'
 [[ -f build/gdec-api-win.exe ]] || fail '缺少 build/gdec-api-win.exe，请先运行 bash build_win.sh api'
@@ -98,6 +101,7 @@ fi
 export GDEC_QSA_KV_BF16=1 GDEC_QSA_WMMA=1 GDEC_QSA_WMMA_BTV=1
 export GDEC_MOE_LT=1 GDEC_MOE_LT_BF16=1 GDEC_GR_BF16=1
 export GDEC_GDN_STREAM=1 GDEC_GDN_WAVE=1 GDEC_NOWARMUP=1
+export GDEC_GEMM_WMMA=1 GDEC_GDN_FUSED=1
 export GDEC_INDEX_FUSED2=1 GDEC_PP_MOE_OUT=1 GDEC_INDEX_STREAM_SELECT=1
 if (( KVSNAP_MAX_GB )); then export GDEC_KVSNAP=1; else export GDEC_KVSNAP=0; fi
 export GDEC_KVSNAP_MAX_GB="$KVSNAP_MAX_GB" GDEC_RCKPT_MAX="$RCKPT_MAX"
@@ -109,6 +113,7 @@ if (( KV_PAGED )); then
   if (( KV_POOL_TOKENS )); then export GDEC_KV_POOL_TOKENS="$KV_POOL_TOKENS"; fi
 fi
 export GDEC_PARALLEL="$PARALLEL"
+export GDEC_API_MAX_IMAGES="$MAX_IMAGES"
 
 mkdir -p logs
 ENGINE_LOG="logs/engine-win-$(date +%Y%m%d-%H%M%S).log"
