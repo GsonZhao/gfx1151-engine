@@ -162,12 +162,12 @@ static const char kDashboardHtml[] = R"HTMLDOC(<!DOCTYPE html>
         <option value="7">近 7 天（UTC）</option>
         <option value="0">全部历史</option>
       </select>
-      <span class="hint" style="margin:0">汇总来自服务端请求记录文件（/reqstat/summary）；下面的最近请求固定为最新 10 条（/reqstat/tail）。</span>
+      <span class="hint" style="margin:0">汇总来自服务端请求记录文件（/reqstat/summary）；下面的最近请求固定为最新 10 条（/reqstat/tail）。结束原因分三类：自然结束（生成完成或命中 stop 词）、长度上限（max_tokens 或上下文打满）、取消/断开（客户端中止）。</span>
     </div>
     <div class="grid" id="reqs-grid"></div>
     <div id="reqs-acc" style="margin-top:10px"></div>
     <table class="ovr" style="margin-top:12px">
-      <thead><tr><th>时间</th><th>结束</th><th>起草</th><th>prompt(命中)</th><th>输出</th><th>TTFT</th><th>decode</th><th>接受率</th></tr></thead>
+      <thead><tr><th>时间</th><th>结束原因</th><th>起草</th><th>prompt(命中)</th><th>输出</th><th>TTFT</th><th>decode</th><th>接受率</th></tr></thead>
       <tbody id="reqs-body"></tbody>
     </table>
     <div class="errmsg" id="reqs-err"></div>
@@ -731,10 +731,19 @@ function fmtPct(x) { return x == null ? "-" : (x * 100).toFixed(1) + "%"; }
 function fmtTok(n) { return n == null ? "-" : Number(n).toLocaleString("en-US"); }
 function fmtMs(x) { return x == null ? "-" : x >= 1000 ? (x / 1000).toFixed(2) + " s" : Math.round(x) + " ms"; }
 
+// 结束原因：JSON 里是英文枚举（稳定接口），页面上显示中文
+const FINISH_ZH = { stop: "自然结束", length: "长度上限", cancel: "取消/断开", error: "错误", other: "其它" };
+function finZh(k) { return FINISH_ZH[k] || k; }
+function finSummary(f) {
+  const parts = [];
+  for (const k of ["stop", "length", "cancel", "error"]) if (f && f[k]) parts.push(finZh(k) + " " + f[k]);
+  for (const k of Object.keys(f || {})) if (!(k in FINISH_ZH)) parts.push(k + " " + f[k]);
+  return parts.join("  ") || "-";
+}
+
 function renderReqSummary(j) {
   const c = (k, v, s) => '<div class="cell"><div class="k">' + k + '</div><div class="v mono">' + v +
                          '</div><div class="s">' + (s || "") + "</div></div>";
-  const fin = Object.entries(j.finish || {}).map(([k, v]) => k + " " + v).join("  ") || "-";
   const t = j.ttft;
   $("reqs-grid").innerHTML =
     c("请求数", fmtTok(j.requests),
@@ -746,7 +755,7 @@ function renderReqSummary(j) {
       "decode 共 " + (j.decode_seconds || 0).toFixed(1) + " s") +
     c("TTFT p50 / p95", t ? fmtMs(t.p50_ms) + " / " + fmtMs(t.p95_ms) : "-",
       t ? t.count + " 条流式" : "无流式请求") +
-    c("结束原因", fin, "");
+    c("结束原因", finSummary(j.finish), "");
   const order = ["chain", "mtp", "ngram", "dflash2", "serial"];
   const names = { chain: "chain（ngram+MTP）", mtp: "MTP", ngram: "ngram", dflash2: "dflash2", serial: "serial" };
   const parts = [];
@@ -774,7 +783,7 @@ function renderReqTable(j) {
     const d = new Date(r.ts_ms);
     const cells = [
       p(d.getMonth() + 1) + "-" + p(d.getDate()) + " " + p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds()),
-      r.finish + (r.vision ? "（图）" : ""),
+      finZh(r.finish) + (r.vision ? "（图）" : ""),
       r.drafter,
       fmtTok(r.prompt_tokens) + (r.cached_tokens ? "（" + fmtTok(r.cached_tokens) + "）" : ""),
       fmtTok(r.output_tokens),
