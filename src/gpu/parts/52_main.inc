@@ -314,6 +314,18 @@ int main(int argc, char** argv) {
     gguf_dense_apply(ckpt);
     g_cfg.vocab = (int)ckpt.at("lm_head.weight").dims[0];
     memstats_capture_hip_baseline();
+    // D1a：并发 serve 用更小的 prefill 分段，缩短 D1b 层间让出的最长停顿。
+    // 必须在 devarena_init 之前（arena sizing 与 GpuModel 共用 eff_maxbatch）。
+    if (eff_parallel() > 1) {
+      if (const char* e = getenv("GDEC_CONC_PREFILL_CHUNK")) {
+        int v = atoi(e);
+        if (v > 0) {
+          g_maxbatch_override = v;
+          fprintf(stderr, "gdec: parallel %d -> prefill chunk %d (GDEC_CONC_PREFILL_CHUNK)\n",
+                  eff_parallel(), eff_maxbatch(maxctx));
+        }
+      }
+    }
     devarena_init(ckpt, maxctx);
     load_arena(ckpt);
     GpuModel m(ckpt, maxctx);
@@ -537,21 +549,30 @@ int main(int argc, char** argv) {
   // 连续真实 token 片段跑 prefill_batch(P, base=N) 各 20 次取中位数，
   // 量 P 行成本曲线与 P>8 / P>16 悬崖（verify 路径同款参数 final/quiet，
   // 不捕 tap、不做快照）。跑完直接退出。
+  // 项写成 PxS（如 8x4）：P 行由 S 段各 P/S 个连续 token 拼成，S 段取自 prompt 里
+  // 均匀分开的位置，专家分布近似 S 个不同序列（D2 合批估算用，tools/d2_gate_check.sh）。
   if (const char* vb = getenv("GDEC_VBENCH")) {
     m.mtp_tap_capture = false;
-    std::vector<int> Ps;
+    std::vector<std::pair<int, int>> Ps;
     for (const char* p = vb;;) {
-      Ps.push_back(atoi(p));
+      char* q = nullptr;
+      int P = (int)strtol(p, &q, 10), S = 1;
+      if (q && *q == 'x') S = std::max(1, atoi(q + 1));
+      Ps.push_back({P, S});
       const char* c = strchr(p, ',');
       if (!c) break;
       p = c + 1;
     }
-    for (int P : Ps) {
-      if (P < 1 || (size_t)P > tokens.size()) {
-        fprintf(stderr, "vbench P=%d skip（越界）\n", P);
+    for (auto [P, S] : Ps) {
+      if (P < 1 || (size_t)P > tokens.size() || P % S) {
+        fprintf(stderr, "vbench P=%d segs=%d skip（越界或不整除）\n", P, S);
         continue;
       }
-      std::vector<int> slice(tokens.begin(), tokens.begin() + P);
+      std::vector<int> slice;
+      for (int s = 0; s < S; s++) {
+        size_t o = tokens.size() / S * s;
+        slice.insert(slice.end(), tokens.begin() + o, tokens.begin() + o + P / S);
+      }
       std::vector<double> ts;
       for (int r = 0; r < 20; r++) {
         auto t0 = std::chrono::steady_clock::now();
@@ -562,8 +583,12 @@ int main(int argc, char** argv) {
                          .count());
       }
       std::sort(ts.begin(), ts.end());
-      fprintf(stderr, "vbench P=%d median=%.2f ms min=%.2f max=%.2f\n", P,
-              ts[ts.size() / 2], ts.front(), ts.back());
+      if (S > 1)
+        fprintf(stderr, "vbench P=%d segs=%d median=%.2f ms min=%.2f max=%.2f\n", P, S,
+                ts[ts.size() / 2], ts.front(), ts.back());
+      else
+        fprintf(stderr, "vbench P=%d median=%.2f ms min=%.2f max=%.2f\n", P,
+                ts[ts.size() / 2], ts.front(), ts.back());
     }
     return 0;
   }

@@ -44,6 +44,9 @@ start() {
   for e in $(compgen -e | grep '^GDEC_'); do unset "$e"; done
   for e in "${PENV[@]}"; do export "$e"; done
   export GDEC_KVSNAP=0 GDEC_NGRAM_CHUNK=16 GDEC_PARALLEL="$par"
+  # D1a：并发引擎的 prefill 分段是 GDEC_CONC_PREFILL_CHUNK，单路是 GDEC_PREFILL_CHUNK。
+  # 本脚本的引擎一律用并发分段，保证单路/并发/旧二进制在同一分段下逐位对比。
+  [[ "${GDEC_CONC_PREFILL_CHUNK:-0}" -gt 0 ]] && export GDEC_PREFILL_CHUNK="$GDEC_CONC_PREFILL_CHUNK"
   for e in "${CONC_ENV[@]}" "$@"; do export "$e"; done
   local cmd=("${BASE[@]}") i
   cmd[0]="$bin"

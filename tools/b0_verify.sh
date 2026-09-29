@@ -55,6 +55,9 @@ start() {
   for e in "${PENV[@]}"; do export "$e"; done
   export GDEC_KVSNAP=0
   for e in "$@"; do export "$e"; done
+  # D1a：并发引擎的 prefill 分段是 GDEC_CONC_PREFILL_CHUNK，单路是 GDEC_PREFILL_CHUNK。
+  # 本脚本的引擎一律用并发分段，保证单路/并发/旧二进制在同一分段下逐位对比。
+  [[ "${GDEC_CONC_PREFILL_CHUNK:-0}" -gt 0 ]] && export GDEC_PREFILL_CHUNK="$GDEC_CONC_PREFILL_CHUNK"
   cmd[0]="$bin"
   for i in "${!cmd[@]}"; do [[ "${cmd[$i]}" == --port ]] && cmd[$((i + 1))]=8732; done
   probe_start "$tag" "${cmd[@]}"

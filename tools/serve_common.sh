@@ -27,6 +27,7 @@ serve_init() {
   KV_PAGED="${KV_PAGED:-1}"
   KV_POOL_TOKENS="${KV_POOL_TOKENS:-0}"
   PARALLEL="${PARALLEL:-1}"
+  CONC_PREFILL_CHUNK="${CONC_PREFILL_CHUNK:-8192}"
   if [[ -f "$ROOT/build/bundled-runtime.conf" ]]; then
     # --bundle 产物优先使用随包库；kernel db 使用绝对路径，不依赖 cwd。
     [[ -d "$ROOT/build/lib" ]] || fail '缺少 build/lib，请重新运行 bash build.sh --bundle'
@@ -47,7 +48,7 @@ serve_init() {
     value="${!key}"
     [[ "$value" =~ ^[1-9][0-9]*$ && ${#value} -le 8 ]] || fail "$key 必须为正整数"
   done
-  for key in KVSNAP_MAX_GB RCKPT_MAX KV_POOL_TOKENS MTP_GAMMA; do
+  for key in KVSNAP_MAX_GB RCKPT_MAX KV_POOL_TOKENS MTP_GAMMA CONC_PREFILL_CHUNK; do
     value="${!key}"
     [[ "$value" =~ ^(0|[1-9][0-9]*)$ && ${#value} -le 8 ]] || fail "$key 必须为非负整数"
   done
@@ -98,6 +99,11 @@ serve_run() {
   # 32768: 32K prompt 单 chunk 实测 +7.4%（1155 vs 1076 tok/s）；65536 超内存 PSI 上限。
   # 32768性能最佳但是吃的显存太多，8192吃的最少但是性能最差，16384折中一下，性能损失不大，吃的显存更少
   export GDEC_PREFILL_CHUNK=16384
+  # 并发（D1a）：引擎 serve 且 GDEC_PARALLEL>1 时用这个分段代替上面的 16384。prefill 只在
+  # 层间让出 GPU，32K prompt 时别的会话最长卡顿 16384 约 0.8–1.4 s、8192 约 0.6 s，
+  # 单独 PP 不变（09-29 d1a_verify）。由引擎判断并发，离线工具（pp_prod/kld 等复用这些 ENV）不受影响。
+  unset GDEC_CONC_PREFILL_CHUNK
+  if (( CONC_PREFILL_CHUNK > 0 )); then export GDEC_CONC_PREFILL_CHUNK="$CONC_PREFILL_CHUNK"; fi
   export GDEC_INDEX_FUSED2=1 GDEC_PP_MOE_OUT=1 GDEC_INDEX_STREAM_SELECT=1
   if (( KVSNAP_MAX_GB )); then export GDEC_KVSNAP=1; else export GDEC_KVSNAP=0; fi
   # PLE io_uring 聚集由 service.conf 的 PLE_URING 控制；引擎只查 GDEC_PLE_URING
@@ -126,6 +132,9 @@ serve_run() {
     echo "KV：分页，页池 $(( (KV_POOL_TOKENS > MAX_CONTEXT ? KV_POOL_TOKENS : MAX_CONTEXT) )) token（${PARALLEL} 路并发共享），RAM 检查点 ${RCKPT_MAX} 个"
   else
     echo "KV：不分页（KV_PAGED=0）"
+  fi
+  if (( PARALLEL > 1 && CONC_PREFILL_CHUNK > 0 )); then
+    echo "prefill 分段：${CONC_PREFILL_CHUNK}（并发；单路 ${GDEC_PREFILL_CHUNK}）"
   fi
   if (( CHECK )); then
     # 机器可读：引擎环境变量与命令行（tools/a5_verify.sh、pp_prod.sh 等解析这两段）

@@ -36,7 +36,13 @@ static hipError_t dalloc_arena(void** p, size_t bytes) {
 // 与 devarena_estimate 共享的 maxbatch 决策。32K 是 Linux 上实测能与 68 GiB
 // 模型及长上下文 KV 共存的最大批（GDEC_PREFILL_CHUNK 可压低）；Windows 受
 // 96 GiB VRAM 硬门槛限制默认 8192（见 PORTING-WINDOWS.md）。
+// 并发 serve 的 prefill 分段覆盖（D1a）：main 的 serve 分支在 eff_parallel()>1 且
+// GDEC_CONC_PREFILL_CHUNK>0 时设置，优先于 GDEC_PREFILL_CHUNK。prefill 只在层间把 GPU
+// 让给别的会话（D1b），分段越小每层越短、别的会话卡得越短。0 = 不覆盖。
+static int g_maxbatch_override = 0;
+
 static int eff_maxbatch(int maxctx) {
+  if (g_maxbatch_override > 0) return std::min(maxctx, g_maxbatch_override);
   if (const char* e = getenv("GDEC_PREFILL_CHUNK")) {
     int v = atoi(e);
     if (v > 0) return std::min(maxctx, v);
