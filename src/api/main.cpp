@@ -44,6 +44,7 @@
 #include "http.h"
 #include "json_py.h"
 #include "reqstat.h"
+#include "reqstat_read.h"
 #include "tokenizer.h"
 #include "toolparse.h"
 #include "vision.h"
@@ -1573,6 +1574,238 @@ void handle_memory(const http::Request&, http::Response* r, http::Stream*) {
     r->body = json_py::dumps(j, /*spaced=*/false);
 }
 
+// --------------------------------------------------------- request stats --
+
+// GET /reqstat/summary?from=YYYY-MM-DD&to=YYYY-MM-DD — aggregates over the
+// reqstat file chain (UTC dates, same semantics as tools/reqstat_dump.py;
+// no params = all history). GET /reqstat/tail?n=N — last N records,
+// oldest-first. Both are read-only and served without touching the engine.
+
+std::string url_decode(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (size_t i = 0; i < s.size(); i++) {
+        if (s[i] == '%' && i + 2 < s.size()) {
+            const auto hex = [](char c) -> int {
+                if (c >= '0' && c <= '9') return c - '0';
+                if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+                if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+                return -1;
+            };
+            const int hi = hex(s[i + 1]), lo = hex(s[i + 2]);
+            if (hi >= 0 && lo >= 0) {
+                out += (char)(hi * 16 + lo);
+                i += 2;
+                continue;
+            }
+        }
+        out += s[i] == '+' ? ' ' : s[i];
+    }
+    return out;
+}
+
+std::map<std::string, std::string> parse_query(const std::string& qs) {
+    std::map<std::string, std::string> out;
+    for (size_t i = 0; i <= qs.size();) {
+        const size_t amp = qs.find('&', i);
+        const std::string kv = qs.substr(i, amp == std::string::npos
+                                                 ? std::string::npos
+                                                 : amp - i);
+        if (!kv.empty()) {
+            const size_t eq = kv.find('=');
+            out[url_decode(kv.substr(0, eq))] =
+                eq == std::string::npos ? "" : url_decode(kv.substr(eq + 1));
+        }
+        if (amp == std::string::npos) break;
+        i = amp + 1;
+    }
+    return out;
+}
+
+// Howard Hinnant's days_from_civil: days since 1970-01-01, proleptic
+// Gregorian — no timezone dependence, so UTC dates behave the same on
+// Linux and Windows.
+int64_t days_from_civil(int64_t y, unsigned m, unsigned d) {
+    y -= m <= 2;
+    const int64_t era = (y >= 0 ? y : y - 399) / 400;
+    const unsigned yoe = (unsigned)(y - era * 400);
+    const unsigned doy = (153 * (m > 2 ? m - 3 : m + 9) + 2) / 5 + d - 1;
+    const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + (int64_t)doe - 719468;
+}
+
+bool parse_date_ms(const std::string& s, bool end_of_day, uint64_t* ms) {
+    int y;
+    unsigned m, d;
+    if (sscanf(s.c_str(), "%d-%u-%u", &y, &m, &d) != 3 || m < 1 || m > 12 ||
+        d < 1 || d > 31)
+        return false;
+    int64_t v = days_from_civil(y, m, d) * 86400000LL +
+                (end_of_day ? 86399999LL : 0);
+    *ms = (uint64_t)(v > 0 ? v : 0);
+    return true;
+}
+
+const char* finish_name(uint32_t f) {
+    switch (f) {
+        case 1: return "stop";
+        case 2: return "length";
+        case 3: return "cancel";
+        case 4: return "error";
+        default: return "other";
+    }
+}
+
+const char* drafter_name(uint32_t d) {
+    switch (d) {
+        case 0: return "serial";
+        case 1: return "mtp";
+        case 2: return "dflash2";
+        case 3: return "ngram";
+        case 4: return "chain";
+        default: return "other";
+    }
+}
+
+void handle_reqstat_summary(const http::Request& q, http::Response* r,
+                            http::Stream*) {
+    const auto qp = parse_query(q.query);
+    uint64_t t0 = 0, t1 = ~(uint64_t)0;
+    if (auto it = qp.find("from"); it != qp.end() && !it->second.empty() &&
+        !parse_date_ms(it->second, false, &t0))
+        http::fail(400, "from must be YYYY-MM-DD (UTC)");
+    if (auto it = qp.find("to"); it != qp.end() && !it->second.empty() &&
+        !parse_date_ms(it->second, true, &t1))
+        http::fail(400, "to must be YYYY-MM-DD (UTC)");
+    if (t0 > t1) http::fail(400, "from is after to");
+
+    uint64_t n = 0, tp = 0, tc = 0, tg = 0;
+    double pre_s = 0, dec_s = 0;
+    std::vector<uint32_t> ttfts;
+    std::map<std::string, uint64_t> finish;
+    struct DStat {
+        uint64_t requests = 0, accepted = 0, proposed = 0;
+    };
+    std::map<std::string, DStat> drafters;
+    reqstat::ScanInfo info;
+    std::string err;
+    if (!reqstat::scan(
+            t0, t1,
+            [&](const reqstat::QEntry& e) {
+                n++;
+                tp += e.n_prompt;
+                tc += e.n_cached;
+                tg += e.n_gen;
+                pre_s += e.prefill_us / 1e6;
+                dec_s += e.decode_us / 1e6;
+                if (e.ttft_us > 0) ttfts.push_back(e.ttft_us);
+                finish[finish_name(e.flags & 0xF)]++;
+                if (e.proposed > 0) {
+                    auto& s = drafters[drafter_name((e.flags >> 4) & 0xF)];
+                    s.requests++;
+                    s.proposed += e.proposed;
+                    s.accepted +=
+                        e.commit >= e.rounds ? e.commit - e.rounds : 0;
+                }
+                return true;
+            },
+            &info, &err)) {
+        r->status = 500;
+        r->body = http::error_json("reqstat scan failed: " + err,
+                                   "server_error", "server_error");
+        return;
+    }
+
+    json j;
+    j["from_ms"] = t0;
+    if (t1 != ~(uint64_t)0) j["to_ms"] = t1; else j["to_ms"] = nullptr;
+    j["requests"] = n;
+    j["input_tokens"] = tp;
+    j["cached_tokens"] = tc;
+    j["output_tokens"] = tg;
+    j["cache_hit_rate"] = tp ? json(tc * 1.0 / tp) : json(nullptr);
+    j["prefill_seconds"] = pre_s;
+    j["decode_seconds"] = dec_s;
+    j["decode_tok_per_s"] =
+        dec_s > 0 ? json(tg / dec_s) : json(nullptr);
+    if (!ttfts.empty()) {
+        std::sort(ttfts.begin(), ttfts.end());
+        j["ttft"] = {{"count", ttfts.size()},
+                     {"p50_ms", ttfts[ttfts.size() / 2] / 1000.0},
+                     {"p95_ms", ttfts[(size_t)(ttfts.size() * 0.95)] / 1000.0}};
+    } else {
+        j["ttft"] = nullptr;
+    }
+    j["finish"] = finish.empty() ? json::object() : json(finish);
+    json dj = json::object();
+    for (const auto& [name, s] : drafters) {
+        dj[name] = {{"requests", s.requests},
+                    {"accepted", s.accepted},
+                    {"proposed", s.proposed},
+                    {"acceptance",
+                     s.proposed ? json(s.accepted * 1.0 / s.proposed)
+                                : json(nullptr)}};
+    }
+    j["drafters"] = dj;
+    j["files_total"] = info.files_total;
+    j["files_scanned"] = info.files_scanned;
+    j["bad_crc"] = info.bad_crc;
+    r->set("Cache-Control", "no-store");
+    r->body = json_py::dumps(j, /*spaced=*/false);
+}
+
+void handle_reqstat_tail(const http::Request& q, http::Response* r,
+                         http::Stream*) {
+    const auto qp = parse_query(q.query);
+    long n = 20;
+    if (auto it = qp.find("n"); it != qp.end() && !it->second.empty()) {
+        char* end = nullptr;
+        n = strtol(it->second.c_str(), &end, 10);
+        if (!end || *end || n < 1) http::fail(400, "n must be a positive integer");
+        if (n > 1000) n = 1000;
+    }
+    std::vector<reqstat::QEntry> recs;
+    reqstat::ScanInfo info;
+    std::string err;
+    if (!reqstat::tail((uint32_t)n, &recs, &info, &err)) {
+        r->status = 500;
+        r->body = http::error_json("reqstat read failed: " + err,
+                                   "server_error", "server_error");
+        return;
+    }
+    json arr = json::array();
+    for (const auto& e : recs) {
+        json o;
+        o["ts_ms"] = e.ts_ms;
+        o["req_seq"] = e.req_seq;
+        o["finish"] = finish_name(e.flags & 0xF);
+        o["drafter"] = drafter_name((e.flags >> 4) & 0xF);
+        o["vision"] = (e.flags & 0x100) != 0;
+        o["prompt_tokens"] = e.n_prompt;
+        o["cached_tokens"] = e.n_cached;
+        o["output_tokens"] = e.n_gen;
+        o["ttft_ms"] = e.ttft_us / 1000.0;
+        o["prefill_ms"] = e.prefill_us / 1000.0;
+        o["decode_ms"] = e.decode_us / 1000.0;
+        o["proposed"] = e.proposed;
+        o["commit"] = e.commit;
+        o["rounds"] = e.rounds;
+        o["acceptance"] =
+            e.proposed
+                ? json((e.commit >= e.rounds ? e.commit - e.rounds : 0) * 1.0 /
+                       e.proposed)
+                : json(nullptr);
+        arr.push_back(o);
+    }
+    json j;
+    j["records"] = arr;
+    j["files_total"] = info.files_total;
+    j["files_scanned"] = info.files_scanned;
+    j["bad_crc"] = info.bad_crc;
+    r->set("Cache-Control", "no-store");
+    r->body = json_py::dumps(j, /*spaced=*/false);
+}
+
 // GET / 和 GET /dashboard — static monitoring page (see dashboard_html.inc).
 // 页面加载后用同源 fetch 轮询 /health 与 /memory，这里只负责回 HTML。
 #include "dashboard_html.inc"
@@ -1589,7 +1822,7 @@ void handle_health(const http::Request&, http::Response* r, http::Stream*) {
     j["model"] = g_cfg.model;
     j["endpoints"] = json::array(
         {"/v1/chat/completions", "/v1/completions", "/v1/models", "/v1/responses",
-         "/dashboard"});
+         "/dashboard", "/reqstat/summary", "/reqstat/tail"});
     j["context"] = g_cfg.context;
     j["rope_scaling"] = nullptr;
     {
@@ -2520,6 +2753,8 @@ int main(int argc, char** argv) {
     srv.on("GET", "/health", handle_health);
     srv.on("GET", "/memory", handle_memory);
     srv.on("GET", "/cache", handle_cache);
+    srv.on("GET", "/reqstat/summary", handle_reqstat_summary);
+    srv.on("GET", "/reqstat/tail", handle_reqstat_tail);
     srv.on("GET", "/admin/overrides", handle_overrides_get);
     srv.on("POST", "/admin/overrides", handle_overrides_post);
     srv.on("POST", "/v1/completions", handle_completions);

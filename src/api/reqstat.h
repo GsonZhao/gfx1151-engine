@@ -12,7 +12,9 @@
 //   flags: bits 0-3 finish (1 stop / 2 length / 3 cancel / 4 error),
 //          bits 4-7 drafter (0 serial / 1 mtp / 3 ngram / 4 chain), bit 8 vision.
 //
-// Consistency rules: records are flushed before the header count is updated,
+// Consistency rules: each record is written to disk and flushed together with
+// the updated header before record() returns, so a completed request survives
+// a process crash. Records are flushed before the header count is updated,
 // so after a crash the header may lag; the truth is the file size
 // (count = (size - 256) / 64, trailing partial bytes are truncated on open).
 // A torn final record is detected by magic+crc16 and skipped by readers.
@@ -42,8 +44,8 @@ struct Entry {
   uint32_t flags = 0;
 };
 
-// Record one completed request. Thread-safe; never throws, never blocks the
-// caller for more than a buffer flush (one write syscall per 64 records).
+// Record one completed request. Thread-safe; never throws. The record is on
+// disk before this returns (one write syscall per request).
 void record(const Entry& e);
 
 }  // namespace reqstat

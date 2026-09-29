@@ -5,6 +5,7 @@
 //   GET /health  每 2 秒   —— API 进程自身的状态，不经过 engine
 //   GET /memory  每 10 秒  —— engine 内存记账（占用推理槽位，间隔勿低于 ~1 秒）
 //   GET/POST /admin/overrides —— 服务端采样/思考参数覆盖表（打开页面时读一次）
+//   GET /reqstat/summary|tail 每 10 秒 —— "请求统计"面板（读 data/reqstat*.bin，不经过 engine）
 //   POST /v1/chat/completions —— "对话测试"面板，以普通客户端身份流式调用
 // /memory 在 engine 不可达时返回 500；页面把错误显示在面板内并保留上次数值，
 // 继续按周期重试，不会白屏。
@@ -135,7 +136,7 @@ static const char kDashboardHtml[] = R"HTMLDOC(<!DOCTYPE html>
   <h1>gdec-api 控制台</h1>
   <span class="mono" id="target"></span>
   <span class="chip" id="conn">连接中…</span>
-  <nav><a href="#health">状态</a><a href="#ovr">参数覆盖</a><a href="#chat">对话测试</a><a href="#mem">内存</a></nav>
+  <nav><a href="#health">状态</a><a href="#reqs">请求统计</a><a href="#ovr">参数覆盖</a><a href="#chat">对话测试</a><a href="#mem">内存</a></nav>
   <button id="pause" type="button">⏸ 暂停刷新</button>
 </header>
 <main>
@@ -151,6 +152,25 @@ static const char kDashboardHtml[] = R"HTMLDOC(<!DOCTYPE html>
       <div><div class="k">服务端覆盖</div><div class="v mono" id="h-ovr">-</div></div>
     </div>
     <div class="errmsg" id="health-err"></div>
+  </section>
+
+  <section class="panel" id="reqs">
+    <h2>请求统计 <span class="meta mono" id="reqs-meta"></span></h2>
+    <div class="row" style="margin:0 0 12px">
+      <select id="reqs-range">
+        <option value="1">今天（UTC）</option>
+        <option value="7">近 7 天（UTC）</option>
+        <option value="0">全部历史</option>
+      </select>
+      <span class="hint" style="margin:0">汇总来自服务端请求记录文件（/reqstat/summary）；下面的最近请求固定为最新 10 条（/reqstat/tail）。</span>
+    </div>
+    <div class="grid" id="reqs-grid"></div>
+    <div id="reqs-acc" style="margin-top:10px"></div>
+    <table class="ovr" style="margin-top:12px">
+      <thead><tr><th>时间</th><th>结束</th><th>起草</th><th>prompt(命中)</th><th>输出</th><th>TTFT</th><th>decode</th><th>接受率</th></tr></thead>
+      <tbody id="reqs-body"></tbody>
+    </table>
+    <div class="errmsg" id="reqs-err"></div>
   </section>
 
   <section class="panel" id="ovr">
@@ -704,6 +724,92 @@ async function tickMem() {
   }
 }
 
+// ------------------------------------------------------------ 请求统计 --
+const REQ_MS = 10000;  // /reqstat/* 轮询间隔
+
+function fmtPct(x) { return x == null ? "-" : (x * 100).toFixed(1) + "%"; }
+function fmtTok(n) { return n == null ? "-" : Number(n).toLocaleString("en-US"); }
+function fmtMs(x) { return x == null ? "-" : x >= 1000 ? (x / 1000).toFixed(2) + " s" : Math.round(x) + " ms"; }
+
+function renderReqSummary(j) {
+  const c = (k, v, s) => '<div class="cell"><div class="k">' + k + '</div><div class="v mono">' + v +
+                         '</div><div class="s">' + (s || "") + "</div></div>";
+  const fin = Object.entries(j.finish || {}).map(([k, v]) => k + " " + v).join("  ") || "-";
+  const t = j.ttft;
+  $("reqs-grid").innerHTML =
+    c("请求数", fmtTok(j.requests),
+      (j.files_total || 0) + " 个记录文件" + (j.bad_crc ? "，" + j.bad_crc + " 条坏记录已跳过" : "")) +
+    c("输入 token", fmtTok(j.input_tokens),
+      "缓存命中 " + fmtTok(j.cached_tokens) + "（" + fmtPct(j.cache_hit_rate) + "）") +
+    c("输出 token", fmtTok(j.output_tokens), "") +
+    c("decode 速度", j.decode_tok_per_s == null ? "-" : j.decode_tok_per_s.toFixed(1) + " tok/s",
+      "decode 共 " + (j.decode_seconds || 0).toFixed(1) + " s") +
+    c("TTFT p50 / p95", t ? fmtMs(t.p50_ms) + " / " + fmtMs(t.p95_ms) : "-",
+      t ? t.count + " 条流式" : "无流式请求") +
+    c("结束原因", fin, "");
+  const order = ["chain", "mtp", "ngram", "dflash2", "serial"];
+  const names = { chain: "chain（ngram+MTP）", mtp: "MTP", ngram: "ngram", dflash2: "dflash2", serial: "serial" };
+  const parts = [];
+  for (const k of order) {
+    const d = (j.drafters || {})[k];
+    if (!d) continue;
+    parts.push('<div><span style="color:var(--dim)">' + names[k] + ' 接受率</span> <span class="mono">' +
+               fmtPct(d.acceptance) + '</span> <span style="color:var(--dim);font-size:12px">（' +
+               fmtTok(d.accepted) + "/" + fmtTok(d.proposed) + "，" + d.requests + " 请求）</span></div>");
+  }
+  $("reqs-acc").innerHTML = parts.join("") ||
+    '<span style="color:var(--dim);font-size:12px">窗口内没有投机请求</span>';
+}
+
+function renderReqTable(j) {
+  const tb = $("reqs-body");
+  tb.innerHTML = "";
+  const recs = (j.records || []).slice().reverse();  // 最新在上
+  if (!recs.length) {
+    tb.innerHTML = '<tr><td colspan="8" class="note">还没有请求记录</td></tr>';
+    return;
+  }
+  const p = v => String(v).padStart(2, "0");
+  for (const r of recs) {
+    const d = new Date(r.ts_ms);
+    const cells = [
+      p(d.getMonth() + 1) + "-" + p(d.getDate()) + " " + p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds()),
+      r.finish + (r.vision ? "（图）" : ""),
+      r.drafter,
+      fmtTok(r.prompt_tokens) + (r.cached_tokens ? "（" + fmtTok(r.cached_tokens) + "）" : ""),
+      fmtTok(r.output_tokens),
+      r.ttft_ms ? Math.round(r.ttft_ms) + " ms" : "-",
+      fmtMs(r.decode_ms),
+      fmtPct(r.acceptance),
+    ];
+    const tr = document.createElement("tr");
+    for (const x of cells) {
+      const td = document.createElement("td");
+      td.className = "mono"; td.textContent = x;
+      tr.appendChild(td);
+    }
+    tb.appendChild(tr);
+  }
+}
+
+async function tickReqs() {
+  if (paused) return;
+  try {
+    const range = $("reqs-range").value;
+    let q = "";
+    if (range !== "0") {
+      const from = new Date(Date.now() - (Number(range) - 1) * 86400000);
+      q = "?from=" + from.toISOString().slice(0, 10);
+    }
+    const [s, t] = await Promise.all([grab("/reqstat/summary" + q), grab("/reqstat/tail?n=10")]);
+    renderReqSummary(s);
+    renderReqTable(t);
+    hideErr("reqs-err");
+    $("reqs-meta").textContent = "更新于 " + hhmmss() + "（每 10 秒）";
+  } catch (e) { showErr("reqs-err", e.message); }
+}
+$("reqs-range").addEventListener("change", tickReqs);
+
 $("pause").addEventListener("click", () => {
   paused = !paused;
   $("pause").textContent = paused ? "▶ 继续刷新" : "⏸ 暂停刷新";
@@ -712,9 +818,10 @@ $("target").textContent = location.host;
 
 buildOvrTable();
 loadOvr();
-tickHealth(); tickMem();
+tickHealth(); tickMem(); tickReqs();
 setInterval(tickHealth, HEALTH_MS);
 setInterval(tickMem, MEM_MS);
+setInterval(tickReqs, REQ_MS);
 window.addEventListener("resize", drawSpark);
 </script>
 </body>

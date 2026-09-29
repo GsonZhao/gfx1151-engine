@@ -15,8 +15,6 @@ constexpr uint32_t kMagic = 0x47525153;  // "GRQS"
 constexpr uint16_t kVersion = 1;
 constexpr uint16_t kHeaderSize = 256;
 constexpr uint32_t kRecordSize = 64;
-constexpr size_t kBufRecords = 64;  // flush every 4 KiB
-constexpr double kFlushIntervalS = 2.0;
 
 void put16(uint8_t* p, uint16_t v) { memcpy(p, &v, 2); }
 void put32(uint8_t* p, uint32_t v) { memcpy(p, &v, 4); }
@@ -51,12 +49,16 @@ class Recorder {
     if (!f_) return;
     const uint64_t esz = (uint64_t)kHeaderSize + hdr_.record_count * kRecordSize;
     if (esz + kRecordSize > hdr_.rotate_bytes && hdr_.record_count > 0) rotate();
-    uint8_t* r = buf_ + nbuf_ * kRecordSize;
+    // 请求一旦结束就必须落盘：记录与头部一起写完并 flush 后才返回，
+    // 进程崩溃最多丢掉正在写的那一条（读者按文件大小截断 torn tail）。
+    uint8_t r[kRecordSize];
     pack(r, e);
     if (hdr_.record_count == 0) hdr_.first_ts = e.ts_ms;
     hdr_.last_ts = e.ts_ms;
     hdr_.record_count++;
-    if (++nbuf_ == kBufRecords || due()) flush();
+    fseek(f_, 0, SEEK_END);
+    fwrite(r, kRecordSize, 1, f_);
+    flush();
   }
 
  private:
@@ -65,10 +67,6 @@ class Recorder {
   FILE* f_ = nullptr;
   std::mutex mtx_;
   Header hdr_;
-  uint8_t buf_[kBufRecords * kRecordSize];
-  size_t nbuf_ = 0;
-  std::chrono::steady_clock::time_point last_flush_ =
-      std::chrono::steady_clock::now();
   std::string path_;
 
   static void pack(uint8_t* r, const Entry& e) {
@@ -88,21 +86,9 @@ class Recorder {
     put16(r + 56, crc16(r, 56));
   }
 
-  bool due() {
-    auto now = std::chrono::steady_clock::now();
-    return std::chrono::duration<double>(now - last_flush_).count() >
-           kFlushIntervalS;
-  }
-
   void flush() {
-    if (nbuf_ > 0) {
-      fseek(f_, 0, SEEK_END);
-      fwrite(buf_, kRecordSize, nbuf_, f_);
-      nbuf_ = 0;
-    }
     write_header();
     fflush(f_);
-    last_flush_ = std::chrono::steady_clock::now();
   }
 
   void write_header() {
