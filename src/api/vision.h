@@ -24,6 +24,9 @@ struct Frame {
 bool decode_image_url(const std::string& value, std::vector<uint8_t>* bytes,
                       std::string* error);
 
+// Per-request image cap: GDEC_API_MAX_IMAGES (1..256), default 8.
+int max_images();
+
 // Decode PNG/JPEG/WebP, smart-resize it, normalize it, and build Qwen patches.
 bool preprocess(const std::vector<uint8_t>& bytes, Frame* frame, std::string* error);
 
