@@ -1,19 +1,32 @@
 // start_win.exe - Windows 启动器：拉起引擎 + OpenAI API 双进程。
 // 原生 Win32，无任何脚本宿主依赖（不需要 Git Bash / PowerShell）。
-// 双击即运行；Ctrl+C 或关窗同时停掉两个子进程。
+//
+// 默认是托盘程序：双击后不开黑色控制台，只在任务栏右下角放一个图标。
+// 右键图标：打开面板 / 复制 API 地址 / 查看日志 / 退出（同时停掉两个子进程）；
+// 双击图标：已就绪时打开面板，否则打开引擎日志。出错或子进程退出时弹框提示。
+// （控制台窗口在"快速编辑模式"下被鼠标点一下就会暂停输出，是 Windows 下
+// 推理卡住的常见原因之一；托盘模式根本没有控制台。）
+//
+//   start_win.exe --console   旧的控制台模式（新开一个控制台窗口实时显示输出，
+//                             Ctrl+C 或关窗停止），排查问题用
+//   start_win.exe --check     只检查配置不启动（结果打印到调用它的控制台）
 //
 // 配置来源（优先级从高到低）：环境变量 > 根目录 service.conf > 内置默认。
 // 换模型文件名、改上下文窗口等，直接编辑 service.conf（与 Linux 同一文件）。
 //   set MAX_CONTEXT=131072 && start_win.exe   （环境变量临时覆盖）
 //   VISION_FILE 置空 = 纯文本不挂视觉塔；MTP_FILE 置空 = 不用投机草稿；
 //   OVERLAY_FILE 置空（默认）= 无覆盖层
-//   start_win.exe --check     只检查配置不启动
 // START_TIMEOUT 等计时项与平台相关，不读 conf（Windows 冷加载分钟级）。
 //
-// 子进程输出实时透传到本控制台，同时写入 logs\*-win-<时间戳>.log。
-// 控制台卡住（选择文本、终端忙）不会阻塞子进程：日志文件照写，控制台显示最多
-// 缓冲 8 MiB，超出部分只在控制台上丢弃并提示。快速编辑模式运行期间关闭。
+// 子进程输出写入 logs\engine-win-<时间戳>.log / logs\api-win-<时间戳>.log，
+// 启动器自己的输出写入 logs\launcher-win-<时间戳>.log（托盘模式）。
+// 控制台模式下输出同时透传到控制台；控制台卡住（选择文本、终端忙）不会阻塞
+// 子进程：日志文件照写，控制台显示最多缓冲 8 MiB，超出部分只在控制台上丢弃
+// 并提示。快速编辑模式运行期间关闭。
+// 两个子进程放在一个 Job 里：启动器无论怎样退出（包括被任务管理器结束），
+// 引擎和 API 都会随之结束，不会留下占着显存的孤儿进程。
 #include <windows.h>
+#include <shellapi.h>
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
@@ -22,14 +35,45 @@
 #include <string>
 #include <vector>
 
+#include "launch_win_icon.inc"  // kIconIco：托盘图标（tools/win_icon.py 生成）
+
 namespace {
 
 std::string g_root;
-HANDLE g_children[2] = {nullptr, nullptr};
-bool g_own_console = false;
+std::string g_stamp;                        // 本次启动的时间戳，日志文件名用
+HANDLE g_children[2] = {nullptr, nullptr};  // 0 = 引擎，1 = API
+HANDLE g_job = nullptr;
+bool g_own_console = false;  // 控制台是本进程 AllocConsole 出来的（退出前 pause）
+bool g_tray = true;          // false = --console / --check
+bool g_console_on = false;   // 子进程输出是否透传到控制台
+bool g_logs_started = false; // 已开始写子进程日志（出错时提示去看日志）
 
 void console_drain(DWORD ms);  // 定义在下方"控制台输出"一节
 void console_mode_restore();
+void tray_remove();            // 定义在下方"托盘"一节
+
+std::wstring to_w(const std::string& s) {
+    if (s.empty()) return {};
+    const int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()),
+                                      nullptr, 0);
+    std::wstring w(static_cast<size_t>(n), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), &w[0], n);
+    return w;
+}
+
+int msgbox(const std::string& text, UINT flags) {
+    return MessageBoxW(nullptr, to_w(text).c_str(), L"gfx1151-engine",
+                       flags | MB_SETFOREGROUND | MB_TOPMOST);
+}
+
+// 用系统默认程序打开：网址 → 浏览器，文件夹 → 资源管理器，.log → 记事本
+void shell_open(const std::string& target) {
+    const INT_PTR r = reinterpret_cast<INT_PTR>(
+        ShellExecuteA(nullptr, "open", target.c_str(), nullptr, g_root.c_str(), SW_SHOWNORMAL));
+    if (r <= 32 && target.size() > 4 && target.compare(target.size() - 4, 4, ".log") == 0)
+        ShellExecuteA(nullptr, "open", "notepad.exe", ("\"" + target + "\"").c_str(),
+                      g_root.c_str(), SW_SHOWNORMAL);
+}
 
 void pause_if_own_console() {
     console_mode_restore();
@@ -42,7 +86,18 @@ void pause_if_own_console() {
     fflush(stderr);
     for (HANDLE h : g_children)
         if (h) TerminateProcess(h, 1);
-    pause_if_own_console();
+    if (g_tray) {
+        tray_remove();
+        if (g_logs_started) {
+            if (msgbox("错误：" + msg + "\n\n是否打开日志文件夹？",
+                       MB_YESNO | MB_ICONERROR) == IDYES)
+                shell_open(g_root + "\\logs");
+        } else {
+            msgbox("错误：" + msg, MB_OK | MB_ICONERROR);
+        }
+    } else {
+        pause_if_own_console();
+    }
     ExitProcess(1);
 }
 
@@ -61,10 +116,9 @@ int env_int(const char* name, int fallback, int lo, int hi) {
     if (!v || !*v) return fallback;
     char* end = nullptr;
     long n = strtol(v, &end, 10);
-    if (!end || *end || n < lo || n > hi) {
-        fprintf(stderr, "错误：%s 必须是 %d-%d 的整数（当前为 \"%s\"）\n", name, lo, hi, v);
-        ExitProcess(1);
-    }
+    if (!end || *end || n < lo || n > hi)
+        fail(std::string(name) + " 必须是 " + std::to_string(lo) + "-" +
+             std::to_string(hi) + " 的整数（当前为 \"" + v + "\"）");
     return static_cast<int>(n);
 }
 
@@ -228,14 +282,14 @@ struct Child {
     std::string name;
 };
 
-// ---- 控制台输出：永不阻塞子进程 ------------------------------------------
+// ---- 控制台输出：永不阻塞子进程（仅 --console 模式） ------------------------
 // 子进程 stdout/stderr → 匿名管道 → tee_thread：先写日志文件（始终完整），
 // 再放进有界内存队列，由唯一的 console_thread 写控制台。
 // 旧实现在 tee_thread 里同步 WriteFile 控制台：控制台一暂停（快速编辑模式下
 // 鼠标点一下进入"选择"、终端忙），tee 不再读管道，管道写满后引擎/API 的每个
 // fprintf 都阻塞——decode 停在半路，kvsnap 写线程持锁打印还会连带卡住 GPU 线程，
 // 日志也同时停住。现在控制台卡住最多丢掉控制台上的文字（队列满之后），
-// 子进程照常跑，日志文件不丢。
+// 子进程照常跑，日志文件不丢。托盘模式没有控制台，tee 只写日志文件。
 struct ConsoleQueue {
     SRWLOCK lock = SRWLOCK_INIT;
     CONDITION_VARIABLE cv = CONDITION_VARIABLE_INIT;
@@ -313,7 +367,7 @@ void console_drain(DWORD ms) {
 }
 
 // 关闭控制台"快速编辑模式"：它让鼠标单击就进入选择状态并暂停所有输出。
-// 退出时恢复原模式（从 cmd 窗口启动时不改变用户的窗口设置）。
+// 退出时恢复原模式。
 HANDLE g_con_in = INVALID_HANDLE_VALUE;
 DWORD g_con_in_mode = 0;
 bool g_con_mode_saved = false;
@@ -338,7 +392,7 @@ DWORD WINAPI tee_thread(LPVOID param) {
             fwrite(buf, 1, n, c->log);
             fflush(c->log);
         }
-        console_push(buf, n);
+        if (g_console_on) console_push(buf, n);
     }
     return 0;
 }
@@ -353,6 +407,10 @@ Child spawn(const std::string& name, const std::string& exe,
     if (!CreatePipe(&pipe_read, &pipe_write, &sa, 1u << 20))
         fail("CreatePipe 失败");
     SetHandleInformation(pipe_read, HANDLE_FLAG_INHERIT, 0);
+    // 托盘模式没有控制台：子进程 stdin 接 NUL
+    HANDLE in = g_tray ? CreateFileA("NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                     &sa, OPEN_EXISTING, 0, nullptr)
+                       : GetStdHandle(STD_INPUT_HANDLE);
 
     std::string cmd = quote(exe);
     for (const std::string& a : args) cmd += " " + quote(a);
@@ -362,17 +420,22 @@ Child spawn(const std::string& name, const std::string& exe,
     si.dwFlags = STARTF_USESTDHANDLES;
     si.hStdOutput = pipe_write;
     si.hStdError = pipe_write;
-    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    si.hStdInput = in == INVALID_HANDLE_VALUE ? nullptr : in;
     PROCESS_INFORMATION pi{};
     std::vector<char> cmdline(cmd.begin(), cmd.end());
     cmdline.push_back('\0');
-    if (!CreateProcessA(nullptr, cmdline.data(), nullptr, nullptr, TRUE, 0,
-                        nullptr, g_root.c_str(), &si, &pi)) {
-        CloseHandle(pipe_read);
-        CloseHandle(pipe_write);
-        fail("启动失败（" + exe + "），错误码 " + std::to_string(GetLastError()));
-    }
+    // 托盘模式：CREATE_NO_WINDOW，否则每个控制台子进程都会弹出自己的黑窗
+    const DWORD flags = g_tray ? CREATE_NO_WINDOW : 0;
+    const BOOL ok = CreateProcessA(nullptr, cmdline.data(), nullptr, nullptr, TRUE, flags,
+                                   nullptr, g_root.c_str(), &si, &pi);
+    const DWORD err = GetLastError();
+    if (g_tray && in != INVALID_HANDLE_VALUE) CloseHandle(in);
     CloseHandle(pipe_write);
+    if (!ok) {
+        CloseHandle(pipe_read);
+        fail("启动失败（" + exe + "），错误码 " + std::to_string(err));
+    }
+    if (g_job) AssignProcessToJobObject(g_job, pi.hProcess);  // 失败也不影响运行
     CloseHandle(pi.hThread);
 
     Child c;
@@ -381,6 +444,7 @@ Child spawn(const std::string& name, const std::string& exe,
     c.name = name;
     c.log = fopen(log_path.c_str(), "wb");
     if (!c.log) fprintf(stderr, "警告：无法写日志 %s\n", log_path.c_str());
+    g_logs_started = true;
     HANDLE t = CreateThread(nullptr, 0, tee_thread, new Child(c), 0, nullptr);
     if (t) CloseHandle(t);
     return c;
@@ -394,31 +458,397 @@ void kill_child(Child& c) {
     if (c.proc && alive(c.proc)) TerminateProcess(c.proc, 1);
 }
 
+void kill_all_children() {
+    for (HANDLE h : g_children)
+        if (h) TerminateProcess(h, 1);
+}
+
 BOOL WINAPI on_ctrl(DWORD ev) {
     if (ev == CTRL_C_EVENT || ev == CTRL_BREAK_EVENT || ev == CTRL_CLOSE_EVENT) {
-        for (HANDLE h : g_children)
-            if (h) TerminateProcess(h, 1);
+        kill_all_children();
         console_mode_restore();
         ExitProcess(1);
     }
     return FALSE;
 }
 
+// 本程序是 GUI 子系统（双击不出黑窗）。--console / --check 需要控制台：
+// --check 先尝试挂到调用者（cmd）的控制台上，不行就新开一个窗口。
+void console_open(bool attach_parent) {
+    const bool attached = attach_parent && AttachConsole(ATTACH_PARENT_PROCESS);
+    if (!attached) {
+        if (!AllocConsole()) return;
+        g_own_console = true;
+    }
+    SECURITY_ATTRIBUTES sa{};
+    sa.nLength = sizeof(sa);
+    sa.bInheritHandle = TRUE;  // 子进程共用这个控制台
+    HANDLE out = CreateFileA("CONOUT$", GENERIC_READ | GENERIC_WRITE,
+                             FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, OPEN_EXISTING, 0, nullptr);
+    HANDLE in = CreateFileA("CONIN$", GENERIC_READ | GENERIC_WRITE,
+                            FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, OPEN_EXISTING, 0, nullptr);
+    if (out != INVALID_HANDLE_VALUE) {
+        SetStdHandle(STD_OUTPUT_HANDLE, out);
+        SetStdHandle(STD_ERROR_HANDLE, out);
+    }
+    if (in != INVALID_HANDLE_VALUE) SetStdHandle(STD_INPUT_HANDLE, in);
+    freopen("CONOUT$", "w", stdout);
+    freopen("CONOUT$", "w", stderr);
+    freopen("CONIN$", "r", stdin);
+    SetConsoleOutputCP(CP_UTF8);
+    SetConsoleCtrlHandler(on_ctrl, TRUE);
+    if (attached) printf("\n");  // cmd 的提示符已经先打印了，另起一行
+}
+
+// 托盘模式：启动器自己的 printf/fprintf 写到 logs\launcher-win-<时间戳>.log
+void launcher_log_open() {
+    const std::string path = "logs\\launcher-win-" + g_stamp + ".log";
+    FILE* f = fopen(path.c_str(), "wb");  // 先清空，stdout/stderr 再以追加方式共用它
+    if (!f) return;
+    fclose(f);
+    if (freopen(path.c_str(), "ab", stdout)) setvbuf(stdout, nullptr, _IONBF, 0);
+    if (freopen(path.c_str(), "ab", stderr)) setvbuf(stderr, nullptr, _IONBF, 0);
+}
+
+// ---- 服务：拉起引擎 → 等端口 → 拉起 API → 等端口 → 看守 -----------------------
+struct Plan {
+    std::vector<std::string> engine_args, api_args;
+    std::string engine_log, api_log;
+    std::string api_host;
+    int engine_port = 0, api_port = 0;
+    int start_timeout = 0;
+};
+Plan g_plan;
+
+enum SvcState : LONG { kLoading = 0, kApiStarting = 1, kReady = 2 };
+volatile LONG g_state = kLoading;
+volatile LONG g_quitting = 0;  // 用户从托盘选了"退出"
+HWND g_hwnd = nullptr;
+const UINT WM_TRAY = WM_APP + 1;       // 托盘图标鼠标事件
+const UINT WM_SVC_STATE = WM_APP + 2;  // 服务线程：状态变化
+const UINT WM_SVC_EXIT = WM_APP + 3;   // 服务线程：子进程退出（wParam 谁，lParam 退出码）
+
+void report(SvcState st) {
+    InterlockedExchange(&g_state, st);
+    if (g_hwnd) PostMessageW(g_hwnd, WM_SVC_STATE, st, 0);
+}
+
+// 本机访问地址：监听 0.0.0.0 时用 127.0.0.1
+std::string local_base() {
+    const std::string& h = g_plan.api_host;
+    const std::string host = h.empty() || h == "0.0.0.0" || h == "::" ? "127.0.0.1" : h;
+    return "http://" + host + ":" + std::to_string(g_plan.api_port);
+}
+
+// 返回先退出的子进程（0 引擎 / 1 API），*code 为其退出码；用户主动退出时返回 -1
+int run_service(DWORD* code) {
+    const Plan& p = g_plan;
+    Child engine = spawn("engine", "build\\gdec-win.exe", p.engine_args, p.engine_log);
+    g_children[0] = engine.proc;
+
+    ULONGLONG deadline = GetTickCount64() + static_cast<ULONGLONG>(p.start_timeout) * 1000;
+    while (!port_listening(p.engine_port)) {
+        if (!alive(engine.proc))
+            fail("引擎提前退出，查看 " + p.engine_log);
+        if (GetTickCount64() > deadline)
+            fail("引擎启动超过 " + std::to_string(p.start_timeout) + " 秒，查看 " + p.engine_log);
+        Sleep(1000);
+    }
+
+    report(kApiStarting);
+    Child api = spawn("api", "build\\gdec-api-win.exe", p.api_args, p.api_log);
+    g_children[1] = api.proc;
+
+    deadline = GetTickCount64() + 30000;
+    while (!port_listening(p.api_port)) {
+        if (!alive(engine.proc)) fail("引擎已退出，查看 " + p.engine_log);
+        if (!alive(api.proc)) fail("API 提前退出，查看 " + p.api_log);
+        if (GetTickCount64() > deadline) fail("API 启动超时，查看 " + p.api_log);
+        Sleep(500);
+    }
+
+    printf("服务已就绪：http://%s:%d/v1（0.0.0.0 表示监听所有网卡）\n", p.api_host.c_str(),
+           p.api_port);
+    printf("日志：%s %s%s\n", p.engine_log.c_str(), p.api_log.c_str(),
+           g_tray ? "" : "；Ctrl+C 同时停止 API 和引擎。");
+    fflush(stdout);
+    report(kReady);
+
+    HANDLE both[2] = {engine.proc, api.proc};
+    const DWORD who = WaitForMultipleObjects(2, both, FALSE, INFINITE) - WAIT_OBJECT_0;
+    if (g_quitting) return -1;
+    const char* which = who == 0 ? "引擎" : "API";
+    *code = 1;
+    GetExitCodeProcess(both[who == 1 ? 1 : 0], code);
+    console_drain(3000);  // 退出进程最后的输出（如错误原因）先上屏
+    fprintf(stderr, "%s进程退出（%lu），正在停止服务。\n", which, *code);
+    kill_child(engine);
+    kill_child(api);
+    return who == 1 ? 1 : 0;
+}
+
+// ---- 托盘 --------------------------------------------------------------------
+NOTIFYICONDATAW g_nid{};
+volatile LONG g_tray_added = 0;
+UINT g_wm_taskbar_created = 0;  // 资源管理器重启后广播，需重新加图标
+
+enum MenuId : UINT {
+    kIdDashboard = 1, kIdCopyUrl, kIdEngineLog, kIdApiLog, kIdLogDir, kIdQuit
+};
+
+std::wstring status_text() {
+    switch (g_state) {
+        case kReady: return L"已就绪：" + to_w(local_base()) + L"/v1";
+        case kApiStarting: return L"模型已加载，正在启动 API…";
+        default: return L"正在加载模型…";
+    }
+}
+
+void tray_update_tip() {
+    const std::wstring tip = L"gfx1151-engine · " + status_text();
+    g_nid.uFlags = NIF_TIP;
+    lstrcpynW(g_nid.szTip, tip.c_str(), ARRAYSIZE(g_nid.szTip));
+    if (g_tray_added) Shell_NotifyIconW(NIM_MODIFY, &g_nid);
+}
+
+// 从内嵌的 ICO（launch_win_icon.inc）里挑一个尺寸做成 HICON：
+// 取不小于 px 的最小条目，都比 px 小就取最大的；由系统缩放到 px。
+HICON app_icon(int px) {
+    const unsigned char* d = kIconIco;
+    const size_t total = sizeof(kIconIco);
+    auto u16 = [&](size_t o) { return static_cast<unsigned>(d[o] | d[o + 1] << 8); };
+    auto u32 = [&](size_t o) { return static_cast<DWORD>(u16(o) | u16(o + 2) << 16); };
+    const unsigned n = u16(4);
+    int best = -1, best_size = 0;
+    for (unsigned i = 0; i < n && 6 + 16 * (i + 1) <= total; ++i) {
+        const int s = d[6 + 16 * i] ? d[6 + 16 * i] : 256;
+        const bool better = best < 0 || (s >= px ? (best_size < px || s < best_size)
+                                                 : (best_size < px && s > best_size));
+        if (better) best = static_cast<int>(i), best_size = s;
+    }
+    if (best < 0) return nullptr;
+    const size_t e = 6 + 16 * static_cast<size_t>(best);
+    const DWORD bytes = u32(e + 8), off = u32(e + 12);
+    if (off > total || bytes > total - off) return nullptr;
+    return CreateIconFromResourceEx(const_cast<PBYTE>(d + off), bytes, TRUE, 0x00030000, px, px,
+                                    LR_DEFAULTCOLOR);
+}
+
+void tray_add() {
+    g_nid.cbSize = sizeof(g_nid);
+    g_nid.hWnd = g_hwnd;
+    g_nid.uID = 1;
+    g_nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+    g_nid.uCallbackMessage = WM_TRAY;
+    static HICON small_icon = app_icon(GetSystemMetrics(SM_CXSMICON));
+    static HICON big_icon = app_icon(GetSystemMetrics(SM_CXICON));  // 通知气泡用
+    g_nid.hIcon = small_icon ? small_icon
+                             : LoadIconA(nullptr, IDI_APPLICATION);  // 未定义 UNICODE：IDI_* 是窄串
+    g_nid.hBalloonIcon = big_icon;
+    const std::wstring tip = L"gfx1151-engine · " + status_text();
+    lstrcpynW(g_nid.szTip, tip.c_str(), ARRAYSIZE(g_nid.szTip));
+    // 开机自启时任务栏可能还没起来：失败就等 TaskbarCreated 再加
+    if (Shell_NotifyIconW(NIM_ADD, &g_nid)) InterlockedExchange(&g_tray_added, 1);
+}
+
+void tray_remove() {
+    if (InterlockedExchange(&g_tray_added, 0)) Shell_NotifyIconW(NIM_DELETE, &g_nid);
+}
+
+void tray_balloon(const std::wstring& title, const std::wstring& text) {
+    if (!g_tray_added) return;
+    g_nid.uFlags = NIF_INFO;
+    lstrcpynW(g_nid.szInfoTitle, title.c_str(), ARRAYSIZE(g_nid.szInfoTitle));
+    lstrcpynW(g_nid.szInfo, text.c_str(), ARRAYSIZE(g_nid.szInfo));
+    g_nid.dwInfoFlags = g_nid.hBalloonIcon ? (NIIF_USER | NIIF_LARGE_ICON) : NIIF_INFO;
+    Shell_NotifyIconW(NIM_MODIFY, &g_nid);
+}
+
+void copy_text(const std::wstring& s) {
+    if (!OpenClipboard(g_hwnd)) return;
+    EmptyClipboard();
+    const size_t bytes = (s.size() + 1) * sizeof(wchar_t);
+    HGLOBAL g = GlobalAlloc(GMEM_MOVEABLE, bytes);
+    if (g) {
+        void* dst = GlobalLock(g);
+        if (dst) {
+            memcpy(dst, s.c_str(), bytes);
+            GlobalUnlock(g);
+            if (!SetClipboardData(CF_UNICODETEXT, g)) GlobalFree(g);
+        } else {
+            GlobalFree(g);
+        }
+    }
+    CloseClipboard();
+}
+
+[[noreturn]] void quit_all(UINT code) {
+    InterlockedExchange(&g_quitting, 1);
+    kill_all_children();
+    tray_remove();
+    ExitProcess(code);
+}
+
+void on_menu(UINT id) {
+    switch (id) {
+        case kIdDashboard: shell_open(local_base() + "/"); break;
+        case kIdCopyUrl:
+            copy_text(to_w(local_base() + "/v1"));
+            tray_balloon(L"已复制", to_w(local_base() + "/v1"));
+            break;
+        case kIdEngineLog: shell_open(g_root + "\\" + g_plan.engine_log); break;
+        case kIdApiLog: shell_open(g_root + "\\" + g_plan.api_log); break;
+        case kIdLogDir: shell_open(g_root + "\\logs"); break;
+        case kIdQuit:
+            if (msgbox("退出会同时停止引擎和 API，正在进行的生成会中断。\n确定退出？",
+                       MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == IDYES)
+                quit_all(0);
+            break;
+        default: break;
+    }
+}
+
+void show_menu() {
+    const LONG st = g_state;
+    HMENU m = CreatePopupMenu();
+    if (!m) return;
+    AppendMenuW(m, MF_STRING | MF_GRAYED, 0, status_text().c_str());
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(m, MF_STRING | (st == kReady ? 0 : MF_GRAYED), kIdDashboard,
+                L"打开面板（浏览器）");
+    AppendMenuW(m, MF_STRING, kIdCopyUrl, L"复制 API 地址");
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(m, MF_STRING, kIdEngineLog, L"查看引擎日志");
+    AppendMenuW(m, MF_STRING | (st >= kApiStarting ? 0 : MF_GRAYED), kIdApiLog,
+                L"查看 API 日志");
+    AppendMenuW(m, MF_STRING, kIdLogDir, L"打开日志文件夹");
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(m, MF_STRING, kIdQuit, L"退出（停止引擎和 API）");
+    POINT pt;
+    GetCursorPos(&pt);
+    SetForegroundWindow(g_hwnd);  // 否则点菜单外面菜单不消失
+    const UINT id = static_cast<UINT>(TrackPopupMenu(
+        m, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON, pt.x, pt.y, 0, g_hwnd, nullptr));
+    PostMessageW(g_hwnd, WM_NULL, 0, 0);
+    DestroyMenu(m);
+    on_menu(id);
+}
+
+LRESULT CALLBACK wnd_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_TRAY) {
+        switch (LOWORD(lp)) {
+            case WM_RBUTTONUP:
+            case WM_CONTEXTMENU: show_menu(); break;
+            case WM_LBUTTONDBLCLK:
+                on_menu(g_state == kReady ? kIdDashboard : kIdEngineLog);
+                break;
+            default: break;
+        }
+        return 0;
+    }
+    if (msg == WM_SVC_STATE) {
+        tray_update_tip();
+        if (wp == static_cast<WPARAM>(kReady))
+            tray_balloon(L"服务已就绪",
+                         to_w(local_base() + "/v1\n双击图标打开面板，右键查看更多"));
+        return 0;
+    }
+    if (msg == WM_SVC_EXIT) {
+        tray_remove();
+        const bool is_api = wp == 1;
+        const std::string text =
+            std::string(is_api ? "API" : "引擎") + "进程已退出（退出码 " +
+            std::to_string(static_cast<DWORD>(lp)) + "），服务已停止。\n\n日志：" +
+            (is_api ? g_plan.api_log : g_plan.engine_log) + "\n是否打开日志文件夹？";
+        if (msgbox(text, MB_YESNO | MB_ICONWARNING) == IDYES) shell_open(g_root + "\\logs");
+        ExitProcess(static_cast<UINT>(lp));
+    }
+    if (g_wm_taskbar_created && msg == g_wm_taskbar_created) {
+        InterlockedExchange(&g_tray_added, 0);
+        tray_add();
+        return 0;
+    }
+    if (msg == WM_ENDSESSION && wp) quit_all(0);  // 注销 / 关机
+    return DefWindowProcW(h, msg, wp, lp);
+}
+
+DWORD WINAPI service_thread(LPVOID) {
+    DWORD code = 1;
+    const int who = run_service(&code);
+    if (who >= 0) PostMessageW(g_hwnd, WM_SVC_EXIT, static_cast<WPARAM>(who),
+                               static_cast<LPARAM>(code));
+    return 0;
+}
+
+int tray_main() {
+    HINSTANCE hi = GetModuleHandleW(nullptr);
+    WNDCLASSW wc{};
+    wc.lpfnWndProc = wnd_proc;
+    wc.hInstance = hi;
+    wc.lpszClassName = L"gfx1151_start_win";
+    RegisterClassW(&wc);
+    // 普通的隐藏顶层窗口（不 ShowWindow）：消息窗口收不到 TaskbarCreated 广播
+    g_hwnd = CreateWindowExW(0, wc.lpszClassName, L"gfx1151-engine", WS_OVERLAPPED, 0, 0, 0, 0,
+                             nullptr, nullptr, hi, nullptr);
+    if (!g_hwnd) fail("无法创建托盘窗口，错误码 " + std::to_string(GetLastError()));
+    g_wm_taskbar_created = RegisterWindowMessageW(L"TaskbarCreated");
+    tray_add();
+    tray_balloon(L"正在加载模型",
+                 L"冷启动可能要几分钟。就绪后会再提示；右键托盘图标可查看日志或退出。");
+
+    HANDLE t = CreateThread(nullptr, 0, service_thread, nullptr, 0, nullptr);
+    if (!t) fail("无法创建服务线程");
+    CloseHandle(t);
+
+    MSG m;
+    while (GetMessageW(&m, nullptr, 0, 0) > 0) {
+        TranslateMessage(&m);
+        DispatchMessageW(&m);
+    }
+    quit_all(0);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
-    SetConsoleOutputCP(CP_UTF8);
-    SetConsoleCtrlHandler(on_ctrl, TRUE);
-    {
-        DWORD procs[4];
-        g_own_console = GetConsoleProcessList(procs, 4) == 1;
+    bool check_only = false, want_console = false;
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "--check") == 0) check_only = true;
+        else if (strcmp(argv[i], "--console") == 0) want_console = true;
     }
+    g_tray = !check_only && !want_console;
+    // 高 DPI 屏上托盘图标取对应尺寸、弹框/菜单文字不发糊
+    if (g_tray) SetProcessDPIAware();
+
     char exe_path[MAX_PATH];
     GetModuleFileNameA(nullptr, exe_path, MAX_PATH);
     g_root = exe_path;
     size_t slash = g_root.find_last_of("\\/");
     g_root = slash == std::string::npos ? "." : g_root.substr(0, slash);
     SetCurrentDirectoryA(g_root.c_str());
+
+    {
+        SYSTEMTIME st;
+        GetLocalTime(&st);
+        char stamp[32];
+        snprintf(stamp, sizeof(stamp), "%04d%02d%02d-%02d%02d%02d", st.wYear, st.wMonth,
+                 st.wDay, st.wHour, st.wMinute, st.wSecond);
+        g_stamp = stamp;
+    }
+    if (g_tray) {
+        CreateDirectoryA("logs", nullptr);
+        launcher_log_open();
+    } else {
+        console_open(check_only);
+    }
+
+    // 防多开（--check 不受限）。句柄不关，进程退出时系统回收。
+    if (!check_only) {
+        CreateMutexW(nullptr, FALSE, L"Local\\gfx1151-engine-start_win");
+        if (GetLastError() == ERROR_ALREADY_EXISTS)
+            fail("start_win.exe 已经在运行了（看任务栏右下角的托盘图标，"
+                 "可能藏在 ^ 展开区里）。");
+    }
 
     WSADATA wsa;
     WSAStartup(MAKEWORD(2, 2), &wsa);
@@ -486,8 +916,10 @@ int main(int argc, char** argv) {
     } else {
         printf("KV：不分页（KV_PAGED=0）\n");
     }
-    if (argc > 1 && strcmp(argv[1], "--check") == 0) {
+    if (check_only) {
         printf("检查通过；没有启动引擎或 API。\n");
+        fflush(stdout);
+        pause_if_own_console();
         return 0;
     }
 
@@ -517,16 +949,15 @@ int main(int argc, char** argv) {
     SetEnvironmentVariableA("GDEC_PARALLEL", std::to_string(parallel).c_str());
 
     CreateDirectoryA("logs", nullptr);
-    SYSTEMTIME st;
-    GetLocalTime(&st);
-    char stamp[32];
-    snprintf(stamp, sizeof(stamp), "%04d%02d%02d-%02d%02d%02d", st.wYear, st.wMonth,
-             st.wDay, st.wHour, st.wMinute, st.wSecond);
-    const std::string engine_log =
-        "logs\\engine-win-" + std::string(stamp) + ".log";
-    const std::string api_log = "logs\\api-win-" + std::string(stamp) + ".log";
+    g_plan.engine_log = "logs\\engine-win-" + g_stamp + ".log";
+    g_plan.api_log = "logs\\api-win-" + g_stamp + ".log";
+    g_plan.engine_port = engine_port;
+    g_plan.api_port = api_port;
+    g_plan.api_host = api_host;
+    g_plan.start_timeout = start_timeout;
 
-    std::vector<std::string> engine_args = {model_file};
+    std::vector<std::string>& engine_args = g_plan.engine_args;
+    engine_args = {model_file};
     if (!overlay_file.empty()) engine_args.push_back(overlay_file);
     if (!mtp_file.empty()) engine_args.push_back(mtp_file);
     engine_args.insert(engine_args.end(),
@@ -534,58 +965,38 @@ int main(int argc, char** argv) {
                         "--maxctx", std::to_string(max_context)});
     if (!vision_file.empty()) engine_args.insert(engine_args.end(),
                                                  {"--vision-tower", vision_file});
+    g_plan.api_args = {"--tokenizer", tokenizer_dir, "--engine",
+                       "127.0.0.1:" + std::to_string(engine_port), "--host", api_host,
+                       "--port", std::to_string(api_port), "--context",
+                       std::to_string(max_context)};
 
-    printf("加载模型中，日志：%s；Ctrl+C 停止。\n", engine_log.c_str());
+    // 子进程进 Job：本进程一退出（含崩溃、被任务管理器结束），Job 句柄关闭，
+    // 引擎和 API 随之结束。
+    g_job = CreateJobObjectA(nullptr, nullptr);
+    if (g_job) {
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION li{};
+        li.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if (!SetInformationJobObject(g_job, JobObjectExtendedLimitInformation, &li,
+                                     sizeof(li))) {
+            CloseHandle(g_job);
+            g_job = nullptr;
+        }
+    }
+
+    printf("加载模型中，日志：%s%s\n", g_plan.engine_log.c_str(),
+           g_tray ? "" : "；Ctrl+C 停止。");
     fflush(stdout);
+    if (g_tray) return tray_main();
+
     console_quickedit_off();
     {
         HANDLE t = CreateThread(nullptr, 0, console_thread, nullptr, 0, nullptr);
         if (!t) fail("无法创建控制台输出线程");
         CloseHandle(t);
+        g_console_on = true;
     }
-    Child engine = spawn("engine", "build\\gdec-win.exe", engine_args, engine_log);
-    g_children[0] = engine.proc;
-
-    ULONGLONG deadline = GetTickCount64() + static_cast<ULONGLONG>(start_timeout) * 1000;
-    while (!port_listening(engine_port)) {
-        if (!alive(engine.proc))
-            fail("引擎提前退出，查看 " + engine_log);
-        if (GetTickCount64() > deadline)
-            fail("引擎启动超过 " + std::to_string(start_timeout) + " 秒，查看 " + engine_log);
-        Sleep(1000);
-    }
-
-    Child api = spawn("api", "build\\gdec-api-win.exe",
-                      {"--tokenizer", tokenizer_dir, "--engine",
-                       "127.0.0.1:" + std::to_string(engine_port), "--host", api_host,
-                       "--port", std::to_string(api_port), "--context",
-                       std::to_string(max_context)},
-                      api_log);
-    g_children[1] = api.proc;
-
-    deadline = GetTickCount64() + 30000;
-    while (!port_listening(api_port)) {
-        if (!alive(engine.proc)) fail("引擎已退出");
-        if (!alive(api.proc)) fail("API 提前退出，查看 " + api_log);
-        if (GetTickCount64() > deadline) fail("API 启动超时，查看 " + api_log);
-        Sleep(500);
-    }
-
-    printf("服务已就绪：http://%s:%d/v1（0.0.0.0 表示监听所有网卡）\n", api_host.c_str(),
-           api_port);
-    printf("日志：%s %s；Ctrl+C 同时停止 API 和引擎。\n", engine_log.c_str(),
-           api_log.c_str());
-    fflush(stdout);
-
-    HANDLE both[2] = {engine.proc, api.proc};
-    DWORD who = WaitForMultipleObjects(2, both, FALSE, INFINITE);
-    const char* which = who == WAIT_OBJECT_0 ? "引擎" : "API";
     DWORD code = 1;
-    GetExitCodeProcess(both[who - WAIT_OBJECT_0], &code);
-    console_drain(3000);  // 退出进程最后的输出（如错误原因）先上屏
-    fprintf(stderr, "%s进程退出（%lu），正在停止服务。\n", which, code);
-    kill_child(engine);
-    kill_child(api);
+    run_service(&code);
     pause_if_own_console();
     return static_cast<int>(code);
 }

@@ -148,8 +148,13 @@ bash start_win.sh           # Git Bash 下起引擎(行协议 8730) + API(8731) 
 ```
 
 **日常启动用 `start_win.exe`**：原生 Win32 启动器，双击即用，不需要
-Git Bash / PowerShell / 任何脚本宿主。拉起引擎 + API 双进程，子进程输出
-实时显示在控制台并写入 `logs\`；Ctrl+C 或关窗同时收掉两者。
+Git Bash / PowerShell / 任何脚本宿主。拉起引擎 + API 双进程；默认是托盘程序，
+不开控制台，子进程输出写入 `logs\`（启动器自己的输出在 `logs\launcher-win-*.log`）。
+右键托盘图标：打开面板 / 复制 API 地址 / 查看引擎或 API 日志 / 打开日志文件夹 /
+退出（同时收掉两者）；双击图标：已就绪时打开面板。出错或子进程退出会弹框。
+两个子进程在一个 Job 里，启动器被任务管理器结束时它们也随之结束。
+`start_win.exe --console` 是旧的控制台模式（输出实时显示，Ctrl+C 或关窗停止），
+排查问题用。
 **配置改根目录 `service.conf`**（与 Linux 启动器同一个文件；Windows 目前只支持 hgn，
 读其中"hgn 权重"一段，GGUF 一段不生效）：换模型
 文件名、调上下文窗口、改端口都编辑它；优先级为 环境变量 > service.conf

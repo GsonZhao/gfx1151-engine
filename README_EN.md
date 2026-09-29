@@ -103,8 +103,11 @@ bash build_win.sh launcher  # Script-free launcher start_win.exe
 
 For daily use, double-click `start_win.exe` (native Win32, no
 Git/PowerShell needed): it brings up the engine + API dual processes,
-shows output in real time and writes it to `logs\`; Ctrl+C or closing the
-window stops it. Configuration is **shared with Linux via
+without a console window: it only puts a tray icon in the notification area
+(right-click: open dashboard / copy API URL / view logs / quit; double-click:
+open dashboard), and output goes to `logs\`. For troubleshooting,
+`start_win.exe --console` restores the console mode (Ctrl+C or closing the
+window stops it). Configuration is **shared with Linux via
 `service.conf`** (edit it to change the model file name or context
 window); environment variables can temporarily override it. Clients
 connect to `http://<host>:8731/v1`.
@@ -133,7 +136,10 @@ Known issues (root causes unknown; there are quite a few quirks, fixes
 pending, priority very low):
 
 - VRAM allocations above 41 GiB or 63 GiB fail
-- The model hangs during decode
+- The model hangs during decode (suspected console output backpressure: once
+  the console is paused by a click/selection, child processes block on logging.
+  Fixed: the launcher is now a tray app whose logs bypass the console, and
+  kvsnap no longer prints while holding its lock; pending verification)
 
 Build details are in [BUILD_EN.md](BUILD_EN.md).
 

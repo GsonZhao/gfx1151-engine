@@ -165,9 +165,15 @@ bash start_win.sh           # under Git Bash: start engine (line protocol 8730) 
 
 **Use `start_win.exe` for daily launches**: a native Win32 launcher,
 double-click and go, no Git Bash / PowerShell / any script host needed. It
-brings up the engine + API as two processes; child process output is shown
-live on the console and written to `logs\`; Ctrl+C or closing the window
-takes both down together.
+brings up the engine + API as two processes. By default it is a tray app with
+no console window; child process output is written to `logs\` (the launcher's
+own output goes to `logs\launcher-win-*.log`). Right-click the tray icon to
+open the dashboard / copy the API URL / view the engine or API log / open the
+log folder / quit (stops both); double-click opens the dashboard once ready.
+Errors and child exits pop up a message box. Both children live in a Job, so
+they also end if the launcher is killed from Task Manager.
+`start_win.exe --console` is the old console mode (live output, Ctrl+C or
+closing the window stops it), for troubleshooting.
 **Configuration lives in the root `service.conf`** (the same file as the Linux
 launchers; Windows currently supports hgn only and reads the "hgn" section, the
 GGUF section has no effect): edit it to change the model filename, adjust the context window,

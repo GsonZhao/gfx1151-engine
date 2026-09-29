@@ -4,7 +4,7 @@
 # 用法:
 #   bash build_win.sh            # 引擎 → build/gdec-win.exe
 #   bash build_win.sh api        # OpenAI HTTP 前端 → build/gdec-api-win.exe
-#   bash build_win.sh launcher   # 免脚本启动器 → ./start_win.exe（双击即用）
+#   bash build_win.sh launcher   # 免脚本启动器 → ./start_win.exe（双击即用，托盘程序）
 #   bash build_win.sh test       # 编 build/ktest-win.exe 并运行 kernel 单测
 #
 # 前置：TheRock 多架构包（默认 C:\therock-dist-windows-multiarch-10.0.0\...，
@@ -96,9 +96,29 @@ case "$TARGET" in
     # 免脚本启动器：原生 Win32，双击即用（不需要 Git Bash / PowerShell）。
     CXX="$TR/lib/llvm/bin/clang++.exe"
     [[ -x "$CXX" ]] || { echo "找不到 TheRock clang++: $CXX" >&2; exit 1; }
+    # GUI 子系统（托盘程序，双击不出控制台）；入口仍是 main()。
+    # 链接器/llvm-rc 选项用 - 前缀：Git Bash 会把 / 开头的参数当路径改写。
+    RES=()
+    if "$CXX" -dumpmachine | grep -q msvc; then
+      GUI_LDFLAGS=(-Xlinker -subsystem:windows -Xlinker -entry:mainCRTStartup)
+      # exe 文件图标（可选）：TheRock 带 llvm-rc 就编进去；没有也不影响托盘图标。
+      RC="$TR/lib/llvm/bin/llvm-rc.exe"
+      if [[ -x "$RC" ]] && "$RC" -no-preprocess -fo build/launch_win.res src/launch_win.rc; then
+        RES=(build/launch_win.res)
+      else
+        echo "提示：llvm-rc 不可用，start_win.exe 文件不带图标（托盘图标不受影响）" >&2
+      fi
+    else
+      GUI_LDFLAGS=(-mwindows)
+    fi
     echo "[编译] start_win.exe"
-    "$CXX" -O2 -std=c++17 -D_CRT_SECURE_NO_WARNINGS \
-      src/launch_win.cpp -lws2_32 -o start_win.exe
+    LAUNCH_SRC=(-O2 -std=c++17 -D_CRT_SECURE_NO_WARNINGS src/launch_win.cpp
+                -lws2_32 -lshell32 -luser32 "${GUI_LDFLAGS[@]}" -o start_win.exe)
+    if ! "$CXX" "${LAUNCH_SRC[@]}" ${RES[@]+"${RES[@]}"}; then
+      [[ ${#RES[@]} -gt 0 ]] || exit 1
+      echo "提示：带图标资源链接失败，改为不带文件图标重试" >&2
+      "$CXX" "${LAUNCH_SRC[@]}"
+    fi
     ;;
   test)
     echo "[编译] build/ktest-win.exe"
