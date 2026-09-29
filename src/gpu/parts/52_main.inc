@@ -355,9 +355,10 @@ int main(int argc, char** argv) {
     fprintf(stderr, ppl ? "--ppl needs at least two tokens\n" : "need --tokens\n");
     return 2;
   }
-  int need = ppl ? 0 : mtp_test > 0 ? mtp_test : spec_gen > 0 ? spec_gen + gamma : gen;
-  if (gamma < 1) gamma = 1;
+  // --gamma 0 = adaptive (Model::GammaCtl, same as the API auto path)
+  if (gamma < 0) gamma = 0;
   if (gamma > 8) gamma = 8;  // spec workspace holds at most 8 draft rows
+  int need = ppl ? 0 : mtp_test > 0 ? mtp_test : spec_gen > 0 ? spec_gen + (gamma ? gamma : 8) : gen;
   if (!kld_mode && ppl_window == 0 && tokens.size() + (size_t)need > (size_t)maxctx) {
     fprintf(stderr, "tokens+gen exceed maxctx\n");
     return 2;

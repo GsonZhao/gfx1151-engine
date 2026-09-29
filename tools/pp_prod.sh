@@ -7,7 +7,7 @@
 #     MAXCTX=N                默认 token 数 + 8192
 #     UNSET="GDEC_A GDEC_B"   从生产 env 中去掉这些变量（开关类变量只看存在性）
 #     GEN=N                   生成 token 数（默认 1；日志末尾 ids: 行可做 A/B 比对）
-#     SPEC=N [GAMMA=3]        改用 MTP 投机生成 --spec-gen N（看 MTP 接受率）
+#     SPEC=N [GAMMA=3]        改用 MTP 投机生成 --spec-gen N（看 MTP 接受率；GAMMA=0 自适应 γ）
 #     OVERLAY=<file>|none     替换/去掉生产 overlay（第 2 个权重参数）
 #     MODEL=<file>            替换主模型（第 1 个权重参数）
 #     MTP=<file>              替换 MTP 草稿 overlay（最后一个权重参数，需 ≥3 个）

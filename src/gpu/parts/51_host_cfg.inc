@@ -2199,15 +2199,27 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
     // GDEC_SPEC_GAMMA 覆盖；未设时按模式自选：greedy 4（09-28 重扫 γ=4：MTP 8K
     // +6%/32K +9%，chain-greedy +5.6%/+11.5%），采样 3（拒绝采样验收率低，
     // 深链不划算：8K 三种子 γ=3 46.7 vs γ=4 44.8 tok/s，32K 持平）。
+    // 09-29 起 auto = 自适应 γ（spec_gamma 传 0，见 Model::GammaCtl：按每深度
+    // 接受率 EMA 在 2..7 里挑 E[commit]/(1+0.2γ) 最大者，起点仍是 4/3）；
+    // GDEC_SPEC_ADAPT=0 退回旧的固定 auto（greedy 4 / 采样 3）。
     static const char* sg_env = getenv("GDEC_SPEC_GAMMA");
+    static const bool sg_adapt = [] {
+      const char* e = getenv("GDEC_SPEC_ADAPT");
+      return !e || e[0] != '0';
+    }();
     const int spec_gamma =
-        std::max(1, std::min(8, sg_env ? atoi(sg_env) : (g.sample ? 3 : 4)));
+        sg_env ? std::max(1, std::min(8, atoi(sg_env)))
+               : sg_adapt ? 0 : (g.sample ? 3 : 4);
     if (!sg_env) {  // 让 auto 默认在 serve 日志里可观测（每模式只打一次）
       static bool said[2] = {false, false};
       if (!said[g.sample]) {
         said[g.sample] = true;
-        fprintf(stderr, "[gamma] GDEC_SPEC_GAMMA 未设：%s 请求默认 gamma=%d\n",
-                g.sample ? "采样" : "greedy", spec_gamma);
+        if (spec_gamma == 0)
+          fprintf(stderr, "[gamma] GDEC_SPEC_GAMMA 未设：%s 请求自适应 gamma（起点 %d）\n",
+                  g.sample ? "采样" : "greedy", g.sample ? 3 : 4);
+        else
+          fprintf(stderr, "[gamma] GDEC_SPEC_GAMMA 未设：%s 请求默认 gamma=%d\n",
+                  g.sample ? "采样" : "greedy", spec_gamma);
       }
     }
     if (g.drafter == 1 && !m.mtp_avail) {
