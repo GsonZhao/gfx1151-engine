@@ -335,6 +335,11 @@ struct GpuModel {
   float* d_mRb = nullptr;      // batch stream (maxbatch, 10240)
   float* d_mRhatb = nullptr;   // batch normed stream
   float* d_mtap = nullptr;     // captured trunk taps (maxbatch, 10240)
+  // Offline test hook (--spec-gen + GDEC_SPEC_FORCE=<ids file>): greedy
+  // spec_loop verifies drafts against these ids instead of the trunk argmax,
+  // so every γ policy commits the same trajectory (paired γ A/B without greedy
+  // near-tie divergence; verify cost unchanged). Empty = off.
+  std::vector<int> spec_force;
   // Stats for the most recent speculative request, emitted on the terminal
   // serve D line so clients can distinguish MTP from serial decode.
   int last_spec_rounds = 0;
@@ -5186,76 +5191,126 @@ struct GpuModel {
   }
 
   // Adaptive MTP draft length, active when a spec_loop* is entered with
-  // gamma == 0 (API: GDEC_SPEC_GAMMA unset; offline: --gamma 0). Tracks an
-  // EMA of the per-depth conditional acceptance p_j = P(draft j accepted |
-  // drafts 0..j-1 accepted) and after each round picks γ in [2, gmax]
-  // maximizing E[commit]/cost with E(γ) = 1 + Σ_{k<γ} Π_{j<=k} p_j and
-  // cost(γ) = 1 + r·γ. 09-29 HQ sweep: round wall ms ≈ 46 + 9.3·γ at
-  // 8K/32K/64K (γ=3..7) → r ≈ 0.2 (GDEC_SPEC_ADAPT_R). Depths >= the current γ
+  // gamma == 0 (API: sampling with GDEC_SPEC_GAMMA unset; offline: --gamma 0).
+  // Tracks an EMA of the per-depth conditional acceptance p_j = P(draft j
+  // accepted | drafts 0..j-1 accepted) and after each round picks γ in
+  // [kmin, gmax] maximizing E[commit]/cost, cost(γ) = 1 + r·γ.
+  // Two states: p is kept separately for rounds that follow a full accept (F)
+  // and rounds that follow a reject (R) — 09-29 γ7 traces, sampling real
+  // text: F .93/.86/.83 vs R .77/.71/.73. A deep γ makes full accepts rare,
+  // so the effective acceptance falls with γ; a single-state estimate misses
+  // that and drifts deep. With A_s = Π_{j<γ} p_s,j and E_s the per-state
+  // expected commit, the stationary P(F) = A_R / (1 − A_F + A_R) and
+  // E(γ) = π_F·E_F + (1 − π_F)·E_R (predicts fixed γ3 commit/round 3.03 vs
+  // measured 2.98; single-state 2.82). Round wall ms ≈ 42 + 10.7·γ → r ≈ 0.25;
+  // default 0.3 absorbs the model's remaining optimism for deep γ. kmin = 3:
+  // on-GPU sampling runs stuck at γ2 were ~20% slower than γ3 (the replay
+  // can't see that). tools/gamma_sim.py MODEL=markov: real text = fixed γ3,
+  // code/repetitive text ≈ best fixed. On GPU (tools/gamma_sample_check.sh,
+  // 18 samples): real text 1.004× γ3 (single-state 0.940×, fixed γ4 0.953×),
+  // code/repetitive 1.040× γ3 (fixed γ4 1.032×). Depths >= the current γ
   // are unobserved and extrapolated from the deepest probed one. gmax = 7:
   // γ=8 means P=9 verify rows, past the P<=8 fast paths (cliff). Sampling
   // stays exact: γ is fixed before the round draws anything. Greedy ids can
   // differ from a fixed γ only through fp near-tie flips (as any γ change).
   // A gamma > 0 is used as-is (clamped to 8); adapt stays off.
   struct GammaCtl {
-    static constexpr int kMin = 2;
-    static constexpr float kAlpha = 0.1f, kPrior = 0.8f, kPriorN = 4.f;
+    static constexpr float kPrior = 0.8f, kPriorN = 4.f;
     bool adapt = false;
-    int cur = 4, gmax = 7, switches = 0;
-    float r = 0.2f, hyst = 0.02f;
-    float p[8], n[8];
+    int cur = 4, kmin = 3, gmax = 7, switches = 0, full = 0;
+    float r = 0.3f, hyst = 0.02f, alpha = 0.05f;
+    float p[2][8], n[2][8];  // [0] after a reject, [1] after a full accept
     int hist[9] = {0};
+    static float env_f(const char* k, float def) {
+      const char* e = getenv(k);
+      return e ? (float)atof(e) : def;
+    }
     GammaCtl(int gamma, bool sample) {
-      for (int j = 0; j < 8; j++) p[j] = kPrior, n[j] = kPriorN;
+      for (int s = 0; s < 2; s++)
+        for (int j = 0; j < 8; j++) p[s][j] = kPrior, n[s][j] = kPriorN;
       if (gamma > 0) { cur = std::min(8, gamma); return; }
       adapt = true;
       cur = sample ? 3 : 4;  // previous fixed auto defaults
-      static const float env_r = [] {
-        const char* e = getenv("GDEC_SPEC_ADAPT_R");
-        return e ? (float)atof(e) : 0.2f;
-      }();
-      static const int env_max = [] {
-        const char* e = getenv("GDEC_SPEC_ADAPT_MAX");
-        return e ? std::max(kMin, std::min(8, atoi(e))) : 7;
-      }();
+      static const float env_r = env_f("GDEC_SPEC_ADAPT_R", 0.3f);
+      static const float env_alpha = env_f("GDEC_SPEC_ADAPT_ALPHA", 0.05f);
+      static const float env_hyst = env_f("GDEC_SPEC_ADAPT_HYST", 0.02f);
+      static const int env_min = (int)env_f("GDEC_SPEC_ADAPT_MIN", 3.f);
+      static const int env_max = (int)env_f("GDEC_SPEC_ADAPT_MAX", 7.f);
       r = std::max(0.01f, env_r);
-      gmax = env_max;
-      cur = std::min(cur, gmax);
+      alpha = std::max(0.005f, std::min(1.f, env_alpha));
+      hyst = std::max(0.f, env_hyst);
+      kmin = std::max(1, std::min(8, env_min));
+      gmax = std::max(kmin, std::min(8, env_max));
+      cur = std::max(kmin, std::min(cur, gmax));
     }
     double score(int G) const {
-      double e = 1.0, pr = 1.0;
-      for (int k = 0; k < G; k++) {
-        pr *= p[std::min(k, cur - 1)];
-        e += pr;
+      double e[2], a[2];
+      for (int s = 0; s < 2; s++) {
+        double pr = 1.0;
+        e[s] = 1.0;
+        for (int k = 0; k < G; k++) {
+          pr *= p[s][std::min(k, cur - 1)];
+          e[s] += pr;
+        }
+        a[s] = pr;
       }
-      return e / (1.0 + r * G);
+      double pf = a[0] / std::max(1e-9, 1.0 - a[1] + a[0]);
+      return (pf * e[1] + (1.0 - pf) * e[0]) / (1.0 + r * G);
     }
+    // GDEC_SPEC_TRACE=1: record every round (γ, accepted, wall ms since the
+    // previous update) and print it in report() — offline controller replay
+    // (tools/gamma_sim.py). Observation only; fixed and adaptive γ alike.
+    static bool trace_on() {
+      static const bool on = [] {
+        const char* e = getenv("GDEC_SPEC_TRACE");
+        return e && e[0] == '1';
+      }();
+      return on;
+    }
+    std::vector<std::array<float, 3>> trace;
+    std::chrono::steady_clock::time_point t_last = std::chrono::steady_clock::now();
     // g = drafts proposed this round, a = accepted prefix length.
     void update(int g, int a) {
+      if (trace_on()) {
+        auto now = std::chrono::steady_clock::now();
+        trace.push_back({(float)g, (float)a,
+                         (float)std::chrono::duration<double, std::milli>(now - t_last).count()});
+        t_last = now;
+      }
       hist[std::min(8, g)]++;
+      const int s = full;
+      full = a >= g;
       if (!adapt || g < cur) return;  // tail round cut short by gen/ctx
       for (int j = 0; j <= a && j < g; j++) {
-        n[j] += 1.f;
-        p[j] += std::max(kAlpha, 1.f / n[j]) * ((j < a ? 1.f : 0.f) - p[j]);
+        n[s][j] += 1.f;
+        p[s][j] += std::max(alpha, 1.f / n[s][j]) * ((j < a ? 1.f : 0.f) - p[s][j]);
       }
       int best = cur;
       double sb = score(cur);
-      for (int G = kMin; G <= gmax; G++) {
+      for (int G = kmin; G <= gmax; G++) {
         double s = score(G);
         if (s > sb * (1.0 + hyst) || (best != cur && s > sb)) best = G, sb = s;
       }
       if (best == cur) return;
-      for (int j = cur; j < best; j++) p[j] = p[cur - 1], n[j] = kPriorN;
+      for (int t = 0; t < 2; t++)
+        for (int j = cur; j < best; j++) p[t][j] = p[t][cur - 1], n[t][j] = kPriorN;
       cur = best;
       switches++;
     }
     void report(const char* tag) const {
+      if (trace_on()) {
+        fprintf(stderr, "%s gamma-trace:", tag);
+        for (auto& t : trace) fprintf(stderr, " %d,%d,%.1f", (int)t[0], (int)t[1], t[2]);
+        fprintf(stderr, "\n");
+      }
       if (!adapt) return;
       fprintf(stderr, "%s gamma-adapt: rounds per γ", tag);
       for (int G = 1; G <= 8; G++)
         if (hist[G]) fprintf(stderr, " %d:%d", G, hist[G]);
-      fprintf(stderr, " | switches=%d final γ=%d r=%.2f p:", switches, cur, r);
-      for (int j = 0; j < cur; j++) fprintf(stderr, " %.2f", p[j]);
+      fprintf(stderr, " | switches=%d final γ=%d r=%.2f p(after full):", switches, cur, r);
+      for (int j = 0; j < cur; j++) fprintf(stderr, " %.2f", p[1][j]);
+      fprintf(stderr, " p(after reject):");
+      for (int j = 0; j < cur; j++) fprintf(stderr, " %.2f", p[0][j]);
       fprintf(stderr, "\n");
     }
   };
@@ -5314,6 +5369,9 @@ struct GpuModel {
       prefill_batch(vt, q + 1, true, true);
       spec_snap = false;
       batch_argmax(g + 1, v.data());
+      if (!spec_force.empty())  // v[j] predicts out[out.size() + j]
+        for (int j = 0; j <= g; j++)
+          if (out.size() + j < spec_force.size()) v[j] = spec_force[out.size() + j];
       if (fork_dump) {
         for (int j = 0; j <= g; j++) {
           int apos = q + 1 + j;

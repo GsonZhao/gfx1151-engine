@@ -2199,17 +2199,25 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
     // GDEC_SPEC_GAMMA 覆盖；未设时按模式自选：greedy 4（09-28 重扫 γ=4：MTP 8K
     // +6%/32K +9%，chain-greedy +5.6%/+11.5%），采样 3（拒绝采样验收率低，
     // 深链不划算：8K 三种子 γ=3 46.7 vs γ=4 44.8 tok/s，32K 持平）。
-    // 09-29 起 auto = 自适应 γ（spec_gamma 传 0，见 Model::GammaCtl：按每深度
-    // 接受率 EMA 在 2..7 里挑 E[commit]/(1+0.2γ) 最大者，起点仍是 4/3）；
-    // GDEC_SPEC_ADAPT=0 退回旧的固定 auto（greedy 4 / 采样 3）。
+    // 09-29 起采样 auto = 自适应 γ（spec_gamma 传 0，见 Model::GammaCtl 两状态版；
+    // tools/gamma_sample_check.sh 18 样本：真实长文 1.004× γ3，代码/重复文本 1.040×），
+    // GDEC_SPEC_ADAPT=0 退回固定 3。greedy auto 固定 4：固定轨迹成对比较
+    // （tools/gamma_force_check.sh）里自适应与 γ4 相差 ±2% 以内，没有可拿的收益，
+    // 固定 γ 还让 greedy 输出不随控制器状态变化（gamma_real_check 里的 0.92 是
+    // 换 γ 导致轨迹分叉的噪声）；GDEC_SPEC_ADAPT_GREEDY=1 让 greedy 也走自适应（试验用）。
     static const char* sg_env = getenv("GDEC_SPEC_GAMMA");
     static const bool sg_adapt = [] {
       const char* e = getenv("GDEC_SPEC_ADAPT");
       return !e || e[0] != '0';
     }();
+    static const bool sg_adapt_greedy = [] {
+      const char* e = getenv("GDEC_SPEC_ADAPT_GREEDY");
+      return e && e[0] == '1';
+    }();
     const int spec_gamma =
         sg_env ? std::max(1, std::min(8, atoi(sg_env)))
-               : sg_adapt ? 0 : (g.sample ? 3 : 4);
+        : g.sample ? (sg_adapt ? 0 : 3)
+                   : (sg_adapt_greedy ? 0 : 4);
     if (!sg_env) {  // 让 auto 默认在 serve 日志里可观测（每模式只打一次）
       static bool said[2] = {false, false};
       if (!said[g.sample]) {

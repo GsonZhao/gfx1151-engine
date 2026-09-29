@@ -611,7 +611,27 @@ int main(int argc, char** argv) {
     //   GDEC_SPEC_SAMPLE=temp,top_k,top_p,seed[,presence,frequency]
     //                       rejection-sampled spec
     // The first token (next_id) stays the prefill argmax.
+    //   GDEC_SPEC_FORCE=<file>  greedy MTP only: verify against these ids
+    //                       (whitespace-separated; the tokens AFTER the
+    //                       prefill argmax, e.g. a plain --gen run's ids
+    //                       minus prompt and first token). All γ policies
+    //                       then commit the same ids (tools/gamma_force_check.sh).
     const bool chain = getenv("GDEC_SPEC_CHAIN") && atoi(getenv("GDEC_SPEC_CHAIN"));
+    if (const char* ff = getenv("GDEC_SPEC_FORCE")) {
+      if (chain || getenv("GDEC_SPEC_SAMPLE")) {
+        fprintf(stderr, "GDEC_SPEC_FORCE: greedy MTP spec only (no CHAIN / SAMPLE)\n");
+        return 2;
+      }
+      FILE* f = fopen(ff, "r");
+      if (!f) { fprintf(stderr, "GDEC_SPEC_FORCE: cannot open %s\n", ff); return 2; }
+      for (int t; fscanf(f, "%d", &t) == 1;) m.spec_force.push_back(t);
+      fclose(f);
+      if ((int)m.spec_force.size() < spec_gen) {
+        fprintf(stderr, "GDEC_SPEC_FORCE: %zu ids < --spec-gen %d\n", m.spec_force.size(), spec_gen);
+        return 2;
+      }
+      fprintf(stderr, "spec-gen force: %zu ids from %s\n", m.spec_force.size(), ff);
+    }
     std::vector<int> spec_out;
     if (const char* ss = getenv("GDEC_SPEC_SAMPLE")) {
       serve::HostSampler smp;

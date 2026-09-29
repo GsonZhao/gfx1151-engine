@@ -2,7 +2,7 @@
 
 *English: [MTP_EN.md](MTP_EN.md)*
 
-目前服务默认草稿长度是 3，范围 1–8。最先比较 1、2、3，每次只改变长度：
+服务默认 `MTP_GAMMA=0`（auto）：greedy（temperature=0）固定 4；采样模式自适应（每轮按各深度接受率的滑动估计在 3–7 里选，见 `Model::GammaCtl`）。设 1–8 则所有请求都用这个固定长度。要手动比较时每次只改变长度：
 
 ```bash
 MTP_GAMMA=1 bash start_hgn.sh    # GGUF 权重用 start_gguf.sh
@@ -61,3 +61,21 @@ grep -E 'decode-live:|spec(-sample)?:|depth acc:|spec(-sample)? time:' logs/*/en
 - `GDEC_SMS_CHECK=1`：每行把 GPU 稀疏分布与 host 全词表 `prepare()` 比对，打印 `[sms-check] n=… bad=…`（很慢，只用于验证）。
 
 一键验证：`bash tools/tg_verify.sh`（kernel 单测 + greedy 逐 token + 采样分布自检 + 采样速度，结尾 PASS/FAIL）。
+
+## 自适应 γ（auto）
+
+控制器按“上一轮是否全部接受”分两套估计各深度接受率：全接受之后的一轮明显更容易接受（真实长文采样：.93/.86/.83 对 .77/.71/.73），γ 越深全接受越少，有效接受率随 γ 下降。单套估计看不到这一点，会往深处漂。两套估计用稳态概率合成期望提交数，再除以耗时 `1 + r·γ` 选 γ。
+
+| 开关 | 作用 |
+|---|---|
+| `GDEC_SPEC_ADAPT=0` | 采样 auto 退回固定 3 |
+| `GDEC_SPEC_ADAPT_GREEDY=1` | greedy auto 也走自适应（默认固定 4；成对测试里两者相差 ±1%，固定更可复现） |
+| `GDEC_SPEC_ADAPT_R` | 每轮耗时模型 `1 + r·γ` 的斜率/截距比（实测约 42 + 10.7·γ ms → 0.25；默认 0.3，抵消模型对深 γ 的偏乐观） |
+| `GDEC_SPEC_ADAPT_ALPHA` | 各深度接受率 EMA 的步长（默认 0.05） |
+| `GDEC_SPEC_ADAPT_HYST` / `_MIN` / `_MAX` | 切换门槛（默认 0.02）/ γ 下限 3（实测卡在 γ2 比 γ3 慢约 20%）/ 上限 7（γ=8 = 9 行 verify，越过 P≤8 快路径） |
+
+离线：`--gamma 0`（pp_prod.sh `GAMMA=0`）走自适应。调参工具：
+
+- `tools/gamma_trace.sh` + `tools/gamma_sim.py`：`GDEC_SPEC_TRACE=1` 打出逐轮 `γ,接受数,ms`，离线回放各种控制器。`MODEL=markov`（两状态生成模型，固定 γ 的每轮提交与实测差约 2%）最准；默认的 pos/round 回放对浅 γ 低估 7–9%，只能用来排序。
+- `tools/gamma_force_check.sh`：`GDEC_SPEC_FORCE=<ids 文件>` 让 greedy spec 对照参考序列验收，所有 γ 配置生成完全相同的 token，成对比较只剩计时噪声（约 ±1%）。直接比较不同 γ 时，greedy 轨迹会在近并列处分叉，单个 prompt 差 ±15–27%。
+- `tools/gamma_sample_check.sh`：采样模式多起点 × 多 seed 汇总（采样轨迹没法固定）。

@@ -2,7 +2,7 @@
 
 *中文版:[MTP.md](MTP.md)*
 
-The service currently defaults to a draft length of 3, with a range of 1–8. Start by comparing 1, 2, and 3, changing only the length each time:
+The service defaults to `MTP_GAMMA=0` (auto): greedy (temperature=0) uses a fixed 4; sampling adapts per round, picking 3–7 from running per-depth acceptance estimates (see `Model::GammaCtl`). Setting 1–8 forces that fixed length for every request. For manual comparisons, change only the length each time:
 
 ```bash
 MTP_GAMMA=1 bash start_hgn.sh    # start_gguf.sh for GGUF weights
@@ -61,3 +61,21 @@ Offline reproduction of the API decode paths (`--spec-gen N`, or `tools/pp_prod.
 - `GDEC_SMS_CHECK=1`: compare the GPU sparse distribution with the host full-vocab `prepare()` on every row, printing `[sms-check] n=… bad=…` (slow; verification only).
 
 One-shot check: `bash tools/tg_verify.sh` (kernel unit test + greedy token identity + sampling distribution self-check + sampling speed, ends in PASS/FAIL).
+
+## Adaptive γ (auto)
+
+The controller keeps two sets of per-depth acceptance estimates, split by whether the previous round was fully accepted. A round that follows a full accept is clearly more likely to be accepted (real-text sampling: .93/.86/.83 vs .77/.71/.73). A deeper γ makes full accepts rarer, so the effective acceptance falls as γ grows. A single estimate can't see this and drifts deep. The controller combines the two sets through their stationary probabilities into an expected commit, divides by the cost `1 + r·γ`, and picks γ.
+
+| Switch | Effect |
+|---|---|
+| `GDEC_SPEC_ADAPT=0` | Sampling auto falls back to fixed 3 |
+| `GDEC_SPEC_ADAPT_GREEDY=1` | Greedy auto adapts too (default fixed 4; paired tests put the two within ±1%, and fixed is reproducible) |
+| `GDEC_SPEC_ADAPT_R` | Slope/intercept ratio of the round cost model `1 + r·γ` (measured ≈ 42 + 10.7·γ ms → 0.25; default 0.3 offsets the model's optimism about deep γ) |
+| `GDEC_SPEC_ADAPT_ALPHA` | EMA step of the per-depth acceptance estimates (default 0.05) |
+| `GDEC_SPEC_ADAPT_HYST` / `_MIN` / `_MAX` | Switch margin (default 0.02) / γ floor 3 (runs stuck at γ2 measured ~20% slower than γ3) / cap 7 (γ=8 = 9 verify rows, past the P≤8 fast paths) |
+
+Offline: `--gamma 0` (pp_prod.sh `GAMMA=0`) runs adaptive. Tuning tools:
+
+- `tools/gamma_trace.sh` + `tools/gamma_sim.py`: `GDEC_SPEC_TRACE=1` prints per-round `γ,accepted,ms`; replay controllers offline. `MODEL=markov` (two-state generator; fixed-γ commit/round within ~2% of measured) is the most accurate; the default pos/round replays underpredict shallow γ by 7–9% — use them for ranking only.
+- `tools/gamma_force_check.sh`: `GDEC_SPEC_FORCE=<ids file>` makes greedy spec verify against a reference sequence, so every γ config commits identical tokens — a paired comparison with only timing noise (~±1%). Comparing γ values directly, greedy trajectories diverge at near-ties and a single prompt varies ±15–27%.
+- `tools/gamma_sample_check.sh`: sampling mode pooled over offsets × seeds (sampling trajectories can't be pinned).

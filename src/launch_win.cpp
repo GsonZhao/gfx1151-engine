@@ -362,7 +362,7 @@ int main(int argc, char** argv) {
     printf("项目：%s\n", g_root.c_str());
     printf("模型：%s\n", model_file.c_str());
     const std::string gamma_str =
-        mtp_gamma ? std::to_string(mtp_gamma) : "auto（greedy 4 / 采样 3）";
+        mtp_gamma ? std::to_string(mtp_gamma) : "auto（greedy 4 / 采样自适应）";
     printf("配置：%d 上下文，MTP gamma=%s，API %s:%d\n", max_context, gamma_str.c_str(),
            api_host.c_str(), api_port);
     if (kv_paged) {
@@ -397,7 +397,7 @@ int main(int argc, char** argv) {
     SetEnvironmentVariableA("GDEC_KVSNAP_MAX_GB",
                             std::to_string(kvsnap_max_gb).c_str());
     SetEnvironmentVariableA("GDEC_RCKPT_MAX", std::to_string(rckpt_max).c_str());
-    // MTP_GAMMA=0：不设（并删掉外部残留），引擎按请求模式自选（greedy 4 / 采样 3）。
+    // MTP_GAMMA=0：不设（并删掉外部残留），引擎按请求模式自选（greedy 4 / 采样自适应）。
     SetEnvironmentVariableA("GDEC_SPEC_GAMMA",
                             mtp_gamma ? std::to_string(mtp_gamma).c_str() : nullptr);
     // 只在开启时设置；关闭时删掉外部环境的残留值（引擎子进程继承本进程环境）。
