@@ -1730,6 +1730,8 @@ void handle_reqstat_summary(const http::Request& q, http::Response* r,
     j["output_tokens"] = tg;
     j["cache_hit_rate"] = tp ? json(tc * 1.0 / tp) : json(nullptr);
     j["prefill_seconds"] = pre_s;
+    j["prefill_tok_per_s"] =
+        tp > tc && pre_s > 0 ? json((tp - tc) / pre_s) : json(nullptr);
     j["decode_seconds"] = dec_s;
     j["decode_tok_per_s"] =
         dec_s > 0 ? json(tg / dec_s) : json(nullptr);

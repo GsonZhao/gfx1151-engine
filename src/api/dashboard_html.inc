@@ -167,7 +167,7 @@ static const char kDashboardHtml[] = R"HTMLDOC(<!DOCTYPE html>
     <div class="grid" id="reqs-grid"></div>
     <div id="reqs-acc" style="margin-top:10px"></div>
     <table class="ovr" style="margin-top:12px">
-      <thead><tr><th>时间</th><th>结束原因</th><th>起草</th><th>prompt(命中)</th><th>输出</th><th>TTFT</th><th>decode</th><th>接受率</th></tr></thead>
+      <thead><tr><th>时间</th><th>结束原因</th><th>起草</th><th>prompt(命中)</th><th>prefill</th><th>输出</th><th>TTFT</th><th>decode</th><th>接受率</th></tr></thead>
       <tbody id="reqs-body"></tbody>
     </table>
     <div class="errmsg" id="reqs-err"></div>
@@ -751,6 +751,8 @@ function renderReqSummary(j) {
     c("输入 token", fmtTok(j.input_tokens),
       "缓存命中 " + fmtTok(j.cached_tokens) + "（" + fmtPct(j.cache_hit_rate) + "）") +
     c("输出 token", fmtTok(j.output_tokens), "") +
+    c("prefill 速度", j.prefill_tok_per_s == null ? "-" : j.prefill_tok_per_s.toFixed(1) + " tok/s",
+      "prefill 共 " + (j.prefill_seconds || 0).toFixed(1) + " s（已扣缓存命中）") +
     c("decode 速度", j.decode_tok_per_s == null ? "-" : j.decode_tok_per_s.toFixed(1) + " tok/s",
       "decode 共 " + (j.decode_seconds || 0).toFixed(1) + " s") +
     c("TTFT p50 / p95", t ? fmtMs(t.p50_ms) + " / " + fmtMs(t.p95_ms) : "-",
@@ -781,17 +783,24 @@ function renderReqTable(j) {
   tb.innerHTML = "";
   const recs = (j.records || []).slice().reverse();  // 最新在上
   if (!recs.length) {
-    tb.innerHTML = '<tr><td colspan="8" class="note">还没有请求记录</td></tr>';
+    tb.innerHTML = '<tr><td colspan="9" class="note">还没有请求记录</td></tr>';
     return;
   }
   const p = v => String(v).padStart(2, "0");
   for (const r of recs) {
     const d = new Date(r.ts_ms);
+    // prefill 只算真正处理的 token（prompt − 缓存命中）；全命中时没有 prefill
+    const proc = r.prompt_tokens - r.cached_tokens;
+    const prefill = proc <= 0 ? "全命中"
+      : r.prefill_ms > 0
+        ? (proc / (r.prefill_ms / 1000)).toFixed(1) + " tok/s（" + fmtMs(r.prefill_ms) + "）"
+        : "-";
     const cells = [
       p(d.getMonth() + 1) + "-" + p(d.getDate()) + " " + p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds()),
       finZh(r.finish) + (r.vision ? "（图）" : ""),
       r.drafter,
       fmtTok(r.prompt_tokens) + (r.cached_tokens ? "（" + fmtTok(r.cached_tokens) + "）" : ""),
+      prefill,
       fmtTok(r.output_tokens),
       r.ttft_ms ? Math.round(r.ttft_ms) + " ms" : "-",
       r.decode_ms > 0 && r.output_tokens > 1

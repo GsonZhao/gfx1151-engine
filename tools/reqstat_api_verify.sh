@@ -89,6 +89,8 @@ else
     check "summary 输入 token 求和" "$S" '"input_tokens":219900'
     check "summary chain 接受率 0.375" "$S" '"acceptance":0.375'
     check "summary decode tok/s" "$S" '"decode_tok_per_s":10'
+    # prefill 速度只算真正处理的 token：219900 - Σ(i%7)=594 -> 219306 / 400s
+    check "summary prefill tok/s" "$S" '"prefill_tok_per_s":548.265'
     # 分起草器速度：chain 与 serial 桶都是 50 tok / 5 s = 10 tok/s；
     # serial 桶 proposed=0 也必须出现（它正是拖低总速度的那类）。
     check "summary serial 桶" "$S" '"serial":{"requests":40,"accepted":0,"proposed":0,"acceptance":null'
