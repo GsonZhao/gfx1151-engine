@@ -1060,11 +1060,11 @@ const json* normalize_reasoning_effort(const json* value, json* storage) {
     if (value == nullptr || value->is_null()) return nullptr;
     if (!value->is_string()) http::fail(400, "reasoning_effort must be a string");
     const std::string& effort = value->get_ref<const std::string&>();
-    if (effort == "high") {
+    if (effort == "high" || effort == "max" || effort == "ultra") {
         *storage = "xhigh";
         return storage;
     }
-    if (effort == "minimal") {
+    if (effort == "none" || effort == "minimal") {
         *storage = "low";
         return storage;
     }
