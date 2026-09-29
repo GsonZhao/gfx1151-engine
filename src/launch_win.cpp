@@ -165,8 +165,10 @@ std::string expand(const std::string& in) {
 }
 
 std::string trim(const std::string& s) {
-    size_t a = s.find_first_not_of(" \t");
-    size_t b = s.find_last_not_of(" \t");
+    // Windows 上 service.conf 常带 CRLF（如 git autocrlf=true 签出）：
+    // 不去掉 \r 会让行尾引号剥不掉、"${KEY:-d}" 识别失败，值变成 ""\r 之类
+    size_t a = s.find_first_not_of(" \t\r\n");
+    size_t b = s.find_last_not_of(" \t\r\n");
     return a == std::string::npos ? "" : s.substr(a, b - a + 1);
 }
 
