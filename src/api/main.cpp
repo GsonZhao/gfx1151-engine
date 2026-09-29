@@ -1867,7 +1867,7 @@ void handle_health(const http::Request&, http::Response* r, http::Stream*) {
                    {"bare_base64", true},
                    {"http_urls", false},
                    {"formats", json::array({"png", "jpeg", "webp"})},
-                   {"max_images", 8},
+                   {"max_images", vision::max_images()},
                    {"video", false},
                    {"runtime", "native-cpp"}};
     j["supported"] = json::array(

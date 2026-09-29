@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -31,7 +32,8 @@ namespace {
 
 constexpr size_t kMaxEncodedBytes = 64u << 20;
 constexpr uint64_t kMaxDecodedPixels = 100000000u;
-constexpr int kMaxImages = 8;
+constexpr int kDefaultMaxImages = 8;
+constexpr int kMaxImagesCap = 256;
 constexpr int kPatch = 16;
 constexpr int kMerge = 2;
 constexpr int kFactor = kPatch * kMerge;
@@ -441,6 +443,23 @@ bool image_url_from_item(const json& item, std::string* url, bool* image,
 
 }  // namespace
 
+// GDEC_API_MAX_IMAGES overrides the per-request image cap (1..256, default 8).
+int max_images() {
+    static const int limit = [] {
+        const char* e = std::getenv("GDEC_API_MAX_IMAGES");
+        if (e != nullptr && *e != '\0') {
+            char* end = nullptr;
+            const long v = std::strtol(e, &end, 10);
+            if (end != e && *end == '\0' && v >= 1 && v <= kMaxImagesCap)
+                return static_cast<int>(v);
+            fprintf(stderr, "vision: ignoring bad GDEC_API_MAX_IMAGES=%s (want 1..%d)\n",
+                    e, kMaxImagesCap);
+        }
+        return kDefaultMaxImages;
+    }();
+    return limit;
+}
+
 bool decode_image_url(const std::string& value, std::vector<uint8_t>* bytes,
                       std::string* error) {
     error->clear();
@@ -497,8 +516,9 @@ bool prepare_messages(const json& messages, std::vector<Frame>* frames,
             if (!image_url_from_item(item, &url, &is_image, error)) return false;
             if (!is_image) continue;
             urls.push_back(std::move(url));
-            if (urls.size() > kMaxImages) {
-                *error = "a request may contain at most 8 images";
+            if (urls.size() > static_cast<size_t>(max_images())) {
+                *error = "a request may contain at most " + std::to_string(max_images()) +
+                         " images";
                 return false;
             }
         }

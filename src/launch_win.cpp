@@ -879,6 +879,8 @@ int main(int argc, char** argv) {
     const int kv_pool_tokens = cfg_int("KV_POOL_TOKENS", 0, 0, 1 << 24);
     // 并发请求数（见 service.conf）：几条序列共享同一个页池，需要分页 KV。
     const int parallel = cfg_int("PARALLEL", 1, 1, 8);
+    // 单请求图片数上限（见 service.conf）：多轮视觉对话会累计历史图片。
+    const int max_images = cfg_int("MAX_IMAGES", 8, 1, 256);
     const int start_timeout = env_int("START_TIMEOUT", 1800, 30, 86400);
 
     if (engine_port == api_port) fail("ENGINE_PORT 与 API_PORT 必须不同");
@@ -949,6 +951,7 @@ int main(int argc, char** argv) {
                                 ? std::to_string(kv_pool_tokens).c_str()
                                 : nullptr);
     SetEnvironmentVariableA("GDEC_PARALLEL", std::to_string(parallel).c_str());
+    SetEnvironmentVariableA("GDEC_API_MAX_IMAGES", std::to_string(max_images).c_str());
 
     CreateDirectoryA("logs", nullptr);
     g_plan.engine_log = "logs\\engine-win-" + g_stamp + ".log";

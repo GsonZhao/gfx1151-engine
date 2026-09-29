@@ -28,6 +28,7 @@ serve_init() {
   KV_POOL_TOKENS="${KV_POOL_TOKENS:-0}"
   PARALLEL="${PARALLEL:-1}"
   CONC_PREFILL_CHUNK="${CONC_PREFILL_CHUNK:-8192}"
+  MAX_IMAGES="${MAX_IMAGES:-8}"
   if [[ -f "$ROOT/build/bundled-runtime.conf" ]]; then
     # --bundle 产物优先使用随包库；kernel db 使用绝对路径，不依赖 cwd。
     [[ -d "$ROOT/build/lib" ]] || fail '缺少 build/lib，请重新运行 bash build.sh --bundle'
@@ -55,6 +56,7 @@ serve_init() {
   [[ "$PLE_URING" =~ ^[01]$ ]] || fail 'PLE_URING 必须为 0 或 1'
   [[ "$KV_PAGED" =~ ^[01]$ ]] || fail 'KV_PAGED 必须为 0 或 1'
   [[ "$PARALLEL" =~ ^[1-8]$ ]] || fail 'PARALLEL 范围为 1–8'
+  [[ "$MAX_IMAGES" =~ ^[1-9][0-9]*$ && "$MAX_IMAGES" -le 256 ]] || fail 'MAX_IMAGES 范围为 1–256'
   (( PARALLEL == 1 || KV_PAGED )) || fail 'PARALLEL>1 需要 KV_PAGED=1'
   (( ENGINE_PORT <= 65535 && API_PORT <= 65535 && ENGINE_PORT != API_PORT )) || fail '端口必须为不同的 1–65535 整数'
   (( MTP_GAMMA <= 8 )) || fail 'MTP_GAMMA 范围为 0–8（0=引擎按模式自选 greedy 4 / 采样自适应）'
@@ -119,6 +121,7 @@ serve_run() {
     if (( KV_POOL_TOKENS )); then export GDEC_KV_POOL_TOKENS="$KV_POOL_TOKENS"; fi
   fi
   export GDEC_PARALLEL="$PARALLEL"
+  export GDEC_API_MAX_IMAGES="$MAX_IMAGES"
   # --serve reads GDEC_SPEC_GAMMA; --gamma is for offline --spec-gen.
   # MTP_GAMMA=0：不导出，引擎按请求模式自选（greedy 4 / 采样自适应）。
   if (( MTP_GAMMA > 0 )); then export GDEC_SPEC_GAMMA="$MTP_GAMMA"; fi
