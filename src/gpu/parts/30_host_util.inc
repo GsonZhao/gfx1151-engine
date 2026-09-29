@@ -915,12 +915,21 @@ static bool gemv_multi_q4cp(const WView& w, const void* x, float* y, int P,
     if (xbf16 && w.cols >= 4096 && w.rows <= 4096) {
       // Row-tiled (RPB=4): x fetched once per (group, block) instead of once
       // per row; bit-exact vs brow (ktest brow_r_bitexact). GDEC_BROW_R=0
-      // opt-out.
+      // opt-out. Only for kBrowRMinP <= P <= kBrowRMaxP: it keeps x[P][32]
+      // bf16 and RPB x P accumulators in registers (VGPR 221 at P=4, 256 +
+      // spill from P=5; P=6/7/8 spill 98/181/240 regs), so at P >= 6 (γ >= 5
+      // verify) it ran 1.5-4.8x slower than brow and the 8K γ=7 MTP round
+      // went 110 -> 139 ms. At P=1/2 its lower occupancy loses to brow too.
+      // tools/brow_bench.cu (cold weights, brow_r/brow): hc_down 320x10240
+      // P1..8 = 1.09 1.03 .98 .87 .94 1.47 3.07 4.45, out_proj 2560x6144
+      // 1.18 1.10 1.04 .90 .92 1.59 3.31 4.77. Other P fall through to brow
+      // below (bit-identical results, so the range only changes speed).
+      constexpr int kBrowRMinP = 3, kBrowRMaxP = 5;
       static const bool brow_r = [] {
         const char* e = getenv("GDEC_BROW_R");
         return !e || e[0] != '0';
       }();
-      if (brow_r) {
+      if (brow_r && P >= kBrowRMinP && P <= kBrowRMaxP) {
         switch (P) {
 #define GDEC_Q8BR(PP)                                                          \
   case PP:                                                                     \
