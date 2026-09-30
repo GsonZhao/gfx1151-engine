@@ -341,6 +341,11 @@ GenResult EngineClient::generate(const GenParams& p, const TokenFn& on_token,
     bool cancelled = false;
     bool heartbeat = static_cast<bool>(on_wait);
     double next_heartbeat = now_s() + 1.0;
+    // Grace for the engine's D-ack after a cancel: a healthy engine answers
+    // within seconds (its next yield point). If none arrives the connection
+    // is wedged (e.g. a desynced stream swallowed the GEN): give up and
+    // reopen it instead of holding this slot until the full read timeout.
+    double cancel_deadline = 0.0;
     // Check heartbeats on a clock, even when buffered T lines keep arriving,
     // and bound idle reads by that clock without changing the overall deadline.
     auto read_with_wait = [&](std::string* line, double timeout_s) {
@@ -351,10 +356,13 @@ GenResult EngineClient::generate(const GenParams& p, const TokenFn& on_token,
                     heartbeat = false;
                     cancelled = true;
                     cancel(p.req);
+                    cancel_deadline = now_s() + 10.0;
                 }
                 next_heartbeat = now_s() + 1.0;
             }
-            const double left = deadline - now_s();
+            double left = deadline - now_s();
+            if (cancel_deadline > 0.0)
+                left = std::min(left, cancel_deadline - now_s());
             if (left <= 0.0) {
                 read_timed_out_ = true;
                 return false;
@@ -391,6 +399,7 @@ GenResult EngineClient::generate(const GenParams& p, const TokenFn& on_token,
                 heartbeat = false;
                 cancelled = true;
                 cancel(p.req);  // engine acknowledges with its own D line
+                cancel_deadline = now_s() + 10.0;
             }
         } else if (kind == "D") {
             long long req = 0;

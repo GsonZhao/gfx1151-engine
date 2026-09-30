@@ -1261,6 +1261,13 @@ static bool send_all(sockfd_t fd, const std::string& s) {
   return true;
 }
 
+// VIMG frames accepted per GEN line (protocol cap). parse_gen keeps the
+// parsed count even when it rejects the value, so the serve loop can still
+// drain that many binary frames before replying — a reject that skips the
+// drain leaves frame bytes to be misread as protocol lines and silently
+// wedges the connection. src/api/vision.cpp clamps its image cap to this.
+constexpr int kVimgMax = 16;
+
 struct GenReq {
   int64_t req = 0;
   int max_tokens = 0;
@@ -1268,6 +1275,7 @@ struct GenReq {
   std::vector<int> ids;
   int drafter = -1;  // omitted: engine default; 0 serial; 1 MTP; 3 ngram-mod; 4 chain
   bool reject = false;  // malformed or unsupported optional field
+  const char* reject_why = nullptr;  // parse note for the serve log
   // Sampler (SAMPLE suffix). sample=true implies temp>0; greedy otherwise.
   bool sample = false;
   float temp = 1.0f, top_p = 0.0f, min_p = 0.0f;  int top_k = 0;
@@ -1669,8 +1677,12 @@ static GenReq parse_gen(std::istringstream& ss) {
         g.mrope_grids.push_back(g3);
       }
     } else if (tok == "VIMG") {
-      if (!(ss >> g.vimg) || g.vimg <= 0 || g.vimg > 16) {
+      // g.vimg stays recorded even when the value is rejected, so the serve
+      // loop can drain that many frames before it replies.
+      if (!(ss >> g.vimg)) { g.reject = true; return g; }
+      if (g.vimg <= 0 || g.vimg > kVimgMax) {
         g.reject = true;
+        g.reject_why = "bad VIMG frame count";
         return g;
       }
     } else if (tok == "SNAP" || tok == "SNAP2") {
@@ -2746,6 +2758,7 @@ static void conn_main(GpuModel& m, sockfd_t cfd, const kvsnap::Cfg& kvs) {
   std::thread worker;
   std::string line;
   bool alive = true;
+  int bad_lines = 0;  // unrecognized lines seen on this connection
   while (alive && lb.readline(line)) {
     if (line.empty()) continue;
     std::istringstream ss(line);
@@ -2801,23 +2814,32 @@ static void conn_main(GpuModel& m, sockfd_t cfd, const kvsnap::Cfg& kvs) {
       }
     } else if (verb == "GEN") {
       GenReq g = parse_gen(ss);
-      if (g.reject || (int)g.ids.size() + g.max_tokens > m.maxctx) {
-        char db[128];
-        snprintf(db, sizeof db, "D %lld error %zu 0 0 0\n", (long long)g.req,
-                 g.ids.size());
-        alive = c.send(db);
-        continue;
+      const bool rejected =
+          g.reject || (int)g.ids.size() + g.max_tokens > m.maxctx;
+      if (rejected) {
+        const char* why = !g.reject ? "prompt + max_tokens exceeds maxctx"
+                          : g.reject_why ? g.reject_why
+                                         : "malformed or unsupported GEN line";
+        fprintf(stderr, "%s serve: req %lld rejected before dispatch: %s "
+                "(ids %zu, max_tokens %d, maxctx %d, vimg %d)\n",
+                log_ts(), (long long)g.req, why, g.ids.size(), g.max_tokens,
+                m.maxctx, g.vimg);
       }
       // VIMG binary frames follow the GEN line immediately and must be
-      // drained before ANY reply path, or their bytes desync the line
-      // protocol. 120 s ceiling on the bulk transfer (~50 MB per 1080p
-      // image over loopback is sub-second; the ceiling only guards against
-      // a stalled client wedging this connection).
+      // drained before ANY reply path — rejects included — or their bytes
+      // desync the line protocol: leftover frame bytes are then misread as
+      // protocol lines and silently swallow every later GEN on this
+      // connection. parse_gen keeps the parsed VIMG count even for lines it
+      // rejects, so the drain still knows how many frames to consume; a
+      // rejected request drains into a scratch buffer (its pixels are never
+      // used). 120 s ceiling on the bulk transfer (~50 MB per 1080p image
+      // over loopback is sub-second; the ceiling only guards against a
+      // stalled client wedging this connection).
       std::vector<std::vector<float>> vpatches;
       if (g.vimg > 0) {
         bool ok = true;
         sock_rcvtimeo(cfd, 120);
-        vpatches.resize(g.vimg);
+        if (!rejected) vpatches.resize(g.vimg);
         for (int i = 0; i < g.vimg && ok; i++) {
           struct {
             uint32_t magic, P;
@@ -2827,8 +2849,19 @@ static void conn_main(GpuModel& m, sockfd_t cfd, const kvsnap::Cfg& kvs) {
                fh.P > 0 && fh.P <= 65536 &&
                fh.nbytes == (uint64_t)fh.P * 1536 * 4;
           if (!ok) break;
-          vpatches[i].resize((size_t)fh.P * 1536);
-          ok = lb.read_full(vpatches[i].data(), fh.nbytes);
+          if (rejected) {
+            char scratch[65536];
+            uint64_t left = fh.nbytes;
+            while (left > 0 && ok) {
+              const size_t chunk =
+                  (size_t)std::min<uint64_t>(left, sizeof scratch);
+              ok = lb.read_full(scratch, chunk);
+              left -= chunk;
+            }
+          } else {
+            vpatches[i].resize((size_t)fh.P * 1536);
+            ok = lb.read_full(vpatches[i].data(), fh.nbytes);
+          }
         }
         sock_rcvtimeo(cfd, 0);
         if (!ok) {
@@ -2841,6 +2874,22 @@ static void conn_main(GpuModel& m, sockfd_t cfd, const kvsnap::Cfg& kvs) {
           c.send(db);
           break;  // protocol desync: cannot trust anything after this
         }
+      }
+      if (rejected) {
+        char db[128];
+        snprintf(db, sizeof db, "D %lld error %zu 0 0 0\n", (long long)g.req,
+                 g.ids.size());
+        alive = c.send(db);
+        if (g.reject && g.vimg <= 0) {
+          // The line failed before the VIMG token was parsed, so the frame
+          // count is unknown and any frames the client did send cannot be
+          // drained. Closing the connection is the only safe resync.
+          fprintf(stderr, "%s serve: conn %llu: closing after an "
+                  "undrainable rejected GEN\n", log_ts(),
+                  (unsigned long long)c.id);
+          break;
+        }
+        continue;
       }
       if (c.in_flight) {  // one GEN at a time per connection
         fprintf(stderr, "serve: req %lld rejected: another GEN is in flight "
@@ -2857,8 +2906,19 @@ static void conn_main(GpuModel& m, sockfd_t cfd, const kvsnap::Cfg& kvs) {
       c.in_flight = true;
       worker = std::thread(gen_one, std::ref(m), std::ref(c), std::move(g),
                            std::move(vpatches), std::cref(kvs));
+    } else {
+      // Not a protocol verb: foreign garbage, or binary frame bytes misread
+      // as lines after a stream desync. Legit clients never send any, so a
+      // flood means this byte stream can no longer be trusted: close the
+      // connection and let the client reconnect resynced, instead of
+      // silently swallowing everything that follows (a connection wedged
+      // that way looks idle but drops every GEN).
+      if (++bad_lines == 4 || bad_lines == 64)
+        fprintf(stderr, "%s serve: conn %llu: %d unrecognized lines "
+                "(desynced stream?)%s\n", log_ts(), (unsigned long long)c.id,
+                bad_lines, bad_lines >= 64 ? "; closing the connection" : "");
+      if (bad_lines >= 64) break;
     }
-    // unknown verbs: drop
   }
   c.cancel = true;  // disconnect cancels the request in flight
   if (worker.joinable()) worker.join();
