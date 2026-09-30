@@ -8,9 +8,11 @@ A local inference engine that runs a 177B MoE model on a single AMD Strix
 Halo APU (gfx1151). Target model: Qwen3.8-Flash-Next (qwen4_exp architecture)
 and fine-tunes with the same architecture.
 
-The 68 GiB of quantized weights are stored in host memory in 4-bit
-quantization and read directly by the GPU kernels — no large VRAM needed;
-a machine with 122 GiB of RAM can serve a 256K context.
+The routed experts are stored in host memory in 4-bit quantization and read
+directly by the GPU kernels — no large VRAM needed. The memory-resident
+weights are ~67–77 GiB depending on the weight format (the PLE n-gram table
+stays on disk and is read on demand); a machine with 122 GiB of RAM can serve
+a 256K context.
 
 ## Measured Performance
 
@@ -31,6 +33,39 @@ above were measured on real-text prompts; highly repetitive content (code,
 template text) hits the chain drafter well and exceeds 60 tok/s in the same
 configuration. Numbers vary with the weight format (GGUF / hgn); all dates
 are in 2026.
+
+## Weight Formats and Quality
+
+The engine supports two weight formats. Service, API and speculative
+decoding are identical; switch by using the other launcher:
+
+| | hgn standard | hgn high quality (HQ) | GGUF UD-Q4_K_XL |
+| --- | --- | --- | --- |
+| Files | current default (`qwen38-flash-next-w4b.hgn` + overlay) | converted from the original weights, see [HGN-HQ.md](HGN-HQ.md) (Chinese) | released by Unsloth, the same files llama.cpp uses |
+| Routed experts | 4-bit (q4cp) | 4-bit (q4cp, imatrix-weighted) | mostly Q4_K / Q5_1 |
+| Dense (attention, GDN, shared expert, embed, lm_head) | 4-bit | 8-bit (q8g32 overlay) | 8-bit (Q8_0) |
+| KLD vs BF16 (lower is better) | 0.163 | **0.0558** | 0.0511 |
+| top1 agreement with BF16 | 86.8% | 92.4% | 92.6% |
+| Resident weights bpw / size | 4.55 / 66.6 GiB | 4.70 / 68.8 GiB | 5.25 / 76.9 GiB |
+| Prefill (8K prompt, chunk 2048) | ~1200 tok/s | ~1200 tok/s | ~1200 tok/s |
+| Decode (no speculation) | ~30 tok/s | ~25 tok/s | ~25 tok/s |
+| Launch | `start_hgn.sh` | `start_hgn.sh` (set `MODEL_FILE` / `OVERLAY_FILE`) | `start_gguf.sh` |
+| Windows | yes | yes (not yet measured) | no |
+
+- KLD: BF16 reference, wikitext-2, 64 chunks × 512, measured the same way as
+  unsloth / llama.cpp (see [KLD.md](KLD.md), Chinese); llama.cpp on the same
+  GGUF gives 0.049.
+- Almost the whole quality gap comes from the dense bit width: 8-bit dense
+  takes KLD from 0.163 to 0.063, imatrix-weighted experts bring it to 0.0558.
+  The cost is more bytes read per decode token, ~16% slower decode (same as
+  GGUF); prefill is unaffected.
+- Resident weights exclude the PLE n-gram table (hgn fp8 47.7 GiB, GGUF
+  IQ4_NL 26.8 GiB), which stays on disk and is read on demand.
+  `python3 tools/bpw.py` reports bpw per category for each file (reads headers
+  only, a few seconds).
+- The default configuration is still hgn standard. The HQ files pass
+  `tools/hq_verify.sh`; deployment is described in section 6 of
+  [HGN-HQ.md](HGN-HQ.md).
 
 ## Features
 
@@ -57,15 +92,20 @@ are in 2026.
   bit-identical to running alone; long-prompt prefill is chunked to yield
   the GPU, capping other sessions' worst stall at ~0.6 s. Configuration
   and semantics in [CONCURRENCY.md](CONCURRENCY.md) (Chinese).
-- **Model conversion tool**: HF safetensors → `.hgn`; quantization needs no
-  calibration data, and can be distributed for your own fine-tuned models
-  (see CONVERT_EN.md).
+- **Two weight formats**: the native `.hgn` (Linux / Windows) and llama.cpp
+  GGUF (Unsloth UD-Q4_K_XL, Linux); comparison above.
+- **Model conversion tool**: HF safetensors → `.hgn`. The default output is
+  the high-quality variant (8-bit dense overlay + weighted 4-bit experts); a
+  llama.cpp-format imatrix is used if you have one, and conversion works
+  without one too. Usable for your own fine-tunes of the same architecture
+  (see [HGN-HQ.md](HGN-HQ.md), [CONVERT_EN.md](CONVERT_EN.md)).
 
 ## Requirements
 
 - Linux + ROCm (HIP 7.x), GPU architecture `gfx1151`; or Windows + AMD GPU
   driver (the GPU needs VRAM carved out in BIOS), see the "Windows" section
-- Available memory ≥ 100 GiB (68 GiB weights pinned (page-locked) + KV)
+- Available memory ≥ 100 GiB (pinned (page-locked) weights: ~68 GiB for hgn,
+  ~80 GiB for GGUF, plus KV)
 - Build dependencies: rocBLAS, hipBLASLt, rocPRIM; the API frontend also
   needs libpng, libjpeg, libwebp; nlohmann/json is vendored in the repository
 
@@ -85,10 +125,18 @@ for details.
 Converting your own fine-tuned model (HF safetensors, same architecture):
 
 ```bash
+# without an imatrix
 python3 tools/flashnext2hgn.py /path/to/hf-model --out ./models
+# with an imatrix (llama.cpp format: GGUF or legacy imatrix.dat)
+python3 tools/flashnext2hgn.py /path/to/hf-model --out ./models --imatrix /path/to/imatrix.gguf
 ```
 
-See [CONVERT_EN.md](CONVERT_EN.md) for details.
+It writes the base `.hgn`, the 8-bit dense overlay, the 8-bit MTP draft, the
+vision tower, the tokenizer and a ready-to-run `start.sh`; ~1.5 hours on 32
+cores, ~125 GiB of disk, needs only numpy. `--classic` is the old data-free
+converter (byte-identical output to before). High-quality conversion: see
+[HGN-HQ.md](HGN-HQ.md); format and the old converter: see
+[CONVERT_EN.md](CONVERT_EN.md).
 
 ## Windows
 
@@ -124,7 +172,10 @@ Differences from the Linux version:
 - Only hgn weights are supported: usable VRAM on Windows is capped at
   about 96 GiB, and GGUF weights are larger (hgn saves ~11 GiB over GGUF)
   and do not fit — `start_gguf.sh` does not apply; hgn weights are
-  produced by the conversion tool, see [CONVERT_EN.md](CONVERT_EN.md)
+  produced by the conversion tool, see [CONVERT_EN.md](CONVERT_EN.md).
+  The high-quality hgn works by swapping files: weight arena +2.2 GiB,
+  estimated ~93.2 GiB at 256K / chunk 8192 (limit 95); not yet measured
+  on Windows
 - Image decoding supports PNG/JPEG via stb_image (WebP not wired up)
 - Prefill chunk defaults to 8192
 - Cold loading reads the full weights from disk (minute-scale, progress
@@ -150,7 +201,12 @@ Build details are in [BUILD_EN.md](BUILD_EN.md).
 - [QUICKSTART_EN.md](QUICKSTART_EN.md) — build, launch, configuration
 - [BUILD_EN.md](BUILD_EN.md) — build environment details and
   troubleshooting
+- [GGUF.md](GGUF.md) (Chinese) — GGUF weight loading, performance vs hgn
+- [HGN-HQ.md](HGN-HQ.md) (Chinese) — high-quality hgn: one-step conversion
+  (optional imatrix), results, deployment
 - [CONVERT_EN.md](CONVERT_EN.md) — model conversion tool
+- [KLD.md](KLD.md) (Chinese) — quality testing (KLD, same method as
+  unsloth / llama.cpp)
 - [MTP_EN.md](MTP_EN.md) — speculative decoding parameters and comparison
   methods
 - [NGRAM_EN.md](NGRAM_EN.md) — ngram verification design, benefits, and
@@ -169,8 +225,11 @@ Build details are in [BUILD_EN.md](BUILD_EN.md).
 ## Tests
 
 ```bash
-bash build.sh test   # Kernel unit tests, no model loading, expect ALL PASS
+bash build.sh test     # Kernel unit tests, no model loading, expect ALL PASS
+python3 tools/bpw.py   # bpw of the weights under models/ by category (headers only)
 ```
+
+Quality (KLD) testing needs a BF16 reference; see [KLD.md](KLD.md).
 
 ## Acknowledgements
 
