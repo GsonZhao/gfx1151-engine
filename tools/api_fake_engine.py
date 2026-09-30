@@ -5,6 +5,8 @@ Run this on port 18730, start gdec-api with --engine 127.0.0.1:18730 and
 --port 18731, then run api_regression_test.py against that API port.
 """
 import argparse
+import json
+import select
 import socket
 import struct
 import threading
@@ -16,10 +18,48 @@ def send_line(conn, line):
 
 
 SLOTS = 1
+TRACE = []
+TRACE_LOCK = threading.Lock()
 
 
 def handle(conn):
     pending = b""
+
+    def record_cancel(req):
+        with TRACE_LOCK:
+            for entry in TRACE:
+                if entry["req"] == req:
+                    entry["cancel"] += 1
+
+    def cancellable(req, seed):
+        nonlocal pending
+        entry = {"req": req, "seed": seed, "cancel": 0, "tokens": 0, "done": False}
+        with TRACE_LOCK:
+            TRACE.append(entry)
+        deadline = time.monotonic() + (2.2 if seed == 616163 else 6.0)
+        cancelled = False
+        while time.monotonic() < deadline:
+            if seed != 616162:
+                conn.sendall((f"T {req} 12675 -0.125\n" * 32).encode("ascii"))
+                with TRACE_LOCK:
+                    entry["tokens"] += 32
+            if select.select([conn], [], [], 0.01)[0]:
+                chunk = conn.recv(65536)
+                if not chunk:
+                    return
+                pending += chunk
+            while b"\n" in pending:
+                command, pending = pending.split(b"\n", 1)
+                if command == f"X {req}".encode("ascii"):
+                    record_cancel(req)
+                    if not cancelled:
+                        cancelled = True
+                        deadline = time.monotonic() + 1.2
+        send_line(conn, f"T {req} 12675 -0.125")
+        reason = "cancel" if cancelled else "done"
+        send_line(conn, f"D {req} {reason} 0 0 0.0 0.0 0 0 0 0 0")
+        with TRACE_LOCK:
+            entry["done"] = True
 
     def read_exact(size):
         nonlocal pending
@@ -52,7 +92,12 @@ def handle(conn):
             if line == "CSTAT":
                 send_line(conn, "C fake")
                 continue
+            if line == "TESTSTATE":
+                with TRACE_LOCK:
+                    send_line(conn, json.dumps(TRACE))
+                continue
             if line.startswith("X "):
+                record_cancel(int(line.split()[1]))
                 continue
             if not line.startswith("GEN "):
                 continue
@@ -96,6 +141,11 @@ def handle(conn):
                 frame_ok = False
             if not frame_ok:
                 send_line(conn, f"D {req} error 0 0 0.0 0.0 0 0 0 0 0")
+                continue
+
+            seed = int(fields[fields.index("SAMPLE") + 5]) if "SAMPLE" in fields else 0
+            if seed in (616161, 616162, 616163):
+                cancellable(req, seed)
                 continue
 
             if "424242" in fields:

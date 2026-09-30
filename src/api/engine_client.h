@@ -64,10 +64,10 @@ struct GenResult {
     int proposed = 0;
 };
 
-// Called for every T line. Return false to send `X <req>` and stop reading
+// Called for every T line until cancellation. Return false to send `X <req>`
 // (the engine still emits its D line, which generate() consumes).
 using TokenFn = std::function<bool(int /*token*/, float /*logprob*/)>;
-// Called periodically while the engine has not produced the next T line.
+// Called periodically during generation, including while T lines keep arriving.
 // Returning false cancels the request, but generate() still drains its D line.
 using WaitFn = std::function<bool()>;
 
@@ -97,8 +97,8 @@ class EngineClient {
     bool cstat(std::string* line, std::string* err);
 
     // Run one GEN to completion (or until `on_token` asks to stop). Blocks.
-    // `on_wait` is called at roughly one-second intervals while waiting for
-    // prefill or the next token, so streaming front-ends can send heartbeats.
+    // `on_wait` is called at roughly one-second intervals during prefill and
+    // decode, so front-ends can check disconnects and send streaming heartbeats.
     // `on_token` may be empty. On transport failure returns a result with
     // transport_ok = false; a protocol-level rejection (D ... error) returns
     // transport_ok = true with reason == "error".

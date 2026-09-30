@@ -134,6 +134,16 @@ build/gdec-api --tokenizer ./models/tokenizer \
 纯文本服务可以省略引擎的 `--vision-tower`。`GDEC_NOWARMUP=1` 会让首个
 请求承担预热耗时,首次延迟不能直接当作稳定 prefill 性能。
 
+API 断连回归无需 GPU 或模型权重：测试会在临时目录创建合成词表，启动本地
+假引擎与 API，覆盖三个生成端点的流式/非流式断连、预填充、排队、协议收尾
+及下一请求。先编译 API，再运行（Windows 的 `--api` 改为
+`build/gdec-api-win.exe`）：
+
+```bash
+python tools/api_disconnect_test.py --api build/gdec-api
+python tools/api_disconnect_test.py --api build/gdec-api --slots 2
+```
+
 ## Windows（TheRock）
 
 Windows 版有独立入口，与 build.sh / start_hgn.sh 并列，覆盖引擎与 API 前端

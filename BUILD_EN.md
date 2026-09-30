@@ -148,6 +148,17 @@ A text-only service can omit the engine's `--vision-tower`. `GDEC_NOWARMUP=1`
 makes the first request bear the warmup cost, so first-request latency cannot
 be taken directly as steady-state prefill performance.
 
+The API disconnect regression needs no GPU or model weights: it creates a
+synthetic tokenizer in a temporary directory and starts a local fake engine
+and API. It covers streaming/non-streaming disconnects on all three generation
+endpoints, prefill, queuing, protocol draining, and the next request. Build the
+API first; on Windows, use `--api build/gdec-api-win.exe` instead:
+
+```bash
+python tools/api_disconnect_test.py --api build/gdec-api
+python tools/api_disconnect_test.py --api build/gdec-api --slots 2
+```
+
 ## Windows (TheRock)
 
 The Windows version has its own entry points, parallel to build.sh /

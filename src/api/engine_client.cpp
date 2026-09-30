@@ -340,31 +340,36 @@ GenResult EngineClient::generate(const GenParams& p, const TokenFn& on_token,
     bool saw_any = false;
     bool cancelled = false;
     bool heartbeat = static_cast<bool>(on_wait);
-    // Poll in short slices when a heartbeat callback is present.  This keeps
-    // long prefill gaps observable without changing the overall deadline.
+    double next_heartbeat = now_s() + 1.0;
+    // Check heartbeats on a clock, even when buffered T lines keep arriving,
+    // and bound idle reads by that clock without changing the overall deadline.
     auto read_with_wait = [&](std::string* line, double timeout_s) {
         const double deadline = now_s() + timeout_s;
         for (;;) {
+            if (heartbeat && now_s() >= next_heartbeat) {
+                if (!on_wait()) {
+                    heartbeat = false;
+                    cancelled = true;
+                    cancel(p.req);
+                }
+                next_heartbeat = now_s() + 1.0;
+            }
             const double left = deadline - now_s();
             if (left <= 0.0) {
                 read_timed_out_ = true;
                 return false;
             }
-            const double slice = heartbeat ? std::min(left, 1.0) : left;
+            const double slice = heartbeat ? std::min(left, next_heartbeat - now_s()) : left;
+            if (slice <= 0.0) continue;
             if (read_line(line, slice)) return true;
             if (!read_timed_out_ || !heartbeat || now_s() >= deadline) return false;
-            if (!on_wait()) {
-                heartbeat = false;
-                cancelled = true;
-                cancel(p.req);
-            }
         }
     };
     for (;;) {
         std::string l;
         if (!read_with_wait(&l, saw_any ? next_timeout_ : first_timeout_)) {
             out.timed_out = read_timed_out_;
-            if (out.timed_out) cancel(p.req);
+            if (out.timed_out && !cancelled) cancel(p.req);
             close();
             return out;
         }
@@ -383,6 +388,7 @@ GenResult EngineClient::generate(const GenParams& p, const TokenFn& on_token,
             out.tokens.push_back(tok);
             out.logprobs.push_back(has_lp ? lp : 0.0f);
             if (!cancelled && on_token && !on_token(tok, has_lp ? lp : 0.0f)) {
+                heartbeat = false;
                 cancelled = true;
                 cancel(p.req);  // engine acknowledges with its own D line
             }
