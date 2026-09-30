@@ -123,6 +123,13 @@ exiting; configuration is centralized in `service.conf` (one section each for
 hgn and GGUF; GGUF details in [GGUF.md](GGUF.md)). See [QUICKSTART_EN.md](QUICKSTART_EN.md)
 for details.
 
+For repeatable standalone performance measurements, build and run the
+command-line benchmark described in [BENCHMARK_EN.md](BENCHMARK_EN.md):
+`bash build.sh bench` on Linux or `bash build_win.sh bench` on Windows. It
+loads only the model selected from `service.conf`, benchmarks all
+`data/qsa-oracle/*.tokens` prompts for prefill, and reports TG speed plus MTP
+acceptance for Python code, creative writing, and common-sense QA workloads.
+
 Converting your own fine-tuned model (HF safetensors, same architecture):
 
 ```bash

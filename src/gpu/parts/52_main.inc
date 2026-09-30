@@ -53,6 +53,7 @@ static void lmhead_base_capture(const Checkpoint& ck) {
   }
 }
 
+#if !defined(GDEC_NO_MAIN)
 int main(int argc, char** argv) {
 #ifdef _WIN32
   if (!wsa_init()) {
@@ -780,3 +781,5 @@ int main(int argc, char** argv) {
   m.perf_report();
   return 0;
 }
+
+#endif  // !defined(GDEC_NO_MAIN)

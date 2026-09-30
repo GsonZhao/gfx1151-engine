@@ -5,6 +5,7 @@
 #   bash build.sh                 # all:引擎 + API(服务器+CLI工具),并行
 #   bash build.sh --bundle        # 同上，并打包分发所需的全部运行库
 #   bash build.sh engine [名字]   # 只编引擎 → build/<名字>(默认 gdec)
+#   bash build.sh bench           # 编译独立性能测试工具 → build/gdec-bench
 #   bash build.sh api             # 只编 API 服务器 + CLI 工具
 #   bash build.sh test            # 编 ktest 并运行
 #
@@ -34,7 +35,7 @@ set -- "${POSITIONAL[@]}"
 TARGET="${1:-all}"
 ENGINE_NAME="${2:-gdec}"
 case "$TARGET" in
-  all|engine|api|test) ;;
+  all|engine|api|bench|test) ;;
   *) usage >&2; exit 2 ;;
 esac
 command -v flock >/dev/null || { echo '缺少 flock，请安装 util-linux' >&2; exit 1; }
@@ -221,6 +222,12 @@ build_engine() {
     "${BUNDLE_RPATH[@]}"
 }
 
+build_bench() {
+  compile build/gdec-bench 8 600 "$HIPCC" -O3 -Werror -std=c++17 \
+    --offload-arch="$GPU_ARCH" -Ithird_party src/gpu/bench_main.cpp \
+    -lrocblas -lhipblaslt "${BUNDLE_RPATH[@]}"
+}
+
 API_FLAGS=(-O2 -std=c++17 -Isrc/api -Ithird_party -Wall -Wextra -Wpedantic
            -Werror "${BUNDLE_RPATH[@]}")
 # tokenizer/chat_template 由 CLI 与服务器共用,每个目标须显式列出源文件
@@ -259,6 +266,10 @@ case "$TARGET" in
   engine)
     build_engine
     (( ! BUNDLE_RUNTIME )) || bundle_gpu_runtime "build/$ENGINE_NAME"
+    ;;
+  bench)
+    build_bench
+    (( ! BUNDLE_RUNTIME )) || bundle_gpu_runtime build/gdec-bench
     ;;
   api)
     build_api
