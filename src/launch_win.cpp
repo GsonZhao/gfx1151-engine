@@ -885,6 +885,9 @@ int main(int argc, char** argv) {
     const int parallel = cfg_int("PARALLEL", 1, 1, 8);
     // 单请求图片数上限（见 service.conf）：多轮视觉对话会累计历史图片。
     const int max_images = cfg_int("MAX_IMAGES", 8, 1, 256);
+    // prefill 分段（见 service.conf）：决定 prefill 工作区在 arena 里的尺寸
+    // （8192≈6.9 GiB，4096≈3.5 GiB）。0 = 引擎内置默认（Windows 8192）。
+    const int prefill_chunk = cfg_int("PREFILL_CHUNK", 0, 0, 1 << 20);
     const int start_timeout = env_int("START_TIMEOUT", 1800, 30, 86400);
 
     sockaddr_in engine_addr{};
@@ -912,7 +915,8 @@ int main(int argc, char** argv) {
     printf("模型：%s\n", model_file.c_str());
     const std::string gamma_str =
         mtp_gamma ? std::to_string(mtp_gamma) : "auto（greedy 4 / 采样自适应）";
-    printf("配置：%d 上下文，MTP gamma=%s，engine %s:%d，API %s:%d\n", max_context, gamma_str.c_str(),
+    printf("配置：%d 上下文，prefill chunk %d，MTP gamma=%s，engine %s:%d，API %s:%d\n",
+           max_context, prefill_chunk ? prefill_chunk : 8192, gamma_str.c_str(),
            engine_host.c_str(), engine_port, api_host.c_str(), api_port);
     if (kv_paged) {
         printf("KV：分页，页池 %d token（%d 路并发共享），RAM 检查点 %d 个\n",
@@ -934,9 +938,11 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    // 生产选项与 Linux start.sh 一致，唯独不设 GDEC_PREFILL_CHUNK：
-    // Windows 默认 8192（256K 下 16384 会顶破 95 GiB arena 上限，
-    // 实测见 PORTING-WINDOWS.md；maxctx ≤ 40K 时可手动设 16384 换 ~6% PP）。
+    // 生产选项与 Linux start.sh 一致。GDEC_PREFILL_CHUNK 只在 service.conf 的
+    // PREFILL_CHUNK>0 时设置（0 = 不碰外部环境，引擎用内置默认：Windows 8192）。
+    // 实测（128K，PORTING-WINDOWS.md）：4096 比 8192 省 ~3.6 GiB arena、稳态 PP
+    // 仅慢 ~2%、首块冷启动更快；256K 下 16384 会顶破 95 GiB arena 上限；
+    // maxctx ≤ 40K 时可设 16384 换 ~6% PP。
     const char* flags[] = {
         "GDEC_QSA_KV_BF16", "GDEC_QSA_WMMA", "GDEC_QSA_WMMA_BTV",
         "GDEC_MOE_LT", "GDEC_MOE_LT_BF16", "GDEC_GR_BF16",
@@ -960,6 +966,10 @@ int main(int argc, char** argv) {
                                 : nullptr);
     SetEnvironmentVariableA("GDEC_PARALLEL", std::to_string(parallel).c_str());
     SetEnvironmentVariableA("GDEC_API_MAX_IMAGES", std::to_string(max_images).c_str());
+    // PREFILL_CHUNK>0 才设置；0 = 不碰外部环境变量（用户可直接 set GDEC_PREFILL_CHUNK）。
+    if (prefill_chunk)
+        SetEnvironmentVariableA("GDEC_PREFILL_CHUNK",
+                                std::to_string(prefill_chunk).c_str());
 
     CreateDirectoryA("logs", nullptr);
     g_plan.engine_log = "logs\\engine-win-" + g_stamp + ".log";

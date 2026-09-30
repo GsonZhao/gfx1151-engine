@@ -29,6 +29,7 @@ serve_init() {
   KV_POOL_TOKENS="${KV_POOL_TOKENS:-0}"
   PARALLEL="${PARALLEL:-1}"
   CONC_PREFILL_CHUNK="${CONC_PREFILL_CHUNK:-8192}"
+  PREFILL_CHUNK="${PREFILL_CHUNK:-0}"
   MAX_IMAGES="${MAX_IMAGES:-8}"
   ROPE_FACTOR="${ROPE_FACTOR:-1}"
   ROPE_ORIGINAL_CTX="${ROPE_ORIGINAL_CTX:-262144}"
@@ -61,7 +62,7 @@ serve_init() {
     value="${!key}"
     [[ "$value" =~ ^[1-9][0-9]*$ && ${#value} -le 8 ]] || fail "$key 必须为正整数"
   done
-  for key in KVSNAP_MAX_GB RCKPT_MAX KV_POOL_TOKENS MTP_GAMMA CONC_PREFILL_CHUNK; do
+  for key in KVSNAP_MAX_GB RCKPT_MAX KV_POOL_TOKENS MTP_GAMMA CONC_PREFILL_CHUNK PREFILL_CHUNK; do
     value="${!key}"
     [[ "$value" =~ ^(0|[1-9][0-9]*)$ && ${#value} -le 8 ]] || fail "$key 必须为非负整数"
   done
@@ -118,7 +119,12 @@ serve_run() {
   export GDEC_GDN_STREAM=1 GDEC_GDN_WAVE=1 GDEC_NOWARMUP=1
   # 32768: 32K prompt 单 chunk 实测 +7.4%（1155 vs 1076 tok/s）；65536 超内存 PSI 上限。
   # 32768性能最佳但是吃的显存太多，8192吃的最少但是性能最差，16384折中一下，性能损失不大，吃的显存更少
-  export GDEC_PREFILL_CHUNK=16384
+  # service.conf 的 PREFILL_CHUNK>0 时优先（同名环境变量再优先于 conf），否则 16384。
+  if (( PREFILL_CHUNK > 0 )); then
+    export GDEC_PREFILL_CHUNK="$PREFILL_CHUNK"
+  else
+    export GDEC_PREFILL_CHUNK=16384
+  fi
   # 并发（D1a）：引擎 serve 且 GDEC_PARALLEL>1 时用这个分段代替上面的 16384。prefill 只在
   # 层间让出 GPU，32K prompt 时别的会话最长卡顿 16384 约 0.8–1.4 s、8192 约 0.6 s，
   # 单独 PP 不变（09-29 d1a_verify）。由引擎判断并发，离线工具（pp_prod/kld 等复用这些 ENV）不受影响。
