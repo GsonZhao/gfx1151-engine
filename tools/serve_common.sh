@@ -23,6 +23,7 @@ serve_init() {
     *) fail "$usage" ;;
   esac
   source "$ROOT/service.conf"
+  ENGINE_HOST="${ENGINE_HOST:-127.0.0.1}"
   # 旧版 service.conf 没有这几项时的缺省值（与 service.conf 相同）
   KV_PAGED="${KV_PAGED:-1}"
   KV_POOL_TOKENS="${KV_POOL_TOKENS:-0}"
@@ -45,6 +46,12 @@ serve_init() {
     done
   fi
   local key value cmd
+  [[ "$ENGINE_HOST" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || fail 'ENGINE_HOST 必须是 IPv4 地址'
+  local engine_octets octet
+  IFS=. read -r -a engine_octets <<< "$ENGINE_HOST"
+  for octet in "${engine_octets[@]}"; do
+    [[ "$octet" =~ ^(0|[1-9][0-9]{0,2})$ ]] && (( 10#$octet <= 255 )) || fail 'ENGINE_HOST 必须是 IPv4 地址'
+  done
   for key in ENGINE_PORT API_PORT MAX_CONTEXT MEMORY_CAP_GB MIN_AVAILABLE_GB START_TIMEOUT STALL_TIMEOUT; do
     value="${!key}"
     [[ "$value" =~ ^[1-9][0-9]*$ && ${#value} -le 8 ]] || fail "$key 必须为正整数"
@@ -125,12 +132,14 @@ serve_run() {
   # --serve reads GDEC_SPEC_GAMMA; --gamma is for offline --spec-gen.
   # MTP_GAMMA=0：不导出，引擎按请求模式自选（greedy 4 / 采样自适应）。
   if (( MTP_GAMMA > 0 )); then export GDEC_SPEC_GAMMA="$MTP_GAMMA"; fi
-  local engine=("$ROOT/build/gdec" "${MODEL_ARGS[@]}" --serve --port "$ENGINE_PORT" --maxctx "$MAX_CONTEXT")
+  local engine_connect_host="$ENGINE_HOST"
+  if [[ "$engine_connect_host" == 0.0.0.0 ]]; then engine_connect_host=127.0.0.1; fi
+  local engine=("$ROOT/build/gdec" "${MODEL_ARGS[@]}" --serve --host "$ENGINE_HOST" --port "$ENGINE_PORT" --maxctx "$MAX_CONTEXT")
   [[ -z "$VISION" ]] || engine+=(--vision-tower "$VISION")
 
   echo "项目：$ROOT"
   echo "权重：$FORMAT，$MAIN_MODEL"
-  echo "配置：${MAX_CONTEXT} 上下文，MTP gamma=$([[ $MTP_GAMMA == 0 ]] && echo 'auto（greedy 4 / 采样自适应）' || echo "$MTP_GAMMA")，API ${API_HOST}:${API_PORT}"
+  echo "配置：${MAX_CONTEXT} 上下文，MTP gamma=$([[ $MTP_GAMMA == 0 ]] && echo 'auto（greedy 4 / 采样自适应）' || echo "$MTP_GAMMA")，engine ${ENGINE_HOST}:${ENGINE_PORT}，API ${API_HOST}:${API_PORT}"
   if (( KV_PAGED )); then
     echo "KV：分页，页池 $(( (KV_POOL_TOKENS > MAX_CONTEXT ? KV_POOL_TOKENS : MAX_CONTEXT) )) token（${PARALLEL} 路并发共享），RAM 检查点 ${RCKPT_MAX} 个"
   else
@@ -180,7 +189,7 @@ serve_run() {
   done
   kill -0 "$engine_pid" 2>/dev/null || fail '引擎已退出'
   "$ROOT/build/gdec-api" --tokenizer "$TOKENIZER_DIR" \
-    --engine "127.0.0.1:$ENGINE_PORT" --host "$API_HOST" \
+    --engine "$engine_connect_host:$ENGINE_PORT" --host "$API_HOST" \
     --port "$API_PORT" --context "$MAX_CONTEXT" >"$API_LOG" 2>&1 9>&- 8>&- &
   api_pid=$!
   begin=$SECONDS

@@ -35,7 +35,7 @@ bash build.sh test            # 编 ktest 并运行 kernel 单测
 | `build/gdec` | GPU 引擎(`src/gpu/gdec.cpp`) |
 | `build/gdec-api` | OpenAI 兼容 API 服务器(`src/api/*.cpp`) |
 | `build/tok_cli` `tpl_cli` `eng_cli` | tokenizer / 模板 / 引擎协议 CLI |
-| `build/http_selftest` `toolparse_test` `vision_test` | API 组件自测 |
+| `build/http_selftest` `toolparse_test` `vision_test` `engine_host_test` | API / 引擎监听地址组件自测 |
 | `build/ktest` | 引擎 kernel 单测 |
 | `build/lib` | `--bundle` 生成的 ROCm/图像运行库及 gfx1151 kernel db |
 
@@ -143,6 +143,15 @@ API 断连回归无需 GPU 或模型权重：测试会在临时目录创建合�
 python tools/api_disconnect_test.py --api build/gdec-api
 python tools/api_disconnect_test.py --api build/gdec-api --slots 2
 ```
+
+引擎监听地址与启动配置回归（均无需模型）：
+
+```bash
+build/engine_host_test
+python tools/engine_host_config_test.py --bash bash
+```
+
+Windows 配置回归可额外传入 `--launcher ./start_win.exe`，检查原生启动器。
 
 ## Windows（TheRock）
 

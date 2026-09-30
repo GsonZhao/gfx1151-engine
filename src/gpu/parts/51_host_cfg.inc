@@ -2804,20 +2804,26 @@ static void conn_main(GpuModel& m, sockfd_t cfd, const kvsnap::Cfg& kvs) {
   fprintf(stderr, "%s serve: client disconnected\n", log_ts());
 }
 
-static int run(GpuModel& m, int port) {
+static int run(GpuModel& m, const std::string& host, int port) {
 #ifndef _WIN32
   signal(SIGPIPE, SIG_IGN);
 #endif
+  sockaddr_in addr{};
+  if (!engine_net::address(host, port, &addr)) {
+    fprintf(stderr, "serve: invalid IPv4 listen address %s:%d\n", host.c_str(), port);
+    return 1;
+  }
   sockfd_t lfd = sock_tcp();
+  if (lfd < 0) {
+    fprintf(stderr, "serve: socket failed: %s\n", sock_strerror(sock_errno()));
+    return 1;
+  }
   int one = 1;
   setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, (const char*)&one, sizeof one);
-  sockaddr_in addr{};
-  addr.sin_family = AF_INET;
-  addr.sin_addr.s_addr = htonl(INADDR_ANY);
-  addr.sin_port = htons(port);
   if (bind(lfd, (sockaddr*)&addr, sizeof addr) || listen(lfd, 16)) {
-    fprintf(stderr, "serve: bind/listen failed on :%d: %s\n", port,
+    fprintf(stderr, "serve: bind/listen failed on %s:%d: %s\n", host.c_str(), port,
             sock_strerror(sock_errno()));
+    sock_close(lfd);
     return 1;
   }
   m.slots_init(eff_parallel());
@@ -2830,7 +2836,7 @@ static int run(GpuModel& m, int port) {
     m.borrow_fn = &borrow_turn;
     m.borrow_skip_fn = &borrow_skip;
   }
-  fprintf(stderr, "serve: listening on :%d (maxctx %d, %d slot%s)\n", port,
+  fprintf(stderr, "serve: listening on %s:%d (maxctx %d, %d slot%s)\n", host.c_str(), port,
           m.maxctx, m.nslots, m.nslots > 1 ? "s" : "");
   static kvsnap::Cfg kvs;  // read-only once serving; workers share it
   kvs.dir = "data/kvsnap";

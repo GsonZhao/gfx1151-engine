@@ -96,6 +96,14 @@ Port, listen address, context, MTP, and memory cap are centralized in `service.c
 listens on `0.0.0.0:8731`, accessible from the LAN; if you only need local access, change it to
 `API_HOST="127.0.0.1"`.
 
+The internal engine defaults to `127.0.0.1:8730` and does not accept remote
+connections. Configure its IPv4 listen address with `ENGINE_HOST` and its port
+with `ENGINE_PORT`. Normally, expose only the API. Set `ENGINE_HOST` to a local
+interface IP or `0.0.0.0` only when direct remote engine access is required
+(this permits remote connections; restrict network access yourself). When
+running the engine directly, use `--serve --host 127.0.0.1 --port 8730`;
+omitting `--host` also binds only to loopback.
+
 Query live memory accounting with `curl http://127.0.0.1:8731/memory`. The
 response separates HIP device allocations, expert weights backed by
 `mmap + hipHostRegister`, pinned host memory, and process RSS.

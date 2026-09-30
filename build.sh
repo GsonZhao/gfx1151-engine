@@ -239,6 +239,8 @@ build_api() {
     src/api/engine_client.cpp src/api/tokenizer.cpp src/api/eng_cli.cpp || return 1
   compile build/http_selftest 8 120 "$CXX" "${API_FLAGS[@]}" \
     src/api/http.cpp src/api/http_selftest.cpp -lpthread || return 1
+  compile build/engine_host_test 8 120 "$CXX" "${API_FLAGS[@]}" \
+    tools/engine_host_test.cpp || return 1
   compile build/toolparse_test 8 120 "$CXX" "${API_FLAGS[@]}" \
     src/api/toolparse.cpp src/api/json_py.cpp src/api/toolparse_test.cpp || return 1
   compile build/vision_test 8 120 "$CXX" "${API_FLAGS[@]}" \

@@ -39,6 +39,7 @@ VISION_FILE="${VISION_FILE-$MODEL_DIR/heretic-vision.hgn}"
 # 覆盖层（可选的高精度替换张量）：默认空=不叠加；非空但文件不存在则报错。
 OVERLAY_FILE="${OVERLAY_FILE-}"
 TOKENIZER_DIR="${TOKENIZER_DIR:-$MODEL_DIR/tokenizer}"
+ENGINE_HOST="${ENGINE_HOST:-127.0.0.1}"
 ENGINE_PORT="${ENGINE_PORT:-8730}"
 API_HOST="${API_HOST:-0.0.0.0}"
 API_PORT="${API_PORT:-8731}"
@@ -56,6 +57,13 @@ MAX_IMAGES="${MAX_IMAGES:-8}"
 # 本机 68 GiB 权重 cold-load 实测 ~9 分钟（NVMe 弱盘），超时给足。
 START_TIMEOUT="${START_TIMEOUT:-1800}"
 
+[[ "$ENGINE_HOST" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || fail 'ENGINE_HOST 必须是 IPv4 地址'
+IFS=. read -r -a engine_octets <<< "$ENGINE_HOST"
+for octet in "${engine_octets[@]}"; do
+  [[ "$octet" =~ ^(0|[1-9][0-9]{0,2})$ ]] && (( 10#$octet <= 255 )) || fail 'ENGINE_HOST 必须是 IPv4 地址'
+done
+engine_connect_host="$ENGINE_HOST"
+if [[ "$engine_connect_host" == 0.0.0.0 ]]; then engine_connect_host=127.0.0.1; fi
 [[ "$ENGINE_PORT" =~ ^[1-9][0-9]*$ && "$ENGINE_PORT" -le 65535 ]] || fail 'ENGINE_PORT 必须为 1–65535'
 [[ "$API_PORT" =~ ^[1-9][0-9]*$ && "$API_PORT" -le 65535 ]] || fail 'API_PORT 必须为 1–65535'
 [[ "$ENGINE_PORT" != "$API_PORT" ]] || fail 'ENGINE_PORT 与 API_PORT 必须不同'
@@ -82,7 +90,7 @@ for port in "$ENGINE_PORT" "$API_PORT"; do
 done
 echo "项目：$ROOT"
 echo "模型：$MODEL_FILE"
-echo "配置：${MAX_CONTEXT} 上下文，MTP gamma=$([[ $MTP_GAMMA == 0 ]] && echo 'auto（greedy 4 / 采样自适应）' || echo "$MTP_GAMMA")，API ${API_HOST}:${API_PORT}"
+echo "配置：${MAX_CONTEXT} 上下文，MTP gamma=$([[ $MTP_GAMMA == 0 ]] && echo 'auto（greedy 4 / 采样自适应）' || echo "$MTP_GAMMA")，engine ${ENGINE_HOST}:${ENGINE_PORT}，API ${API_HOST}:${API_PORT}"
 if (( KV_PAGED )); then
   echo "KV：分页，页池 $(( (KV_POOL_TOKENS > MAX_CONTEXT ? KV_POOL_TOKENS : MAX_CONTEXT) )) token（${PARALLEL} 路并发共享），RAM 检查点 ${RCKPT_MAX} 个"
   (( PARALLEL == 1 )) || echo "提示：每多一路并发约多占 0.12 GiB 设备内存，arena（95 GiB 上限）放不下的部分会回退 hipMalloc" >&2
@@ -121,7 +129,7 @@ ENGINE_LOG="logs/engine-win-$(date +%Y%m%d-%H%M%S).log"
 engine=(build/gdec-win.exe "$MODEL_FILE")
 [[ -z "$OVERLAY_FILE" ]] || engine+=("$OVERLAY_FILE")
 [[ -z "$MTP_FILE" ]] || engine+=("$MTP_FILE")
-engine+=(--serve --port "$ENGINE_PORT" --maxctx "$MAX_CONTEXT")
+engine+=(--serve --host "$ENGINE_HOST" --port "$ENGINE_PORT" --maxctx "$MAX_CONTEXT")
 [[ -z "$VISION_FILE" ]] || engine+=(--vision-tower "$VISION_FILE")
 
 echo "加载模型中，日志：$ENGINE_LOG；Ctrl+C 停止。"
@@ -148,7 +156,7 @@ until grep -q 'serve: listening' "$ENGINE_LOG" 2>/dev/null; do
 done
 
 build/gdec-api-win.exe --tokenizer "$TOKENIZER_DIR" \
-  --engine "127.0.0.1:$ENGINE_PORT" --host "$API_HOST" \
+  --engine "$engine_connect_host:$ENGINE_PORT" --host "$API_HOST" \
   --port "$API_PORT" --context "$MAX_CONTEXT" >"$API_LOG" 2>&1 &
 api_pid=$!
 begin=$SECONDS

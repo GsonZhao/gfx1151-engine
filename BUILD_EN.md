@@ -37,7 +37,7 @@ Artifacts:
 | `build/gdec` | GPU engine (`src/gpu/gdec.cpp`) |
 | `build/gdec-api` | OpenAI-compatible API server (`src/api/*.cpp`) |
 | `build/tok_cli` `tpl_cli` `eng_cli` | tokenizer / template / engine protocol CLIs |
-| `build/http_selftest` `toolparse_test` `vision_test` | API component self-tests |
+| `build/http_selftest` `toolparse_test` `vision_test` `engine_host_test` | API / engine listen-address component self-tests |
 | `build/ktest` | engine kernel unit tests |
 | `build/lib` | ROCm/image runtimes and gfx1151 kernel databases from `--bundle` |
 
@@ -158,6 +158,15 @@ API first; on Windows, use `--api build/gdec-api-win.exe` instead:
 python tools/api_disconnect_test.py --api build/gdec-api
 python tools/api_disconnect_test.py --api build/gdec-api --slots 2
 ```
+
+Engine listen-address and launcher configuration regressions (no model needed):
+
+```bash
+build/engine_host_test
+python tools/engine_host_config_test.py --bash bash
+```
+
+On Windows, also pass `--launcher ./start_win.exe` to test the native launcher.
 
 ## Windows (TheRock)
 

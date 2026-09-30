@@ -25,6 +25,7 @@
 // 并提示。快速编辑模式运行期间关闭。
 // 两个子进程放在一个 Job 里：启动器无论怎样退出（包括被任务管理器结束），
 // 引擎和 API 都会随之结束，不会留下占着显存的孤儿进程。
+#include "engine_net.h"
 #include <windows.h>
 #include <shellapi.h>
 #include <cctype>
@@ -260,14 +261,15 @@ bool port_free(int port) {
     return ok;
 }
 
-// 能连上 127.0.0.1:port 说明对端已在 LISTEN。
-bool port_listening(int port) {
+// 能连上配置的 host:port 说明对端已在 LISTEN。
+bool port_listening(int port, const std::string& host = engine_net::kDefaultHost) {
     SOCKET s = socket(AF_INET, SOCK_STREAM, 0);
     if (s == INVALID_SOCKET) return false;
     sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    addr.sin_port = htons(static_cast<u_short>(port));
+    if (!engine_net::address(engine_net::connect_host(host), port, &addr)) {
+        closesocket(s);
+        return false;
+    }
     bool ok = connect(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0;
     closesocket(s);
     return ok;
@@ -516,6 +518,7 @@ void launcher_log_open() {
 struct Plan {
     std::vector<std::string> engine_args, api_args;
     std::string engine_log, api_log;
+    std::string engine_host;
     std::string api_host;
     int engine_port = 0, api_port = 0;
     int start_timeout = 0;
@@ -549,7 +552,7 @@ int run_service(DWORD* code) {
     g_children[0] = engine.proc;
 
     ULONGLONG deadline = GetTickCount64() + static_cast<ULONGLONG>(p.start_timeout) * 1000;
-    while (!port_listening(p.engine_port)) {
+    while (!port_listening(p.engine_port, p.engine_host)) {
         if (!alive(engine.proc))
             fail("引擎提前退出，查看 " + p.engine_log);
         if (GetTickCount64() > deadline)
@@ -867,6 +870,7 @@ int main(int argc, char** argv) {
     const std::string overlay_file = cfg_optional("OVERLAY_FILE", "");
     const std::string tokenizer_dir =
         cfg("TOKENIZER_DIR", model_dir + "\\tokenizer");
+    const std::string engine_host = cfg("ENGINE_HOST", engine_net::kDefaultHost);
     const int engine_port = cfg_int("ENGINE_PORT", 8730, 1, 65535);
     const std::string api_host = cfg("API_HOST", "0.0.0.0");
     const int api_port = cfg_int("API_PORT", 8731, 1, 65535);
@@ -883,6 +887,9 @@ int main(int argc, char** argv) {
     const int max_images = cfg_int("MAX_IMAGES", 8, 1, 256);
     const int start_timeout = env_int("START_TIMEOUT", 1800, 30, 86400);
 
+    sockaddr_in engine_addr{};
+    if (!engine_net::address(engine_host, engine_port, &engine_addr))
+        fail("ENGINE_HOST 必须是 IPv4 地址");
     if (engine_port == api_port) fail("ENGINE_PORT 与 API_PORT 必须不同");
     if (parallel > 1 && !kv_paged) fail("PARALLEL>1 需要 KV_PAGED=1");
     if (!file_exists("build\\gdec-win.exe")) fail("缺少 build\\gdec-win.exe");
@@ -905,8 +912,8 @@ int main(int argc, char** argv) {
     printf("模型：%s\n", model_file.c_str());
     const std::string gamma_str =
         mtp_gamma ? std::to_string(mtp_gamma) : "auto（greedy 4 / 采样自适应）";
-    printf("配置：%d 上下文，MTP gamma=%s，API %s:%d\n", max_context, gamma_str.c_str(),
-           api_host.c_str(), api_port);
+    printf("配置：%d 上下文，MTP gamma=%s，engine %s:%d，API %s:%d\n", max_context, gamma_str.c_str(),
+           engine_host.c_str(), engine_port, api_host.c_str(), api_port);
     if (kv_paged) {
         printf("KV：分页，页池 %d token（%d 路并发共享），RAM 检查点 %d 个\n",
                kv_pool_tokens > max_context ? kv_pool_tokens : max_context, parallel,
@@ -958,6 +965,7 @@ int main(int argc, char** argv) {
     g_plan.engine_log = "logs\\engine-win-" + g_stamp + ".log";
     g_plan.api_log = "logs\\api-win-" + g_stamp + ".log";
     g_plan.engine_port = engine_port;
+    g_plan.engine_host = engine_host;
     g_plan.api_port = api_port;
     g_plan.api_host = api_host;
     g_plan.start_timeout = start_timeout;
@@ -967,12 +975,12 @@ int main(int argc, char** argv) {
     if (!overlay_file.empty()) engine_args.push_back(overlay_file);
     if (!mtp_file.empty()) engine_args.push_back(mtp_file);
     engine_args.insert(engine_args.end(),
-                       {"--serve", "--port", std::to_string(engine_port),
+                       {"--serve", "--host", engine_host, "--port", std::to_string(engine_port),
                         "--maxctx", std::to_string(max_context)});
     if (!vision_file.empty()) engine_args.insert(engine_args.end(),
                                                  {"--vision-tower", vision_file});
     g_plan.api_args = {"--tokenizer", tokenizer_dir, "--engine",
-                       "127.0.0.1:" + std::to_string(engine_port), "--host", api_host,
+                       engine_net::connect_host(engine_host) + ":" + std::to_string(engine_port), "--host", api_host,
                        "--port", std::to_string(api_port), "--context",
                        std::to_string(max_context)};
 

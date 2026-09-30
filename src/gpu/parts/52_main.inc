@@ -70,8 +70,9 @@ int main(int argc, char** argv) {
             "[--kld-chunks N] [--kld-save OUT]   (llama.cpp KLD file)\n"
             "       gdec <base.hgn> [overlay.hgn ...] --tokens-file IDS --kld-save OUT "
             "[--kld-ctx 512] [--kld-chunks N]\n"
-            "       gdec <base.hgn> [overlay.hgn ...] --serve [--port N] [--maxctx N] "
+            "       gdec <base.hgn> [overlay.hgn ...] --serve [--host IPv4] [--port N] [--maxctx N] "
             "[--no-ple]\n"
+            "       Serve defaults: --host 127.0.0.1 --port 8730 (IPv4)\n"
             "       M-RoPE: [--mrope-grid t,h,w ...] with --tokens; "
             "--mrope-test K dumps rope tables/decode positions without weights "
             "(GDEC_MROPE_DUMP=<file>)\n"
@@ -90,6 +91,7 @@ int main(int argc, char** argv) {
   bool ppl_window_set = false, ppl_stride_set = false;
   bool serve_mode = false, maxctx_set = false;
   int port = 8730, mtp_test = 0, spec_gen = 0, gamma = 7;
+  std::string engine_host = engine_net::kDefaultHost;
   int ppl_window = 0, ppl_stride = 0;
   kld::Opts kld_opts;  // --kld-*: KL divergence vs a llama.cpp logits file
   // M-RoPE: per-image grid triples (repeatable), rope-only test mode.
@@ -147,7 +149,13 @@ int main(int argc, char** argv) {
       show_top = true;
     else if (a == "--serve")
       serve_mode = true;
-    else if (a == "--port")
+    else if (a == "--host") {
+      if (argi + 1 >= argc || argv[argi + 1][0] == '-') {
+        fprintf(stderr, "--host requires an IPv4 address\n");
+        return 2;
+      }
+      engine_host = next();
+    } else if (a == "--port")
       port = atoi(next());
     else if (a == "--maxctx") {
       maxctx = atoi(next());
@@ -178,6 +186,14 @@ int main(int argc, char** argv) {
       vision_test = next();
     else if (a == "--patches")
       vision_patches = next();
+  }
+  if (serve_mode) {
+    sockaddr_in listen_addr{};
+    if (!engine_net::address(engine_host, port, &listen_addr)) {
+      fprintf(stderr, "invalid engine listen address %s:%d (expected IPv4)\n",
+              engine_host.c_str(), port);
+      return 2;
+    }
   }
   if (ppl && (serve_mode || !vision_test.empty() || mtp_test > 0 || spec_gen > 0 ||
               !mrope_grids.empty() || dump || !splits.empty())) {
@@ -361,7 +377,7 @@ int main(int argc, char** argv) {
         for (const auto& mp : g_gguf_mtp->mappings()) kvsnap::g_model_files.push_back(mp.path);
     }
     kvsnap::g_vision_file = vision_tower;
-    return serve::run(m, port);
+    return serve::run(m, engine_host, port);
   }
   if (!kld_mode && tokens.size() < (ppl ? 2u : 1u)) {
     fprintf(stderr, ppl ? "--ppl needs at least two tokens\n" : "need --tokens\n");

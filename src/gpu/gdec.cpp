@@ -141,6 +141,7 @@
 #include "../hgn.h"
 #include "../gguf.h"
 #include "../gguf_map.h"
+#include "../engine_net.h"
 
 #include "parts/00_platform.inc"
 #include "parts/05_config.inc"

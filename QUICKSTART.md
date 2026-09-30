@@ -94,6 +94,12 @@ bash build.sh test           # 编译并运行 kernel 单测,不加载模型
 监听 `0.0.0.0:8731`,可从局域网访问;只需本机访问时改为
 `API_HOST="127.0.0.1"`。
 
+引擎内部端口默认只监听 `127.0.0.1:8730`，不接受外机直连；监听 IPv4 地址
+由 `ENGINE_HOST` 配置，端口由 `ENGINE_PORT` 配置。通常只对外开放 API 即可。
+仅确需直接连接引擎时，才显式将 `ENGINE_HOST` 改为本机网卡 IP 或 `0.0.0.0`
+（会允许外机直连，需自行限制网络访问）。直接运行引擎时使用
+`--serve --host 127.0.0.1 --port 8730`；省略 `--host` 也只监听本机。
+
 运行时内存可通过 `curl http://127.0.0.1:8731/memory` 查询。返回值区分
 HIP 设备分配、`mmap + hipHostRegister` 的专家权重、pinned host 内存和
 进程 RSS；`gpu_accessible_committed_bytes` 是引擎自身可准确记账的合计，
