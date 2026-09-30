@@ -93,7 +93,7 @@ elif start par4 "$NEW_BIN" 4 ""; then
 else note "4 路" "FAIL（引擎启动失败）"; fi
 
 if ! want ovf; then :
-elif start ovf2 "$NEW_BIN" 2 16384 GDEC_RCKPT_MAX=0; then
+elif start ovf2 "$NEW_BIN" 2 16384 GDEC_RCKPT_MAX=0 GDEC_KV_RESERVE_DECODE=256; then
   if python3 tools/conc_verify.py ovf; then
     if grep -q 'aborting the later request' "$PROBE_LOG"; then note "池溢出中断后来者" PASS
     else note "池溢出中断后来者" "FAIL（日志里没有 aborting the later request）"; fi

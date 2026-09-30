@@ -1,4 +1,9 @@
 // ---------------- config (matches ref.cpp / config.json) --------------------
+#include "../../rope.h"
+
+__device__ double g_rope_tab[64];
+__device__ float g_rope_mscale;
+
 struct Cfg {
   int d = 2560;
   int layers = 48;
@@ -13,6 +18,7 @@ struct Cfg {
   int experts = 512, topk = 10, moe_mid = 640;
   float norm_eps = 1e-6f;
   double rope_theta = 1e7;
+  RopeConfig rope;
   int vocab = 248320;
 };
 static Cfg g_cfg;

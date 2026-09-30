@@ -1290,12 +1290,14 @@ __global__ void k_rope(float* __restrict__ vec, int nheads, int dh, int rotary,
   int half = rotary / 2;
   if (idx >= nheads * half) return;
   int h = idx / half, i = idx % half;
-  double ang = pos * pow(theta, -2.0 * i / rotary);
+  double ang = pos * g_rope_tab[i];
   float cs = (float)cos(ang), sn = (float)sin(ang);
+  if (g_rope_mscale != 1.f) cs *= g_rope_mscale, sn *= g_rope_mscale;
   float* p = vec + h * dh;
   float x0 = p[i], x1 = p[i + half];
   p[i] = x0 * cs - x1 * sn;
   p[i + half] = x0 * sn + x1 * cs;
+  (void)theta;
 }
 
 // --- QSA attention step: one block per q head, threads over positions.
