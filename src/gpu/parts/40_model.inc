@@ -3877,20 +3877,45 @@ struct GpuModel {
                     bool quiet = false) {
     int N = (int)tokens.size();
     int id = -1;
+    PleWinPrefetch* chunk_prefetch = nullptr;
+#ifdef _WIN32
+    std::unique_ptr<PleWinPrefetch> prefetch;
+    if (ple_on && N > maxbatch_cap && base >= 0 && N <= maxctx - base &&
+        !env_zero("GDEC_PLE_PREFETCH") && !getenv("GDEC_PLE_NOSORT") &&
+        ple_uring_ready()) {
+      ple_prefetch::Hash hash;
+      std::copy_n(ple_mult, 3, hash.mult.begin());
+      std::copy_n(ple_vsz, 16, hash.sizes.begin());
+      std::copy_n(ple_voff, 16, hash.offsets.begin());
+      hash.pad = pad_id;
+      hash.table = (uint64_t)(uintptr_t)ple_table->data;
+      hash.row_bytes = g_ple_rb;
+      prefetch = std::make_unique<PleWinPrefetch>();
+      if (!prefetch->setup(maxbatch_cap, chist, tokens, hash)) {
+        fprintf(stderr, "ple_prefetch: IOCP setup failed; using chunk-local reads\n");
+        prefetch.reset();
+      }
+    }
+    chunk_prefetch = prefetch.get();
+#endif
     for (int off = 0; off < N;) {
       int rem = N - off;
-      int n = std::min(maxbatch, rem);
       // Absorb a small tail into this chunk instead of running a tiny final
       // chunk whose per-chunk fixed cost (~0.9 s) dwarfs its token count.
-      if (rem > maxbatch && rem <= maxbatch_cap) n = rem;
+      int n = ple_prefetch::chunk_size(rem, maxbatch, maxbatch_cap);
       // D1b: while the GPU is lent mid-chunk, only light rounds may start;
       // a heavy chunk requeues behind the owner and retries.
       while (n > conc_rmax_ && borrow_skip_fn &&
              g_borrow_light.load(std::memory_order_acquire))
         borrow_skip_fn(*this);
+#ifdef _WIN32
+      if (prefetch)
+        prefetch->select(off, n, ple_prefetch::chunk_size(rem - n, maxbatch,
+                                                        maxbatch_cap));
+#endif
       id = prefill_chunk(
           std::vector<int>(tokens.begin() + off, tokens.begin() + off + n),
-          base + off, final, quiet);
+          base + off, final, quiet, chunk_prefetch);
       if (mtp_tap_capture) {
         // Ingest this chunk's taps (chunk-local rows in d_mtap) into the MTP
         // layer before the next chunk overwrites them. MTP position i takes
@@ -3912,7 +3937,7 @@ struct GpuModel {
   }
 
   int prefill_chunk(const std::vector<int>& tokens, int base = 0, bool final = true,
-                    bool quiet = false) {
+                    bool quiet = false, PleWinPrefetch* prefetch = nullptr) {
     int P = (int)tokens.size();
     if (P < 1 || base + P > maxctx || base < 0 || P > maxbatch_cap) {
       fprintf(stderr, "prefill_chunk: base=%d P=%d out of range "
@@ -3947,6 +3972,7 @@ struct GpuModel {
     std::atomic<int> ple_workers{0};
     int ple_base0 = 0;
     uint8_t* ple_fp8 = nullptr;
+    uint8_t* ple_input_dev = ple_eb_dev;
     // two-phase PLE gather state (must outlive the async workers — every
     // variable the pool lambdas capture by reference lives at this scope;
     // declaring aliases/sizes inside the gather block is
@@ -3963,6 +3989,12 @@ struct GpuModel {
       constexpr int nt = 16;
       ple_workers.store(nt);
       ple_pool.reserve(nt);
+#ifdef _WIN32
+      if (prefetch) {
+        prefetch->start_current();
+        ple_input_dev = prefetch->buffers[prefetch->slot].device;
+      } else
+#endif
       if (!getenv("GDEC_PLE_NOSORT")) {
         ple_barrier.store(0, std::memory_order_relaxed);
         if (ple_uring_ready()) {
@@ -4093,6 +4125,13 @@ struct GpuModel {
     phase("embed+L0", TP);
     if (ple_on) {
       auto wait_start = std::chrono::steady_clock::now();
+#ifdef _WIN32
+      if (prefetch) {
+        auto timing = prefetch->wait();
+        ple_start = timing.start;
+        ple_done = timing.done;
+      } else
+#endif
       for (auto& th : ple_pool) th.join();
       auto wait_done = std::chrono::steady_clock::now();
       if (prof) {
@@ -4105,12 +4144,15 @@ struct GpuModel {
       if (ple_iq4) {
         size_t nb = (size_t)P * 2560 / 32;
         k_ple_iq4nl_dequant<<<(unsigned)((nb + 255) / 256), 256, 0, g_str>>>(
-            ple_eb_dev, d_eb, nb);
+            ple_input_dev, d_eb, nb);
       } else {
         size_t n16 = (size_t)P * 2560 / 16;
         k_ple_fp8_dequant<<<(unsigned)((n16 + 255) / 256), 256, 0, g_str>>>(
-            ple_eb_dev, d_eb, ple_tscale, n16);
+            ple_input_dev, d_eb, ple_tscale, n16);
       }
+#ifdef _WIN32
+      if (prefetch) prefetch->mark_consumed(g_str);
+#endif
       float* hc_storage = d_Rb;
       if (gr_bf16) {
         uint64_t n = (uint64_t)P * 10240;
@@ -4130,6 +4172,9 @@ struct GpuModel {
       }
     }
     phase("ple", TP);
+#ifdef _WIN32
+    if (prefetch) prefetch->start_next();
+#endif
     if (ws_ok_) CK(hipEventRecord(conc_ev_a_, g_str));  // D1b quantum clock
     for (int l = 1; l < g_cfg.layers; l++) {
       bool fuse_prev = gr_scatter_norm && l > 1;

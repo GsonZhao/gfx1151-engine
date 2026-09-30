@@ -179,11 +179,25 @@ struct PleWin {
   HANDLE fh = INVALID_HANDLE_VALUE;
   HANDLE iocp = nullptr;
   static constexpr size_t DEPTH = 512;
+  std::string path;
+
+  PleWin() = default;
+  PleWin(const PleWin&) = delete;
+  PleWin& operator=(const PleWin&) = delete;
+  ~PleWin() { close(); }
+
+  void close() {
+    if (fh != INVALID_HANDLE_VALUE) CloseHandle(fh);
+    if (iocp) CloseHandle(iocp);
+    fh = INVALID_HANDLE_VALUE;
+    iocp = nullptr;
+  }
 
   bool ok() const { return iocp != nullptr && g_ple_off_ok; }
 
-  bool setup(const char* path) {
-    fh = CreateFileA(path, GENERIC_READ,
+  bool setup(const char* filename) {
+    close();
+    fh = CreateFileA(filename, GENERIC_READ,
                      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                      nullptr, OPEN_EXISTING,
                      FILE_FLAG_OVERLAPPED | FILE_FLAG_RANDOM_ACCESS, nullptr);
@@ -194,6 +208,7 @@ struct PleWin {
       fh = INVALID_HANDLE_VALUE;
       return false;
     }
+    path = filename;
     return true;
   }
 
@@ -254,7 +269,79 @@ static void ple_uring_open(const char* path) {
 static bool ple_uring_ready() { return g_ple_win.ok(); }
 #define PLE_PUMP g_ple_win
 
+struct PleWinPrefetch {
+  struct Buffer {
+    uint8_t* host = nullptr;
+    uint8_t* device = nullptr;
+    hipEvent_t consumed = nullptr;
+    bool used = false;
+  };
+  PleWin reader;
+  std::array<Buffer, 2> buffers;
+  std::unique_ptr<ple_prefetch::Queue> queue;
+  size_t slot = 0;
+  int offset = 0, count = 0, next_count = 0;
+
+  ~PleWinPrefetch() {
+    queue.reset();
+    for (auto& buffer : buffers) {
+      if (buffer.used) CK(hipEventSynchronize(buffer.consumed));
+      if (buffer.consumed) CK(hipEventDestroy(buffer.consumed));
+      if (buffer.host) CK(hipHostFree(buffer.host));
+    }
+  }
+
+  bool setup(int capacity, const std::vector<int64_t>& history,
+             const std::vector<int>& tokens, ple_prefetch::Hash hash) {
+    if (!reader.setup(g_ple_win.path.c_str())) return false;
+    for (auto& buffer : buffers) {
+      CK(hipHostMalloc((void**)&buffer.host,
+                       (size_t)capacity * 16 * hash.row_bytes,
+                       hipHostMallocDefault));
+      CK(hipHostGetDevicePointer((void**)&buffer.device, buffer.host, 0));
+      CK(hipEventCreateWithFlags(&buffer.consumed, hipEventDisableTiming));
+    }
+    queue = std::make_unique<ple_prefetch::Queue>(
+        history, tokens, hash,
+        std::array<uint8_t*, 2>{buffers[0].host, buffers[1].host},
+        [this, hash](const uint64_t* addrs, uint8_t* staging, size_t rows) {
+          reader.run(addrs, staging, hash.table, rows);
+        },
+        [this](size_t buffer_index) {
+          Buffer& buffer = buffers[buffer_index];
+          if (buffer.used) CK(hipEventSynchronize(buffer.consumed));
+        });
+    fprintf(stderr, "ple_prefetch: enabled (2 x %.1f MiB pinned staging)\n",
+            (double)capacity * 16 * hash.row_bytes / (1024 * 1024));
+    return true;
+  }
+
+  void select(int chunk_offset, int chunk_count, int following_count) {
+    if (chunk_offset != 0) slot = 1 - slot;
+    offset = chunk_offset;
+    count = chunk_count;
+    next_count = following_count;
+  }
+
+  void start_current() {
+    if (!queue->pending(slot)) queue->start(slot, offset, count);
+  }
+
+  ple_prefetch::Queue::Timing wait() { return queue->wait(slot, offset, count); }
+
+  void mark_consumed(hipStream_t stream) {
+    CK(hipEventRecord(buffers[slot].consumed, stream));
+    buffers[slot].used = true;
+  }
+
+  void start_next() {
+    if (next_count > 0) queue->start(1 - slot, offset + count, next_count);
+  }
+};
+
 #endif  // _WIN32
+
+struct PleWinPrefetch;
 
 constexpr int INDEX_BUDGET = 512;
 constexpr int INDEX_BATCH = 1024;

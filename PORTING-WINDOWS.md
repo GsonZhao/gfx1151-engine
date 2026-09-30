@@ -72,7 +72,17 @@ OpenAI 接口）。Git Bash 下 `start_win.sh` 与 Linux `start.sh` 并列。
   （rocblas 17M + hipblaslt 13M，全架构则是 703M+530M），`build_win.sh`
   幂等固化；拷完 build/ 自包含，TheRock 可删（已做改名断根实测）。
 - **PLE 留盘按需读**：io_uring → IOCP（PleWin，DEPTH=512，自由槽队列），
-  prefill 批量读走 `PLE_PUMP` 宏，两平台主体代码同形。
+  chunk-local 批量读走 `PLE_PUMP` 宏。Windows 多 chunk prefill 默认使用
+  独立 IOCP + pinned 双缓冲，当前 chunk 层计算期间预取下一 chunk；
+  `GDEC_PLE_PREFETCH=0` 回退。首 chunk 读盘和 PLE GPU 计算不能隐藏。
+  预取队列/缓冲是调用局部对象，取消时先收完 I/O，再等待 GPU 消费 event
+  后释放，不与其它请求的 decode 或小 workspace 共享 completion 队列。
+  正确性回归可用主机编译器编译运行 `tools/ple_prefetch_test.cpp`（C++17，
+  Linux 加 `-pthread`）；覆盖 FP8/IQ4 原始行、前缀/pad、尾块、异步重叠、
+  缓冲复用及取消/异常清理。真实模型 A/B 须关闭 KV 快照复用，保持相同的
+  token 文件和生产 kernel 环境，分别用 `GDEC_PLE_PREFETCH=0/1` 运行；
+  `GDEC_PROF` 的 `ple_host/ple_wait` 是累计值，取相邻 chunk 差值比较，
+  `phase ple` 还包括 PLE GPU 运算，不应当全部记为读盘等待。
 - **socket/serve**：WinSock2 shim（`sock_*`/`os_*`），协议零改动。
 - **API 前端**（`src/api` → `gdec-api-win.exe`）：http.cpp / engine_client.cpp
   的 socket 层走同一套 `os_win32.h` shim（`sock_t` 类型、WSAPoll、

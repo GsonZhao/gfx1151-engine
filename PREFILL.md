@@ -163,6 +163,17 @@ kernel 链演进（头注释 gdec.cpp:6-15）：
   Windows：IOCP overlapped ReadFile（`PleWin` gdec.cpp:388-455，QD=512，
   NVMe 随机读；热行走缓存）。失败即 fatal，不做半途回退。
 
+  Windows 多 chunk prefill 默认启用下一 chunk 预取：当前 chunk 的 PLE
+  staging 交给 GPU 解量化后，独立文件句柄和 IOCP 读取下一 chunk，与当前
+  L1–L47 的计算重叠。地址来自调用内不可变的 token 历史快照，不提前推进
+  `chist`；每次调用独立拥有两份 pinned raw staging，GPU event 保证解量化
+  读取完成后才复用或释放。FP8 8192 行/份时额外约 40 MiB（tail slack 另计），
+  GGUF IQ4_NL 的 90 B 行也走同一预取路径。
+
+  首 chunk 仍须读盘；单 chunk、PLE 关闭、IOCP 未就绪或设置
+  `GDEC_PLE_NOSORT` 时保留原路径。`GDEC_PLE_PREFETCH=0` 可回退做 A/B。
+  Linux 的调度不变，不能把 Linux 热态的低等待归因于跨 chunk 预取。
+
 ## 8. 量化格式在 prefill 中的参与
 
 - **Q4C-P**（4-bit codebook，16 项 + 每 32 列 fp16 group scale；主力权重
@@ -192,6 +203,7 @@ kernel 链演进（头注释 gdec.cpp:6-15）：
 | `GDEC_GDN_LOOP=1` / `GDEC_GDN_NOSPLIT=1` / `GDEC_GDN_NOSTRIP=1` | GDN 三级回退 |
 | `GDEC_PLE_LOOP=1` | PLE 回退逐 token |
 | `GDEC_PLE_URING=1` | 启用 io_uring PLE 聚集（Linux；service.conf `PLE_URING=1` 默认开，引擎只查变量存在性） |
+| `GDEC_PLE_PREFETCH=0` | 关闭 Windows 多 chunk PLE 双缓冲预取；默认开，单 chunk/推测验证小批次保持原路径 |
 | `GDEC_MOE_NAIVE=1` / `GDEC_MOE_LT=1` / `GDEC_MOE_LT_BF16=1` | MoE：分组 GEMV 回退 / per-expert hipBLASLt / Lt 输出也 bf16 |
 | `GDEC_MOE_HOST_ROUTE=1` / `GDEC_MOE_UNTILED=1` | MoE 路由/切分回退 |
 | `GDEC_MOE_FP32_IO=1` | MoE 激活回退 fp32 staging |
