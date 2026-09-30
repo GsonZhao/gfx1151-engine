@@ -69,7 +69,10 @@ for f in "$TR/bin/rocblas/library/"*"$GPU_ARCH"*; do
   [[ -f "build/rocblas/library/$b" ]] || cp "$f" build/rocblas/library/
 done
 
+# _CRT_NONSTDC_NO_DEPRECATE：屏蔽 MSVC 头文件对 strdup 等 POSIX 名的
+# deprecated 标记（_CRT_NONSTDC_DEPRECATE → __declspec(deprecated)）。
 FLAGS=(-O3 -std=c++17 --offload-arch="$GPU_ARCH" -D_CRT_SECURE_NO_WARNINGS
+       -D_CRT_NONSTDC_NO_DEPRECATE
        -I"$TR/include" -Lbuild/winlibs -lrocblas -lhipblaslt)
 
 case "$TARGET" in
