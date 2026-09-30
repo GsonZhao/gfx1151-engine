@@ -5,7 +5,8 @@
 #   ./tools/pp_win.sh 128k my128     # 128K，自定义日志名
 # 长度支持 2k / 32k / 128k（也可写 2048 / 32768 / 131072），
 # 自动匹配 data/qsa-oracle/<N>.tokens 并计算 maxctx（长度 + 8K 余量）。
-# 输出全部进日志，跑完自动打印 prefill 行。终端无洪水。
+# 输出全部进日志，跑完自动汇总（预热/首块/稳态分开）。终端无洪水。
+# 开关：PP_NOWARMUP=1 跳过引擎预热；PP_PHASE=1 开启同步 profiling（诊断用）。
 set -u
 
 if [[ $# -lt 1 || "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
@@ -35,20 +36,50 @@ MAXCTX=$((LEN + 8192))
 
 # chunk 大小与下方 GDEC_PREFILL_CHUNK 保持一致；NCHUNK 是真实 chunk 数
 # （向上取整，tail slack 的余量并入上一个 chunk，不单独成行）。
-# warmup 的 dummy chunk 也会打印一行 prefill，最后只取末尾 NCHUNK 行，
-# 冷启动的那行就不会混进结果。
+# 引擎默认先用全零 dummy 跑一轮预热（52_main.inc:460），打印一行 prefill。
+# 注意：GDEC_NOWARMUP / GDEC_PHASE 引擎判断的是变量“是否存在”，设 0 也生效，
+# 所以这里必须显式 unset，并从脚本自己的开关重新导出。
 CHUNK=8192
 NCHUNK=$(( (LEN + CHUNK - 1) / CHUNK ))
 
+unset GDEC_NOWARMUP GDEC_PHASE
+EXTRA_ENV=()
+if [[ "${PP_NOWARMUP:-}" == "1" ]]; then
+    EXTRA_ENV+=(GDEC_NOWARMUP=1); WARMUP="关（PP_NOWARMUP=1）"
+else
+    WARMUP="开（全零 dummy 一轮，不含真实 PLE 行）"
+fi
+if [[ "${PP_PHASE:-}" == "1" ]]; then
+    EXTRA_ENV+=(GDEC_PHASE=1); PHASE="开（同步 profiling，会打乱流水重叠，仅诊断用）"
+else
+    PHASE="关"
+fi
+echo "预热: $WARMUP | GDEC_PHASE: $PHASE"
+
 LOG="$ROOT/logs/${LABEL}.log"
-env GDEC_QSA_KV_BF16=1 GDEC_QSA_WMMA=1 GDEC_QSA_WMMA_BTV=1 \
+env "${EXTRA_ENV[@]}" \
+    GDEC_QSA_KV_BF16=1 GDEC_QSA_WMMA=1 GDEC_QSA_WMMA_BTV=1 \
     GDEC_MOE_LT=1 GDEC_MOE_LT_BF16=1 GDEC_GR_BF16=1 \
     GDEC_GDN_STREAM=1 GDEC_GDN_WAVE=1 \
     GDEC_PREFILL_CHUNK=$CHUNK GDEC_GEMM_WMMA=1 GDEC_GDN_FUSED=1 \
     GDEC_INDEX_FUSED2=1 GDEC_PP_MOE_OUT=1 GDEC_INDEX_STREAM_SELECT=1 \
-    GDEC_KVSNAP=1 GDEC_KVSNAP_MAX_GB=20 GDEC_PROF=1 GDEC_PHASE=1 \
+    GDEC_KVSNAP=1 GDEC_KVSNAP_MAX_GB=20 GDEC_PROF=1 \
     build/gdec-win models/qwen38-flash-next-w4b.hgn models/qwen38-flash-next-w4b.overlay.hgn \
     --tokens-file "$TOK" --gen 1 --maxctx "$MAXCTX" >"$LOG" 2>&1
 rc=$?
 echo "rc=$rc 日志: $LOG"
-grep -E 'prefill: ' "$LOG" | tail -n "$NCHUNK"
+
+# 汇总：区分预热行 / 首块（冷 PLE，ple_wait 集中在这一块）/ 稳态块
+grep -E 'prefill: [0-9]+ tokens in' "$LOG" | \
+    sed -E 's/.*in ([0-9.]+) s = ([0-9.]+) tok\/s/\1 \2/' | \
+    awk -v warm="$WARMUP" -v nchunk="$NCHUNK" '{
+        t[NR]=$1; v[NR]=$2
+    } END {
+        i = 1
+        if (NR == nchunk + 1) { printf "预热(dummy): %.1f tok/s\n", v[1]; i = 2 }
+        else if (NR != nchunk) { printf "(行数 %d != 预期 %d，全量列出)\n", NR, nchunk }
+        printf "chunk 1 (冷): %.1f tok/s (%.2f s)\n", v[i], t[i]
+        n = 0; s = 0; mn = 1e9; mx = 0
+        for (j = i + 1; j <= NR; j++) { s += v[j]; n++; if (v[j]<mn) mn=v[j]; if (v[j]>mx) mx=v[j] }
+        if (n > 0) printf "chunk 2+ 稳态: avg %.1f tok/s (min %.1f / max %.1f, n=%d)\n", s/n, mn, mx, n
+    }'
