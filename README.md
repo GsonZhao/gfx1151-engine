@@ -64,8 +64,9 @@
 - **独立 8-bit MTP 草稿权重** sidecar,接受率高于内置 4-bit 草稿头。
 - **视觉**:支持图像输入(OpenAI `image_url`),KV 复用跨轮生效。
 - **OpenAI 兼容 API**:流式、工具调用、`/v1/chat/completions`。
-- **256K 上下文**,分页 KV 页池 + 两级 prompt 缓存:消息边界的内存检查点
-  (编辑重发秒回) + KV 快照跨重启恢复。
+- **原生 256K / YaRN 512K 上下文**,默认保留原生 RoPE,按需开启 YaRN;
+  分页 KV 页池 + 两级 prompt 缓存:消息边界的内存检查点(编辑重发秒回)
+  + KV 快照跨重启恢复。配置与共享池语义见下方「YaRN 与共享 KV 池配置」。
 - **并发请求**:多条请求共享同一个分页 KV 页池(默认 4 路、总共 256K,
   类似 llama.cpp 的共享上下文),GPU 按请求轮转,每条输出与单独运行逐位
   一致;长 prompt prefill 分段让出 GPU,其它会话最长卡顿约 0.6 s。配置与
@@ -109,6 +110,165 @@ python3 tools/flashnext2hgn.py /path/to/hf-model --out ./models --imatrix /path/
 `start.sh`;32 核约 1.5 小时,磁盘约 125 GiB,只依赖 numpy。`--classic` 为旧的无数据转换器
 (输出与以前逐字节相同)。高质量转换见 [HGN-HQ.md](HGN-HQ.md),格式与旧转换器见
 [CONVERT.md](CONVERT.md)。
+
+## YaRN 与共享 KV 池配置
+
+**先分清三个独立概念:单条请求的上下文上限、整个服务的 KV 池容量、RoPE 缩放。**
+本节 `K` 按 1024 token 计:256K = 262144,512K = 524288。上下文包含输入与
+生成输出,并包括模板、历史消息和图像对应的 token,不只是用户最后一条消息。
+
+### 原生与 YaRN 的区别
+
+| | 原生 RoPE | YaRN factor 2 |
+| --- | --- | --- |
+| 定位 | 模型原生 256K 范围,默认模式 | 将单条上下文扩展到 512K 的推理配置 |
+| 位置编码 | `ROPE_FACTOR=1`,保持原生频率与默认幅度 | 调整 RoPE 频率,并对主注意力 Q/K 应用幅度缩放 |
+| 单条上限 | 配置 `MAX_CONTEXT=262144` | 配置 `MAX_CONTEXT=524288` |
+| 短文本行为 | 作为默认基线 | 静态 YaRN 在短文本上也生效,输出分布可能改变 |
+| KV 存储 | 由 KV 类型和池容量决定 | 不压缩 KV,不自动扩大共享池 |
+
+`factor` 是位置编码的扩展倍率,不是并发数、KV 压缩率或自动分配的容量。
+只改 `MAX_CONTEXT` 不会自动开启 YaRN,只改 `ROPE_FACTOR` 也不会自动改上下文上限。
+只需要更多原生短/中上下文并发时,扩大共享池即可,不必开启 YaRN。
+
+RoPE 配置是**实例级**的:factor 2 下所有请求都使用 YaRN,不是超过 256K 才临时
+切换;同一实例不能让一条请求用原生、另一条用 YaRN。每条序列仍有独立位置,
+两条 200K 请求不会拼成一条 400K 序列。短文本优先保持原生;需要同时提供两种
+模式时,使用独立实例(检查内存和端口)或停服后切换配置。
+
+### service.conf 参数
+
+编辑已有配置行,不要在文件末尾重复追加。保留 `${变量:-默认值}` 写法时,同名
+环境变量优先;修改文件后需要重启引擎和 API 才生效。
+
+| 参数 | 默认值 | 含义 |
+| --- | --- | --- |
+| `MAX_CONTEXT` | `262144` | 每条请求的输入 + 输出上限,不是所有并发请求的合计 |
+| `ROPE_FACTOR` | `1` | `1` 为原生;512K 配 `2`,必须同时改 `MAX_CONTEXT` |
+| `ROPE_ORIGINAL_CTX` | `262144` | 模型原生长度;开 YaRN 后仍保持此值,不要改成 `524288` |
+| `ROPE_BETA_FAST` / `ROPE_BETA_SLOW` | `32` / `1` | 频率混合边界,通常不改;引擎要求 `beta_fast >= beta_slow > 0` |
+| `ROPE_ATTN_SCALE` | `0` | `0` 自动取幅度系数:原生为 1,YaRN 为 `1 + 0.1 * ln(factor)`;factor 2 约 1.0693,正值表示手工覆盖 |
+| `KV_PAGED` | `1` | 分页共享池;`PARALLEL>1` 必须开启,并使用支持分页的 kernel 组合 |
+| `KV_POOL_TOKENS` | `0` | 全部槽位共享的物理页池容量,以 token 为单位;`0` 跟随 `MAX_CONTEXT`,小于它也按它算,向上取整到 256 token/页 |
+| `PARALLEL` | `4` | 并发槽位数,范围 1–8;不自动乘大池容量,也不把单条上限等分 |
+| `GDEC_KV_RESERVE_DECODE` | `4096` | 引擎环境变量,控制准入时最多预约多少 decode token;不是输出上限,有效值为 0–2147483647 |
+
+脚本启动器把 `ROPE_*` 导出为同名的 `GDEC_ROPE_*`,让引擎和 API 使用相同设置。
+直接运行引擎时可用 `--rope-factor`、`--rope-original-ctx`、`--rope-beta-fast`、
+`--rope-beta-slow`、`--rope-attn-scale`;直接运行 API 则使用 `GDEC_ROPE_*`。
+手工启动要确保两侧配置一致;只改 API 的 `/health` 元数据不会改变引擎的 RoPE。
+
+### 两种 512K 配置
+
+| 使用模式 | `MAX_CONTEXT` | `KV_POOL_TOKENS` | `ROPE_FACTOR` | `PARALLEL` 示例 |
+| --- | --- | --- | --- | --- |
+| 默认原生 256K 池 | `262144` | `0` | `1` | `4` |
+| 原生 256K 单条,512K 总池 | `262144` | `524288` | `1` | `2` |
+| YaRN 512K 单条,512K 总池,单并发 | `524288` | `0` 或 `524288` | `2` | `1` |
+| YaRN 512K 单条,512K 总池,多并发 | `524288` | `0` 或 `524288` | `2` | `2` |
+
+**模式 A:保持原生,只是扩大共享池。** 两条序列动态共享 512K,每条仍不得超过
+256K,不是让单条请求获得 512K。替换 `service.conf` 中对应行:
+
+```bash
+MAX_CONTEXT="${MAX_CONTEXT:-262144}"
+KV_POOL_TOKENS="${KV_POOL_TOKENS:-524288}"
+ROPE_FACTOR="${ROPE_FACTOR:-1}"
+KV_PAGED="${KV_PAGED:-1}"
+PARALLEL="${PARALLEL:-2}"
+```
+
+**模式 B:YaRN 扩展单条到 512K。** 池仍总共 512K;下面开启两槽共享,若希望长请求
+单路运行,把 `PARALLEL` 改为 `1`。替换对应行:
+
+```bash
+MAX_CONTEXT="${MAX_CONTEXT:-524288}"
+KV_POOL_TOKENS="${KV_POOL_TOKENS:-0}"
+ROPE_FACTOR="${ROPE_FACTOR:-2}"
+ROPE_ORIGINAL_CTX="${ROPE_ORIGINAL_CTX:-262144}"
+ROPE_BETA_FAST="${ROPE_BETA_FAST:-32}"
+ROPE_BETA_SLOW="${ROPE_BETA_SLOW:-1}"
+ROPE_ATTN_SCALE="${ROPE_ATTN_SCALE:-0}"
+KV_PAGED="${KV_PAGED:-1}"
+PARALLEL="${PARALLEL:-2}"
+```
+
+不改文件也可临时覆盖,先检查再启动(去掉 `--check`):
+
+```bash
+MAX_CONTEXT=524288 KV_POOL_TOKENS=0 KV_PAGED=1 PARALLEL=2 \
+ROPE_FACTOR=2 ROPE_ORIGINAL_CTX=262144 ROPE_BETA_FAST=32 \
+ROPE_BETA_SLOW=1 ROPE_ATTN_SCALE=0 bash start_hgn.sh --check
+```
+
+Linux GGUF 使用相同变量,换成 `start_gguf.sh`;已完成的 512K 实机验收使用 Linux
+hgn + BF16 分页 KV + WMMA + BTV,不代表所有权重/kernel/平台组合都已验证。
+Windows 的 `start_win.sh` 已传递这些 YaRN 参数,但 Windows 512K 尚未实测验收。
+**当前原生 `start_win.exe` 尚未将 `service.conf` 的 `ROPE_*` 转为
+`GDEC_ROPE_*`**,不要只改配置文件就认为双击启动器启用了 YaRN;高级手工启动需
+为引擎和 API 同时设置 `GDEC_ROPE_*`,并另行验证 Windows 的 arena/显存容量。
+
+### 并发怎样占用共享池
+
+`PARALLEL` 只规定同时活跃的槽位数。池大小在启动时预分配,不会随并发数自动增长,
+也不是每槽固定分到 `池容量 / PARALLEL`。一个槽可以用到单条上限,其他槽用剩余
+页;槽位用满时请求排队,槽位可用但 KV 预算不足时,多并发准入门禁会拒绝后来者。
+GPU 在安全调度点轮转,并发数翻倍不意味着吞吐翻倍,请求延迟也可能增加。
+
+例如 `MAX_CONTEXT=524288, KV_POOL_TOKENS=0, PARALLEL=2, ROPE_FACTOR=2`:
+
+| 请求情况 | 结果 |
+| --- | --- |
+| 单条接近 512K(输入 + 输出),另一槽空闲 | 可以使用整池,不会因两槽而把单条上限减半 |
+| 两条各约 200K prompt | 加上 decode 预约后仍能放下时,都可准入 |
+| 两条各约 300K prompt | 合计超过 512K,后来者在下一安全调度边界被拒,不会完整 prefill 后才发现 |
+| 准入时够用,decode 后来增长超出预约 | 仍可能池耗尽,触发逐出/中断兜底;准入不是无限生成保证 |
+
+准入按 256 token/页计算,并对活跃序列保守记账:
+
+```text
+目标页数 = ceil(min(MAX_CONTEXT,
+                   prompt_tokens + min(max_tokens, GDEC_KV_RESERVE_DECODE)) / 256)
+其他活跃槽的预算 = max(目标页数, 当前实际映射页数)
+可用预算 = 池总页数 - 其他活跃槽预算之和
+新请求需页 = 目标页数; live continuation 则取 max(目标页数, 已映射页数)
+```
+
+- 非前缀复用会 reset 旧槽,释放的旧页不再作为新请求的增长基线重复扣除。
+- 缓存命中减少 prefill 工作,不等于已有 KV 不占页;活跃序列即使共享前缀,
+  准入仍分别记账,不依赖共享省出的物理页允许超订。
+- 空闲槽和 RAM 检查点钉住的页也会占物理池,COW 可能需要额外页。门禁把可回收
+  页视为可逐出,不把所有缓存永久扣减;真正分配时仍保留压力处理。
+- 池耗尽时先逐出 RAM 检查点,再释放空闲槽 KV,仍不足则中断较晚准入的活跃请求;
+  需要页的请求若自身是后来者,它可能失败。被中断请求通过 API 返回错误。
+- `GDEC_KV_RESERVE_DECODE=4096` 不会把输出裁到 4096;输出仍受请求预算和
+  `MAX_CONTEXT` 限制。减小预约可能提高准入率,但增加中途池耗尽风险。
+- `PARALLEL=1` 绕过多槽准入门禁,仍受单条上限、实际池容量和缓存逐出机制约束。
+
+想让两条完整 512K 序列同时驻留,需要至少把 `KV_POOL_TOKENS` 设为 `1048576`,
+再核算检查点/COW 与其他内存;这不是默认 512K 池的能力,也不在本轮实机验收范围。
+增加池容量主要增加 KV 存储,增加槽位还增加 GDN 等每序列状态;相同总池也不保证
+不同 `MAX_CONTEXT`/`PARALLEL` 配置的总内存完全相同。
+
+### 启动检查、缓存与验证范围
+
+- 512K 使用 BF16 KV + WMMA + BTV;Linux 启动器已设置此组合。超过原生 256K
+  时引擎自动禁用 `GDEC_QSA_UNION`,不要手工强制使用未验证组合。
+- 检查 `--check` 的单条上下文、共享池和并发数;服务起来后检查 engine 日志的
+  `RoPE: YaRN factor=2`、`[kvpage]` 页数及 KV 类型,以及 `/health` 的
+  `context=524288` 和 `rope_scaling.factor=2`。默认原生返回 `rope_scaling=null`;
+  API 的上下文以引擎 INFO 为准,不要仅凭 API 命令行判断生效。
+- 512K 实测需约 108 GiB 的 gpu-accessible committed 内存(Linux hgn 测试配置),
+  不应把 KV 数组大小当成整机预算,也不要把 UMA 的 RSS 与 device 数值直接相加。
+  扩池前检查权重、KV/BTV、工作区和系统余量;内存紧张时不要只提高并发/池容量。
+- RoPE 参数进入 SSD KV 快照指纹。切换原生/YaRN 或其参数需要重启,不同指纹不会
+  错用旧 KV;无需为正确性删除快照,但旧文件仍可能占磁盘配额并被 LRU 逐出。
+- 2026-09-30 Linux/gfx1151 实测覆盖 500K prefill/needle、精确 512K 边界、
+  factor 2 双槽并发、reset/COW/SSD 恢复、超预约 decode 及取消。256K prefill
+  原生 1374.4 vs YaRN 1370.3 tok/s,约 0.3% 差异,不表示任意负载都无开销。
+  短文本探针 factor 2 与原生 mean KLD 0.0234、same-top 93.5%,因此不承诺两者
+  输出一致。详细实现/限制见 [YARN-512K.md](YARN-512K.md),实测见
+  [YARN-512K-RESULTS.md](YARN-512K-RESULTS.md)。
 
 ## Windows
 
@@ -166,6 +326,8 @@ API 地址 / 查看日志 / 退出;双击:打开面板),输出写入 `logs\`;排
 - [MTP.md](MTP.md) — 投机解码参数与对比方法
 - [NGRAM.md](NGRAM.md) — ngram 验证的设计、收益与已知分歧
 - [CONCURRENCY.md](CONCURRENCY.md) — 并发请求(PARALLEL)的配置与语义
+- [YARN-512K.md](YARN-512K.md) — YaRN 512K 实现、共享池准入与验证范围
+- [YARN-512K-RESULTS.md](YARN-512K-RESULTS.md) — Linux/gfx1151 长上下文与并发实测
 - [HGN-FORMAT.md](HGN-FORMAT.md) — `.hgn` 权重容器格式
 - [GGUF.md](GGUF.md) — 直接用 llama.cpp GGUF 权重运行
 - [data/README.md](data/README.md) — 数值回归基准(data/qsa-oracle)说明
