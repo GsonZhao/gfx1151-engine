@@ -23,9 +23,10 @@ architecture flags directly to other graphics cards.
 ## build.sh (unified entry point)
 
 ```bash
-bash build.sh                 # all: build engine + API in parallel (default)
+bash build.sh                 # all: build engine + benchmark + API in parallel (default)
 bash build.sh --bundle        # distribution build with all runtime dependencies
 bash build.sh engine [name]   # engine only → build/<name> (default gdec)
+bash build.sh bench           # standalone performance benchmark only
 bash build.sh api             # API server + CLI tools only
 bash build.sh test            # build ktest and run kernel unit tests
 ```
@@ -35,6 +36,7 @@ Artifacts:
 | File | Contents |
 |---|---|
 | `build/gdec` | GPU engine (`src/gpu/gdec.cpp`) |
+| `build/gdec-bench` | Standalone performance benchmark (`src/gpu/bench_main.cpp`) |
 | `build/gdec-api` | OpenAI-compatible API server (`src/api/*.cpp`) |
 | `build/tok_cli` `tpl_cli` `eng_cli` | tokenizer / template / engine protocol CLIs |
 | `build/http_selftest` `toolparse_test` `vision_test` `engine_host_test` | API / engine listen-address component self-tests |
@@ -176,7 +178,8 @@ start_hgn.sh, covering the engine and the API frontend
 PORTING-WINDOWS_EN.md):
 
 ```bash
-bash build_win.sh           # engine → build/gdec-win.exe
+bash build_win.sh           # all artifacts: engine, benchmark, API, launcher
+bash build_win.sh bench     # standalone performance benchmark only
 bash build_win.sh api       # OpenAI API frontend → build/gdec-api-win.exe
 bash build_win.sh launcher  # script-free launcher → ./start_win.exe
 bash build_win.sh test      # build ktest-win and run kernel unit tests

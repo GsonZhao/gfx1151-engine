@@ -113,7 +113,7 @@ decoding are identical; switch by using the other launcher:
 ## Quick Start
 
 ```bash
-bash build.sh        # Build engine + API, output goes to build/
+bash build.sh        # Build all required artifacts, output goes to build/
 bash start_hgn.sh    # hgn weights: load the model and start the service (reads service.conf)
 bash start_gguf.sh   # or GGUF weights (Unsloth UD-Q4_K_XL, the same files llama.cpp uses)
 ```
@@ -125,8 +125,10 @@ for details.
 
 For repeatable standalone performance measurements, build and run the
 command-line benchmark described in [BENCHMARK_EN.md](BENCHMARK_EN.md):
-`bash build.sh bench` on Linux or `bash build_win.sh bench` on Windows. It
-loads only the model selected from `service.conf`, benchmarks all
+`bash build.sh` on Linux or `bash build_win.sh` on Windows. Each default build
+produces all required platform artifacts, including the engine, API, and
+benchmark; Windows also builds the native launcher. It loads only the model
+selected from `service.conf`, benchmarks all
 `data/qsa-oracle/*.tokens` prompts for prefill, and reports TG speed plus MTP
 acceptance for Python code, creative writing, and common-sense QA workloads.
 
@@ -345,7 +347,7 @@ OpenAI API + multimodal). Porting notes and measurements are in
 (or double-click `build_win.bat`; Git is only needed at build time):
 
 ```bash
-bash build_win.sh           # Engine
+bash build_win.sh           # All required artifacts: engine, benchmark, API, launcher
 bash build_win.sh api       # OpenAI API frontend
 bash build_win.sh launcher  # Script-free launcher start_win.exe
 ```

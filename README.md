@@ -88,7 +88,7 @@
 ## 快速开始
 
 ```bash
-bash build.sh        # 编译引擎 + API,输出在 build/
+bash build.sh        # 编译全部所需产物,输出在 build/
 bash start_hgn.sh    # hgn 权重:加载模型并启动服务(读取 service.conf)
 bash start_gguf.sh   # 或 GGUF 权重(Unsloth UD-Q4_K_XL,与 llama.cpp 同一份文件)
 ```
@@ -96,6 +96,10 @@ bash start_gguf.sh   # 或 GGUF 权重(Unsloth UD-Q4_K_XL,与 llama.cpp 同一�
 两个启动器都从 `./models` 读取权重,缺文件时列出缺失项并退出;配置集中在
 `service.conf`(hgn、GGUF 各一段)。GGUF 见 [GGUF.md](GGUF.md)。
 详见 [QUICKSTART.md](QUICKSTART.md)。
+
+独立性能测试工具见 [BENCHMARK.md](BENCHMARK.md)。编译脚本不带参数时会
+一次性编译引擎、API 前端和 benchmark；Windows 还会编译原生启动器。测试
+程序本身的输出使用英语，文档仍以中文为主。
 
 自有微调模型(HF safetensors,同架构)转换:
 
@@ -277,7 +281,7 @@ Windows 版与 Linux 版功能一致(引擎 + OpenAI API + 多模态),移植记�
 (或双击 `build_win.bat`,仅编译期需要 Git):
 
 ```bash
-bash build_win.sh           # 引擎
+bash build_win.sh           # 全部所需产物:引擎、benchmark、API、启动器
 bash build_win.sh api       # OpenAI API 前端
 bash build_win.sh launcher  # 免脚本启动器 start_win.exe
 ```

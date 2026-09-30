@@ -7,21 +7,24 @@ command line. This keeps a result tied to the model configuration in
 
 ## Build
 
-Linux:
+Linux (the default build also produces the engine and API artifacts):
 
 ```bash
-bash build.sh bench
+bash build.sh
 ```
 
 The executable is `build/gdec-bench`.
 
-Windows:
+Windows (the default build also produces the engine, API, and launcher artifacts):
 
 ```bash
-bash build_win.sh bench
+bash build_win.sh
 ```
 
 The executable is `build/gdec-bench.exe`.
+
+The `bench` target remains available when only the benchmark needs to be
+rebuilt.
 
 Opening the executable without arguments exits immediately. Run the benchmark
 explicitly with `run`:
