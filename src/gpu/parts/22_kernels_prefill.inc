@@ -676,22 +676,41 @@ __global__ void k_gr_scatter_norm_b(const float* __restrict__ w4,
 }
 
 // --- batched RoPE: grid.y = token row t (pos = t); rotation identical to k_rope
-// --- RoPE pow table: g_rope_tab[i] = pow(theta, -2.0*i/rotary), filled on
-// device with the same libm pow and the same argument expression k_rope_b
-// used to compute inline -> per-element angles are bit-identical, the table
-// just removes 33M redundant pow calls per prefill layer.
-__device__ double g_rope_tab[64];
-__global__ void k_rope_tab_init(double theta, int rotary) {
+// --- RoPE inverse-frequency table. Native mode is still initialized on-device
+// with the original pow expression; YaRN mode uploads the host-computed table.
+__global__ void k_rope_tab_init(double theta, int rotary, float mscale) {
   int i = threadIdx.x;
   if (i < rotary / 2) g_rope_tab[i] = pow(theta, -2.0 * i / rotary);
+  if (i == 0) g_rope_mscale = mscale;
 }
 static void ensure_rope_tab(double theta, int rotary) {
   static double cur_theta = -1;
   static int cur_rotary = -1;
-  if (cur_theta != theta || cur_rotary != rotary) {
-    k_rope_tab_init<<<1, 64, 0, g_str>>>(theta, rotary);
+  static double cur_factor = -1, cur_original = -1, cur_fast = -1, cur_slow = -1;
+  static double cur_mscale = -1;
+  const RopeConfig& rope = g_cfg.rope;
+  const double mscale = rope_attention_factor(rope);
+  if (cur_theta != theta || cur_rotary != rotary || cur_factor != rope.factor ||
+      cur_original != rope.original_max_position_embeddings ||
+      cur_fast != rope.beta_fast || cur_slow != rope.beta_slow ||
+      cur_mscale != mscale) {
+    if (rope.factor <= 1.0) {
+      k_rope_tab_init<<<1, 64, 0, g_str>>>(theta, rotary, (float)mscale);
+    } else {
+      double tab[64] = {};
+      for (int i = 0; i < rotary / 2; i++)
+        tab[i] = rope_inv_freq(rope, theta, rotary, i);
+      CK(hipMemcpyToSymbol(g_rope_tab, tab, (size_t)rotary / 2 * sizeof(double)));
+      float fm = (float)mscale;
+      CK(hipMemcpyToSymbol(g_rope_mscale, &fm, sizeof(fm)));
+    }
     cur_theta = theta;
     cur_rotary = rotary;
+    cur_factor = rope.factor;
+    cur_original = rope.original_max_position_embeddings;
+    cur_fast = rope.beta_fast;
+    cur_slow = rope.beta_slow;
+    cur_mscale = mscale;
   }
 }
 
@@ -705,6 +724,7 @@ __global__ void k_rope_b(float* __restrict__ vec, int nheads, int dh, int rotary
   int h = idx / half, i = idx % half;
   double ang = apos * g_rope_tab[i];
   float cs = (float)cos(ang), sn = (float)sin(ang);
+  if (g_rope_mscale != 1.f) cs *= g_rope_mscale, sn *= g_rope_mscale;
   float* p = vec + ((size_t)pos * nheads + h) * dh;
   float x0 = p[i], x1 = p[i + half];
   p[i] = x0 * cs - x1 * sn;
@@ -735,9 +755,12 @@ __global__ void k_rope_dump(float2* __restrict__ out, int* __restrict__ rpos,
   int pos = *d_pos + (d_rdelta ? *d_rdelta : 0);
   if (i == 0) *rpos = pos;
   if (i < 32) {
-    double ang = pos * pow(theta, -2.0 * i / 64.0);
-    out[i] = make_float2((float)cos(ang), (float)sin(ang));
+    double ang = pos * g_rope_tab[i];
+    float cs = (float)cos(ang), sn = (float)sin(ang);
+    if (g_rope_mscale != 1.f) cs *= g_rope_mscale, sn *= g_rope_mscale;
+    out[i] = make_float2(cs, sn);
   }
+  (void)theta;
 }
 
 // M-RoPE slot interleave (mrope_section = [11, 11, 10], see

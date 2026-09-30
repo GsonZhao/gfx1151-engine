@@ -48,6 +48,7 @@
 #include "tokenizer.h"
 #include "toolparse.h"
 #include "vision.h"
+#include "../rope.h"
 
 namespace {
 
@@ -61,6 +62,7 @@ struct Config {
     std::string listen = "0.0.0.0:8731";
     std::string model = "qwen3.8-flash-next";
     int context = 262144;
+    RopeConfig rope;
     // Server-side sampling/thinking overrides (see apply_overrides). Relative
     // to the working directory, which every launcher sets to the repo root.
     std::string overrides_path = "data/api-overrides.json";
@@ -1834,7 +1836,17 @@ void handle_health(const http::Request&, http::Response* r, http::Stream*) {
         {"/v1/chat/completions", "/v1/completions", "/v1/models", "/v1/responses",
          "/dashboard", "/reqstat/summary", "/reqstat/tail"});
     j["context"] = g_cfg.context;
-    j["rope_scaling"] = nullptr;
+    if (g_cfg.rope.factor > 1.0) {
+        j["rope_scaling"] = {{"type", "yarn"},
+                              {"factor", g_cfg.rope.factor},
+                              {"original_max_position_embeddings",
+                               g_cfg.rope.original_max_position_embeddings},
+                              {"beta_fast", g_cfg.rope.beta_fast},
+                              {"beta_slow", g_cfg.rope.beta_slow},
+                              {"attention_factor", rope_attention_factor(g_cfg.rope)}};
+    } else {
+        j["rope_scaling"] = nullptr;
+    }
     {
         std::lock_guard<std::mutex> lk(g_slot_mtx);
         j["busy"] = g_in_flight > 0;
@@ -2726,6 +2738,12 @@ int main(int argc, char** argv) {
                     argv[0]);
             return 2;
         }
+    }
+    std::string rope_error;
+    if (!rope_from_env(g_cfg.rope, rope_error) || !rope_config_valid(g_cfg.rope)) {
+        if (rope_error.empty()) rope_error = "invalid YaRN configuration";
+        fprintf(stderr, "gdec-api: %s\n", rope_error.c_str());
+        return 2;
     }
     // Environment, not argv: keeps the key out of `ps`.
     if (const char* k = std::getenv("GDEC_API_ADMIN_KEY")) g_cfg.admin_key = k;

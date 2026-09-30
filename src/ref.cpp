@@ -11,6 +11,7 @@
 //        [--theta T] [--dump] [--no-ple]
 
 #include "hgn.h"
+#include "rope.h"
 
 #include <algorithm>
 #include <cmath>
@@ -43,6 +44,7 @@ struct Cfg {
   // misc
   float norm_eps = 1e-6f;          // rms_norm_eps
   double rope_theta = 1e7;         // rope_parameters.rope_theta
+  RopeConfig rope;
   int vocab = 248320;              // set from lm_head rows at runtime
 };
 static Cfg g_cfg;
@@ -497,8 +499,14 @@ struct Model {
       for (int h = 0; h < nheads; h++) {
         float* p = vec + h * dh;
         for (int i = 0; i < g_cfg.rotary_dim / 2; i++) {
-          double ang = pos * pow(g_cfg.rope_theta, -2.0 * i / g_cfg.rotary_dim);
+          double ang = pos * rope_inv_freq(g_cfg.rope, g_cfg.rope_theta,
+                                           g_cfg.rotary_dim, i);
           float cs = (float)cos(ang), sn = (float)sin(ang);
+          const float attention_factor = (float)rope_attention_factor(g_cfg.rope);
+          if (attention_factor != 1.f) {
+            cs *= attention_factor;
+            sn *= attention_factor;
+          }
           float x0 = p[i], x1 = p[i + g_cfg.rotary_dim / 2];
           p[i] = x0 * cs - x1 * sn;
           p[i + g_cfg.rotary_dim / 2] = x0 * sn + x1 * cs;
@@ -699,7 +707,8 @@ int main(int argc, char** argv) {
   if (argc < 2) {
     fprintf(stderr,
             "usage: ref <base.hgn> [overlay.hgn] --tokens 1,2,3 [--gen N] [--topk K] "
-            "[--theta T]\n");
+             "[--theta T] [--rope-factor F] [--rope-original-ctx N] "
+             "[--rope-beta-fast F] [--rope-beta-slow F] [--rope-attn-scale F]\n");
     return 2;
   }
   std::string base = argv[1];
@@ -711,6 +720,11 @@ int main(int argc, char** argv) {
   bool ple_on = true;
   int ple_dil = 3, ple_pad = 248044;
   float ple_eps = 1e-6f;
+  std::string rope_error;
+  if (!rope_from_env(g_cfg.rope, rope_error)) {
+    fprintf(stderr, "%s\n", rope_error.c_str());
+    return 2;
+  }
   if (argi < argc && argv[argi][0] != '-') overlay = argv[argi++];
   for (; argi < argc; argi++) {
     std::string a = argv[argi];
@@ -725,6 +739,12 @@ int main(int argc, char** argv) {
       g_cfg.topk = atoi(next());
     else if (a == "--theta")
       g_cfg.rope_theta = atof(next());
+    else if (const char* key = rope_cli_key(a)) {
+      if (argi + 1 >= argc || !rope_set(g_cfg.rope, key, next())) {
+        fprintf(stderr, "%s requires a valid numeric value\n", a.c_str());
+        return 2;
+      }
+    }
     else if (a == "--dump")
       dump = true;
     else if (a == "--no-ple")
@@ -738,6 +758,10 @@ int main(int argc, char** argv) {
   }
   if (tokens.empty()) {
     fprintf(stderr, "need --tokens\n");
+    return 2;
+  }
+  if (!rope_config_valid(g_cfg.rope)) {
+    fprintf(stderr, "invalid YaRN config\n");
     return 2;
   }
 

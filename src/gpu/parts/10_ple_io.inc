@@ -564,13 +564,14 @@ __device__ void index_norm_rope(float value, const float* weight, float* out,
       float2 c = cs_tab[ti * 32 + i];
       cs = c.x, sn = c.y;
     } else {
-      double angle = position * pow(theta, -2.0 * i / 64.0);
+      double angle = position * g_rope_tab[i];
       cs = (float)cos(angle), sn = (float)sin(angle);
     }
     v = d < 32 ? values[d] * cs - values[d + 32] * sn
                 : values[d] * cs + values[d - 32] * sn;
   }
   out[d] = v;
+  (void)theta;
 }
 
 __global__ void k_index_q(const float* proj, const float* norm, float* queries,

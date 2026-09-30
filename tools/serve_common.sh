@@ -30,6 +30,11 @@ serve_init() {
   PARALLEL="${PARALLEL:-1}"
   CONC_PREFILL_CHUNK="${CONC_PREFILL_CHUNK:-8192}"
   MAX_IMAGES="${MAX_IMAGES:-8}"
+  ROPE_FACTOR="${ROPE_FACTOR:-1}"
+  ROPE_ORIGINAL_CTX="${ROPE_ORIGINAL_CTX:-262144}"
+  ROPE_BETA_FAST="${ROPE_BETA_FAST:-32}"
+  ROPE_BETA_SLOW="${ROPE_BETA_SLOW:-1}"
+  ROPE_ATTN_SCALE="${ROPE_ATTN_SCALE:-0}"
   if [[ -f "$ROOT/build/bundled-runtime.conf" ]]; then
     # --bundle 产物优先使用随包库；kernel db 使用绝对路径，不依赖 cwd。
     [[ -d "$ROOT/build/lib" ]] || fail '缺少 build/lib，请重新运行 bash build.sh --bundle'
@@ -52,7 +57,7 @@ serve_init() {
   for octet in "${engine_octets[@]}"; do
     [[ "$octet" =~ ^(0|[1-9][0-9]{0,2})$ ]] && (( 10#$octet <= 255 )) || fail 'ENGINE_HOST 必须是 IPv4 地址'
   done
-  for key in ENGINE_PORT API_PORT MAX_CONTEXT MEMORY_CAP_GB MIN_AVAILABLE_GB START_TIMEOUT STALL_TIMEOUT; do
+  for key in ENGINE_PORT API_PORT MAX_CONTEXT MEMORY_CAP_GB MIN_AVAILABLE_GB START_TIMEOUT STALL_TIMEOUT ROPE_ORIGINAL_CTX; do
     value="${!key}"
     [[ "$value" =~ ^[1-9][0-9]*$ && ${#value} -le 8 ]] || fail "$key 必须为正整数"
   done
@@ -64,6 +69,12 @@ serve_init() {
   [[ "$KV_PAGED" =~ ^[01]$ ]] || fail 'KV_PAGED 必须为 0 或 1'
   [[ "$PARALLEL" =~ ^[1-8]$ ]] || fail 'PARALLEL 范围为 1–8'
   [[ "$MAX_IMAGES" =~ ^[1-9][0-9]*$ && "$MAX_IMAGES" -le 256 ]] || fail 'MAX_IMAGES 范围为 1–256'
+  [[ "$ROPE_FACTOR" =~ ^[0-9]+([.][0-9]+)?$ ]] || fail 'ROPE_FACTOR 必须为非负小数'
+  [[ "$ROPE_BETA_FAST" =~ ^[0-9]+([.][0-9]+)?$ ]] || fail 'ROPE_BETA_FAST 必须为非负小数'
+  [[ "$ROPE_BETA_SLOW" =~ ^[0-9]+([.][0-9]+)?$ ]] || fail 'ROPE_BETA_SLOW 必须为非负小数'
+  [[ "$ROPE_ATTN_SCALE" =~ ^[0-9]+([.][0-9]+)?$ ]] || fail 'ROPE_ATTN_SCALE 必须为非负小数'
+  awk "BEGIN { exit !($ROPE_FACTOR >= 1 && $ROPE_BETA_FAST > 0 && $ROPE_BETA_SLOW > 0 && $ROPE_ATTN_SCALE >= 0) }" || \
+    fail 'ROPE_FACTOR 必须 >=1，beta 必须 >0，ROPE_ATTN_SCALE 必须 >=0'
   (( PARALLEL == 1 || KV_PAGED )) || fail 'PARALLEL>1 需要 KV_PAGED=1'
   (( ENGINE_PORT <= 65535 && API_PORT <= 65535 && ENGINE_PORT != API_PORT )) || fail '端口必须为不同的 1–65535 整数'
   (( MTP_GAMMA <= 8 )) || fail 'MTP_GAMMA 范围为 0–8（0=引擎按模式自选 greedy 4 / 采样自适应）'
@@ -129,6 +140,11 @@ serve_run() {
   fi
   export GDEC_PARALLEL="$PARALLEL"
   export GDEC_API_MAX_IMAGES="$MAX_IMAGES"
+  export GDEC_ROPE_FACTOR="$ROPE_FACTOR"
+  export GDEC_ROPE_ORIGINAL_CTX="$ROPE_ORIGINAL_CTX"
+  export GDEC_ROPE_BETA_FAST="$ROPE_BETA_FAST"
+  export GDEC_ROPE_BETA_SLOW="$ROPE_BETA_SLOW"
+  export GDEC_ROPE_ATTN_SCALE="$ROPE_ATTN_SCALE"
   # --serve reads GDEC_SPEC_GAMMA; --gamma is for offline --spec-gen.
   # MTP_GAMMA=0：不导出，引擎按请求模式自选（greedy 4 / 采样自适应）。
   if (( MTP_GAMMA > 0 )); then export GDEC_SPEC_GAMMA="$MTP_GAMMA"; fi

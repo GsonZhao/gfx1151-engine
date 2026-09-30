@@ -44,6 +44,11 @@ ENGINE_PORT="${ENGINE_PORT:-8730}"
 API_HOST="${API_HOST:-0.0.0.0}"
 API_PORT="${API_PORT:-8731}"
 MAX_CONTEXT="${MAX_CONTEXT:-262144}"
+ROPE_FACTOR="${ROPE_FACTOR:-1}"
+ROPE_ORIGINAL_CTX="${ROPE_ORIGINAL_CTX:-262144}"
+ROPE_BETA_FAST="${ROPE_BETA_FAST:-32}"
+ROPE_BETA_SLOW="${ROPE_BETA_SLOW:-1}"
+ROPE_ATTN_SCALE="${ROPE_ATTN_SCALE:-0}"
 MTP_GAMMA="${MTP_GAMMA:-0}"
 KVSNAP_MAX_GB="${KVSNAP_MAX_GB:-20}"
 RCKPT_MAX="${RCKPT_MAX:-8}"
@@ -74,6 +79,13 @@ if [[ "$engine_connect_host" == 0.0.0.0 ]]; then engine_connect_host=127.0.0.1; 
 [[ "$KV_POOL_TOKENS" =~ ^(0|[1-9][0-9]*)$ && ${#KV_POOL_TOKENS} -le 8 ]] || fail 'KV_POOL_TOKENS 必须为非负整数'
 [[ "$PARALLEL" =~ ^[1-8]$ ]] || fail 'PARALLEL 范围为 1–8'
 [[ "$MAX_IMAGES" =~ ^[1-9][0-9]*$ && "$MAX_IMAGES" -le 256 ]] || fail 'MAX_IMAGES 范围为 1–256'
+[[ "$ROPE_ORIGINAL_CTX" =~ ^[1-9][0-9]*$ ]] || fail 'ROPE_ORIGINAL_CTX 必须为正整数'
+[[ "$ROPE_FACTOR" =~ ^[0-9]+([.][0-9]+)?$ ]] || fail 'ROPE_FACTOR 必须为非负小数'
+[[ "$ROPE_BETA_FAST" =~ ^[0-9]+([.][0-9]+)?$ ]] || fail 'ROPE_BETA_FAST 必须为非负小数'
+[[ "$ROPE_BETA_SLOW" =~ ^[0-9]+([.][0-9]+)?$ ]] || fail 'ROPE_BETA_SLOW 必须为非负小数'
+[[ "$ROPE_ATTN_SCALE" =~ ^[0-9]+([.][0-9]+)?$ ]] || fail 'ROPE_ATTN_SCALE 必须为非负小数'
+awk "BEGIN { exit !($ROPE_FACTOR >= 1 && $ROPE_BETA_FAST > 0 && $ROPE_BETA_SLOW > 0 && $ROPE_ATTN_SCALE >= 0) }" || \
+  fail 'ROPE_FACTOR 必须 >=1，beta 必须 >0，ROPE_ATTN_SCALE 必须 >=0'
 (( PARALLEL == 1 || KV_PAGED )) || fail 'PARALLEL>1 需要 KV_PAGED=1'
 [[ -f build/gdec-win.exe ]] || fail '缺少 build/gdec-win.exe，请先运行 bash build_win.sh'
 [[ -f build/gdec-api-win.exe ]] || fail '缺少 build/gdec-api-win.exe，请先运行 bash build_win.sh api'
@@ -122,6 +134,11 @@ if (( KV_PAGED )); then
 fi
 export GDEC_PARALLEL="$PARALLEL"
 export GDEC_API_MAX_IMAGES="$MAX_IMAGES"
+export GDEC_ROPE_FACTOR="$ROPE_FACTOR"
+export GDEC_ROPE_ORIGINAL_CTX="$ROPE_ORIGINAL_CTX"
+export GDEC_ROPE_BETA_FAST="$ROPE_BETA_FAST"
+export GDEC_ROPE_BETA_SLOW="$ROPE_BETA_SLOW"
+export GDEC_ROPE_ATTN_SCALE="$ROPE_ATTN_SCALE"
 
 mkdir -p logs
 ENGINE_LOG="logs/engine-win-$(date +%Y%m%d-%H%M%S).log"

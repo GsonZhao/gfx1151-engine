@@ -421,6 +421,13 @@ struct GpuModel {
   }();
 
   explicit GpuModel(const Checkpoint& c, int mc) : ckpt(c), maxctx(mc) {
+    if (qsa_union && maxctx > 262144) {
+      fprintf(stderr, "qsa: disabling GDEC_QSA_UNION above 256K because its "
+                      "block ids are uint16\n");
+      qsa_union = false;
+    }
+    ensure_rope_tab(g_cfg.rope_theta, g_cfg.rotary_dim);
+    CK(hipStreamSynchronize(nullptr));
     // Prefill workspace is sized by maxbatch, NOT maxctx: long prompts are
     // processed in maxbatch-token chunks via the same continuation path as
     // KV reuse, so a 256K context costs chunk-sized workspace (~4.5 GB at
@@ -1250,7 +1257,7 @@ struct GpuModel {
     if (mrope_active_) {
       double tab[32];
       for (int i = 0; i < 32; i++)
-        tab[i] = pow(g_cfg.rope_theta, -2.0 * i / 64.0);
+        tab[i] = rope_inv_freq(g_cfg.rope, g_cfg.rope_theta, 64, i);
       h_ropecs_.resize((size_t)P * 32);
       const int mropeN = (int)mrope_pos_.size();
       for (int r = 0; r < P; r++)
@@ -1331,6 +1338,7 @@ struct GpuModel {
 
   void qsa(int l, int qi, const float* x, float* y) {
     char buf[128];
+    ensure_rope_tab(g_cfg.rope_theta, g_cfg.rotary_dim);
     if (!qsa_dense) {
       snprintf(buf, sizeof buf, "layers.%d.self_attn.indexer.index_qk_proj.weight", l);
       gemv(wview(ckpt.at(buf)), x, d_iproj);
@@ -4332,6 +4340,7 @@ struct GpuModel {
   void mtp_qsa(const float* x, float* y) {
     const char* pfx = "mtp.layers.0.self_attn";
     char buf[128];
+    ensure_rope_tab(g_cfg.rope_theta, g_cfg.rotary_dim);
     if (!qsa_dense) {
       snprintf(buf, sizeof buf, "%s.indexer.index_qk_proj.weight", pfx);
       gemv(wview(ckpt.at(buf)), x, d_iproj);
@@ -7189,6 +7198,7 @@ __global__ void k_qsa_qsplit(const float* __restrict__ qg, const float* __restri
     // the extra qg load is L2-hot) instead of staging them through LDS —
     // saves two __syncthreads and the sm round-trip per block.
     float2 cs = ropecs[(size_t)blockIdx.y * 32 + t];
+    if (g_rope_mscale != 1.f) cs.x *= g_rope_mscale, cs.y *= g_rope_mscale;
     float v1 = qg[h * 2 * dh + t + 32];
     float x0 = v * inv * (1.f + qnw[t]);
     float x1 = v1 * inv * (1.f + qnw[t + 32]);
@@ -7231,6 +7241,7 @@ __global__ void k_qsa_kprep(const float* __restrict__ kb, const float* __restric
   if (t < 32) {
     // inline recompute instead of LDS staging (see k_qsa_qsplit)
     float2 cs = ropecs[(size_t)blockIdx.y * 32 + t];
+    if (g_rope_mscale != 1.f) cs.x *= g_rope_mscale, cs.y *= g_rope_mscale;
     float v1 = xg[t + 32];
     float x0 = v * inv * (1.f + wg[t]);
     float x1 = v1 * inv * (1.f + wg[t + 32]);
