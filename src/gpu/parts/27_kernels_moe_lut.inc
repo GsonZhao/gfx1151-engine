@@ -17,7 +17,7 @@
 // (IQ: lut / 256 and scale * 256, exact rescale keeping scales out of fp16 subnormals).
 //
 //   kPair (gate/up): hid F16 [slot][m] = up * silu(gate), grid = (m / 64, tiles)
-//     kRaw: F32 [slot][2m] = gate | up unfused (hgn v2: rotation comes first)
+//     kRaw: F16 [slot][2m] = gate | up unfused (hgn v2: rotation comes first)
 //   !kPair (down):   pairs F32 [slot][m],                grid = (m / 128, tiles)
 //
 // hgn v2 i4r (dtype 23, kI4R): q4cp code plane, linear book -8..7 (p.cb), one
@@ -298,9 +298,9 @@ __launch_bounds__(256) __global__
           const int idx = (r / 16) * plane + (flat / kRows) * stride + r % 16;
           if constexpr (kRaw) {
             const size_t o = (size_t)(slot0 + t) * 2 * m + r_block + r;
-            *reinterpret_cast<float2*>(out + o) = make_float2(base[idx], base[idx + 1]);
-            *reinterpret_cast<float2*>(out + o + m) =
-                make_float2(base[idx + 4 * plane], base[idx + 1 + 4 * plane]);
+            *reinterpret_cast<__half2*>(out_half + o) = __floats2half2_rn(base[idx], base[idx + 1]);
+            *reinterpret_cast<__half2*>(out_half + o + m) =
+                __floats2half2_rn(base[idx + 4 * plane], base[idx + 1 + 4 * plane]);
             continue;
           }
           __half vals[2];
@@ -371,15 +371,16 @@ static bool moe_lut_up(int type, const moelut::LutW& p, const __half* x, const i
   return true;
 }
 
-// hgn v2 gate/up without the fused silu: guv[slot][2m] F32 (gate | up), still
-// in the rotated domain (k_i4r_mid finishes it).
+// hgn v2 gate/up without the fused silu: guv[slot][2m] F16 (gate | up), still
+// in the rotated domain (k_i4r_mid finishes it). F16 halves the round trip
+// through memory (k_i4r_mid is bandwidth-bound at P = 16K).
 static bool moe_lut_up_raw(const moelut::LutW& p, const __half* x, const int* tokidx,
-                           const MoeTile* tiles, const int* ntiles, int max_tiles, float* guv,
+                           const MoeTile* tiles, const int* ntiles, int max_tiles, __half* guv,
                            int m, int k, hipStream_t st) {
   if (m % 64 || !moelut::lut_ok(moelut::kI4R, p, true, k)) return false;
   dim3 grid(m / 64, max_tiles);
-  k_moe_lut<moelut::kI4R, true, 64, true><<<grid, 256, 0, st>>>(p, x, tokidx, tiles, ntiles, guv,
-                                                                nullptr, m, k);
+  k_moe_lut<moelut::kI4R, true, 64, true><<<grid, 256, 0, st>>>(p, x, tokidx, tiles, ntiles, nullptr,
+                                                                guv, m, k);
   return true;
 }
 

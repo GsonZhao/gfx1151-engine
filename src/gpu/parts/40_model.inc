@@ -1492,8 +1492,8 @@ struct GpuModel {
     k_q4cp_gemv_gg<2><<<(unsigned)((pairs + 15) / 16), 512, 0, g_str>>>(
         c.codes, c.scales, c.cb, d_ey, d_guv, topids, (uint64_t)2 * mid, gu.cols,
         gu.scale_stride, k, 0 /*x_stride*/, 16 /*id_stride*/, k);
-    k_i4r_mid<false><<<k, 2 * mid / 128 * 32, 0, g_str>>>(d_guv, 2 * mid, d_hid, mid, gu.svh,
-                                                          dn.suh, mid);
+    k_i4r_mid<float, false><<<k, 2 * mid / 128 * 32, 0, g_str>>>(d_guv, 2 * mid, d_hid, mid,
+                                                                 gu.svh, dn.suh, mid);
     moe_down1(k, dn, topids);
     v2_rot(d_moeacc, 0, d_moeacc, 0, nullptr, dn.svh, d, 1);
   }
@@ -3328,8 +3328,7 @@ struct GpuModel {
     snprintf(buf, sizeof buf, "layers.%d.mlp.experts.down_proj.weight", l);
     WView dn = wview(ckpt.at(buf));
     if (gu.dtype == 23) {  // hgn v2 i4r: own paths (q4cp fast paths do not apply)
-      moe_b_v2(gu, dn, acc, P);
-      moe_b_shared(l, P, acc, direct_output);
+      moe_b_v2(l, gu, dn, acc, P, direct_output);
       return;
     }
     // Shared expert first (its scratch d_guvb/d_hidb/d_xbf16b is dead before
@@ -3801,12 +3800,16 @@ struct GpuModel {
     moe_b_shared(l, P, acc, direct_output);
   }
 
-  // hgn v2 i4r routed experts for P rows of d_xb (topk in d_topidsb/d_topwb) ->
-  // acc f32 [P][d], fully overwritten. Same dataflow as moe_v2_1; small P
-  // (verify) runs the grouped GEMVs, larger P the kI4R LUT WMMA kernels on the
-  // moe_q4w_run workspaces (raw gate|up f32 in d_guvb, dead once k_i4r_mid has
-  // written the F16 down input to d_hidb; d_guvb then takes the down pairs).
-  void moe_b_v2(const WView& gu, const WView& dn, float* acc, int P) {
+  // hgn v2 i4r MoE of trunk layer l for P rows of d_xb (topk in d_topidsb /
+  // d_topwb): routed + shared expert -> acc f32 [P][d] (then d_yb unless
+  // direct_output). Same dataflow as moe_v2_1; small P (verify) runs the
+  // grouped GEMVs, larger P the kI4R LUT WMMA kernels on the moe_q4w_run
+  // workspaces (raw gate|up F16 in d_guvb, dead once k_i4r_mid has written the
+  // F16 down input to d_hidb; d_guvb then takes the down pairs). LUT path: the
+  // shared expert runs first (its d_guvb / d_hidb scratch is dead by then) and
+  // k_v2_reduce_rot folds reduce + rot_out + shared add into one pass
+  // (GDEC_MOE_SG_FUSE=0: shared expert afterwards via k_axpy_sg).
+  void moe_b_v2(int l, const WView& gu, const WView& dn, float* acc, int P, bool direct_output) {
     const int k = g_cfg.topk, E = g_cfg.experts, d = g_cfg.d, mid = g_cfg.moe_mid;
     if (gu.cols != (uint64_t)d || gu.rows != (uint64_t)E * 2 * mid || dn.dtype != 23 ||
         dn.cols != (uint64_t)mid || dn.rows != (uint64_t)E * d || mid % 128 || d % 128 ||
@@ -3826,20 +3829,31 @@ struct GpuModel {
         logged = true;
         fprintf(stderr, "moe prefill: hgn v2 i4r LUT WMMA\n");
       }
+      static const bool sg_fuse = !env_zero("GDEC_MOE_SG_FUSE");
+      if (sg_fuse) moe_b_shared_ey(l, P);
       moe_routing.run(d_topidsb, d_topwb, d_tokidx, d_pweight, d_eoff, d_pairids, P, k, E);
       k_moe_tiles<<<1, 512, 0, g_str>>>(d_eoff, d_moetiles, d_moentiles, E);
       const int max_tiles = (P * k + 63) / 64 + E;
       __half* x16 = (__half*)d_xbf16b;
       __half* hid = (__half*)d_hidb;
+      __half* guv16 = (__half*)d_guvb;
       v2_rot(d_xb, d, x16, d, gu.suh, nullptr, d, P, true);
-      moe_lut_up_raw(pgu, x16, d_tokidx, d_moetiles, d_moentiles, max_tiles, d_guvb, mid, d,
+      moe_lut_up_raw(pgu, x16, d_tokidx, d_moetiles, d_moentiles, max_tiles, guv16, mid, d,
                      g_str);
-      k_i4r_mid<true><<<P * k, mid_threads, 0, g_str>>>(d_guvb, 2 * mid, hid, mid, gu.svh,
-                                                        dn.suh, mid);
+      k_i4r_mid<__half, true><<<P * k, mid_threads, 0, g_str>>>(guv16, 2 * mid, hid, mid,
+                                                                gu.svh, dn.suh, mid);
       moe_lut_down(moelut::kI4R, pdn, hid, d_moetiles, d_moentiles, max_tiles, d_guvb, d, mid,
                    g_str);
-      k_moe_reduce_pw<10><<<dim3((d + 255) / 256, P), 256, 0, g_str>>>(d_guvb, d_pairids,
-                                                                       d_pweight, acc, P, d);
+      const unsigned waves = (unsigned)P * (d / 128);
+      k_v2_reduce_rot<10><<<(waves + 7) / 8, 256, 0, g_str>>>(
+          d_guvb, d_pairids, d_pweight, dn.svh, sg_fuse ? d_eyb : nullptr, d_sgb, acc, P, d);
+      if (sg_fuse) {
+        if (!direct_output)
+          CK(hipMemcpyAsync(d_yb, acc, (size_t)P * d * 4, hipMemcpyDeviceToDevice, g_str));
+      } else {
+        moe_b_shared(l, P, acc, direct_output);
+      }
+      return;
     } else {
       const XCodes cg = xcodes(gu), cd = xcodes(dn);
       const bool direct_down = moe_down_topk && k == 10;
@@ -3849,8 +3863,8 @@ struct GpuModel {
       k_q4cp_gemv_gg<2><<<(unsigned)((pairs + 15) / 16), 512, 0, g_str>>>(
           cg.codes, cg.scales, cg.cb, d_eyb, d_guvb, d_topidsb, (uint64_t)2 * mid, gu.cols,
           gu.scale_stride, P * k, (uint64_t)d, 16, k, nullptr);
-      k_i4r_mid<false><<<P * k, mid_threads, 0, g_str>>>(d_guvb, 2 * mid, d_hidb, mid, gu.svh,
-                                                         dn.suh, mid);
+      k_i4r_mid<float, false><<<P * k, mid_threads, 0, g_str>>>(d_guvb, 2 * mid, d_hidb, mid,
+                                                                gu.svh, dn.suh, mid);
       if (direct_down) {
         const uint64_t row_pairs = (d + 1) / 2, warps_per_block = 128 / 32;
         k_q4cp_gemv_gd_topk_h16<10, 2><<<
@@ -3865,6 +3879,7 @@ struct GpuModel {
       }
     }
     v2_rot(acc, d, acc, d, nullptr, dn.svh, d, P);
+    moe_b_shared(l, P, acc, direct_output);
   }
 
   // Shared expert of trunk layer l added into acc (routed sum), then acc -> d_yb.

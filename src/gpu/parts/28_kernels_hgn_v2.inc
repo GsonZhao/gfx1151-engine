@@ -115,12 +115,13 @@ __global__ __launch_bounds__(256) void k_v2_rot(const TX* __restrict__ x, uint64
 }
 
 // i4r expert middle, one block per slot, 2*mid/128 waves:
-//   g|u = svh_gu . H(z) / sqrt128   (z = rotated gate_up output, 2*mid wide)
+//   g|u = svh_gu . H(z) / sqrt128   (z = rotated gate_up output, 2*mid wide,
+//                                    f32 from the GEMVs or f16 from the LUT)
 //   h   = silu(g) * u
 //   out = H(suh_dn . h) / sqrt128   (rotated input of down_proj)
 // mid % 128 == 0, 2*mid <= 2048.
-template <bool OUTH>
-__global__ __launch_bounds__(512) void k_i4r_mid(const float* __restrict__ guv, uint64_t gs,
+template <typename TG, bool OUTH>
+__global__ __launch_bounds__(512) void k_i4r_mid(const TG* __restrict__ guv, uint64_t gs,
                                                  void* out, uint64_t os,
                                                  const float* __restrict__ svh_gu,
                                                  const float* __restrict__ suh_dn, int mid) {
@@ -128,10 +129,10 @@ __global__ __launch_bounds__(512) void k_i4r_mid(const float* __restrict__ guv, 
   const int slot = blockIdx.x;
   const int lane = threadIdx.x & 31, w = threadIdx.x >> 5;
   {
-    const float* z = guv + (size_t)slot * gs + w * 128;
+    const TG* z = guv + (size_t)slot * gs + w * 128;
     float v[4];
 #pragma unroll
-    for (int j = 0; j < 4; j++) v[j] = z[j * 32 + lane];
+    for (int j = 0; j < 4; j++) v[j] = (float)z[j * 32 + lane];
     hv2::fwht128(v[0], v[1], v[2], v[3], lane);
 #pragma unroll
     for (int j = 0; j < 4; j++) {
@@ -157,6 +158,45 @@ __global__ __launch_bounds__(512) void k_i4r_mid(const float* __restrict__ guv, 
       ((__half*)out)[(size_t)slot * os + i] = __float2half(o);
     else
       ((float*)out)[(size_t)slot * os + i] = o;
+  }
+}
+
+// i4r LUT prefill tail: k_moe_reduce_pw + rot_out (post = svh_dn) + optional
+// shared-expert add (k_axpy_sg) in one pass, one wave per (row t, 128 block).
+// Same slot order and expressions as the three separate kernels, so the result
+// is bit-identical to reduce -> k_v2_rot -> k_axpy_sg.
+// out[t][i] = svh[i] * H(sum_s pw[id_s] * pairs[id_s])[i] / sqrt128
+//             (+ sigmoid(sg[t]) * ey[t][i])
+template <int K>
+__global__ __launch_bounds__(256) void k_v2_reduce_rot(const float* __restrict__ pairs,
+                                                       const int* __restrict__ pairids,
+                                                       const float* __restrict__ pw,
+                                                       const float* __restrict__ svh,
+                                                       const float* __restrict__ ey,
+                                                       const float* __restrict__ sg,
+                                                       float* __restrict__ out, int P, int d) {
+  const int lane = threadIdx.x & 31;
+  const int gw = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+  const int nb = d >> 7;
+  if (gw >= P * nb) return;
+  const int t = gw / nb, b = gw - t * nb;
+  float v[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+  for (int s = 0; s < K; s++) {
+    const int id = pairids[t * K + s];
+    const float w = pw[id];
+    const float* pr = pairs + (size_t)id * d + b * 128;
+#pragma unroll
+    for (int j = 0; j < 4; j++) v[j] += w * pr[j * 32 + lane];
+  }
+  hv2::fwht128(v[0], v[1], v[2], v[3], lane);
+  const float sgt = ey ? 1.f / (1.f + expf(-sg[t])) : 0.f;
+#pragma unroll
+  for (int j = 0; j < 4; j++) {
+    const int i = b * 128 + j * 32 + lane;
+    float o = v[j] * hv2::kRs128 * svh[i];
+    if (ey) o += sgt * ey[(size_t)t * d + i];
+    out[(size_t)t * d + i] = o;
   }
 }
 
