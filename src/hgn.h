@@ -107,14 +107,17 @@ public:
   Checkpoint(const Checkpoint&) = delete;
   Checkpoint& operator=(const Checkpoint&) = delete;
 
-  // overlay tensors override base tensors with the same name. A file that is
-  // already mapped (e.g. NGRAM_FILE == MODEL_FILE on a single-file w4b) is
-  // skipped, so one path is never mapped twice. Returns false when skipped.
-  bool add_overlay(const char* path) {
+  // overlay tensors override base tensors with the same name. Returns nullptr
+  // when applied, else why the whole file was skipped:
+  //   - already mapped (e.g. NGRAM_FILE == MODEL_FILE on a single-file w4b);
+  //   - it would replace hgn v2 tensors (dtype 16 ht / 23 i4r / 24 q6g64): a
+  //     v1 quality overlay does not apply to a v2 base. MTP and n-gram files
+  //     replace / add other tensors only and are applied as usual.
+  const char* add_overlay(const char* path) {
     for (const auto& m : maps_)
-      if (same_file(m.path, path)) return false;
-    map_file(path, true);
-    return true;
+      if (same_file(m.path, path)) return "already mapped";
+    if (!map_file(path, true)) return "would replace hgn v2 tensors (v1 overlay on a v2 base)";
+    return nullptr;
   }
 
   // In-memory tensor (GGUF-derived) owning its bytes; overrides by name like
@@ -286,7 +289,10 @@ private:
     return ec ? a == b : eq;
   }
 
-  void map_file(const char* path, bool is_overlay = false) {
+  static bool is_v2_dtype(uint32_t dtype) { return dtype == 16 || dtype == 23 || dtype == 24; }
+
+  // Returns false (and unmaps) for an overlay that would replace a v2 tensor.
+  bool map_file(const char* path, bool is_overlay = false) {
 #ifdef _WIN32
     // MapViewOfFile 等价 mmap：映射整个文件（64 位 VA，115 GiB 无压力），
     // 页按需从文件调入，不由 pagefile 支撑。os_map_ro 语义与
@@ -328,21 +334,43 @@ private:
     if (memcmp(h.magic, "HGN1", 4) != 0) throw std::runtime_error("bad magic");
     if ((uint64_t)h.file_size != len) throw std::runtime_error("size mismatch");
 
+    std::vector<Tensor> ts(h.tensor_count);
     for (uint32_t i = 0; i < h.tensor_count; i++) {
       Record r;
       memcpy(&r, p + h.records_offset + (uint64_t)i * sizeof(Record), sizeof(r));
-      Tensor t;
+      Tensor& t = ts[i];
       t.name.assign(r.name, strnlen(r.name, sizeof(r.name)));
       t.dtype = r.dtype;
       t.ndims = r.ndims;
       for (int k = 0; k < 4; k++) t.dims[k] = r.dims[k];
       t.data = p + r.data_offset;
       t.data_size = r.data_size;
+      if (is_overlay) {
+        auto it = index_.find(t.name);
+        if (it != index_.end() && is_v2_dtype(it->second.dtype)) {
+          unmap_last();
+          return false;
+        }
+      }
+    }
+    for (const Tensor& t : ts) {
       if (is_overlay)
         index_[t.name] = t;  // override
       else
         index_.emplace(t.name, t);
     }
+    return true;
+  }
+
+  void unmap_last() {
+    const Mapping& m = maps_.back();
+#ifdef _WIN32
+    UnmapViewOfFile(m.base);
+    CloseHandle((HANDLE)m.os_handle);
+#else
+    munmap((void*)m.base, m.len);
+#endif
+    maps_.pop_back();
   }
 };
 

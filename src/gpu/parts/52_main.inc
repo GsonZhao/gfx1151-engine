@@ -302,8 +302,8 @@ int main(int argc, char** argv) {
     // GDEC_MROPE_DUMP=<file> and compare via tools/cmp_mrope.py.
     Checkpoint ckpt(base.c_str());
     for (const auto& o : overlays)
-      if (!ckpt.add_overlay(o.c_str()))
-        fprintf(stderr, "overlay %s: already mapped, skipped\n", o.c_str());
+      if (const char* why = ckpt.add_overlay(o.c_str()))
+        fprintf(stderr, "overlay %s: %s, skipped\n", o.c_str(), why);
     if (tokens.empty()) {
       fprintf(stderr, "need --tokens\n");
       return 2;
@@ -351,8 +351,8 @@ int main(int argc, char** argv) {
     Checkpoint& ckpt = *ckbase;
     lmhead_base_capture(ckpt);
     for (const auto& o : overlays)
-      if (!ckpt.add_overlay(o.c_str()))
-        fprintf(stderr, "overlay %s: already mapped, skipped\n", o.c_str());
+      if (const char* why = ckpt.add_overlay(o.c_str()))
+        fprintf(stderr, "overlay %s: %s, skipped\n", o.c_str(), why);
     fprintf(stderr, "loaded %zu tensors (base+%zu overlay)\n", ckpt.tensor_count(),
             overlays.size());
     gguf_dense_apply(ckpt);
@@ -428,8 +428,8 @@ int main(int argc, char** argv) {
   Checkpoint& ckpt = *ckbase;
   lmhead_base_capture(ckpt);
   for (const auto& o : overlays)
-    if (!ckpt.add_overlay(o.c_str()))
-      fprintf(stderr, "overlay %s: already mapped, skipped\n", o.c_str());
+    if (const char* why = ckpt.add_overlay(o.c_str()))
+      fprintf(stderr, "overlay %s: %s, skipped\n", o.c_str(), why);
   fprintf(stderr, "loaded %zu tensors (base+%zu overlay)\n", ckpt.tensor_count(),
           overlays.size());
   gguf_dense_apply(ckpt);

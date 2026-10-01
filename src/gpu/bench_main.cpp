@@ -387,7 +387,9 @@ static LoadedModel load_model(const ModelPaths& paths, int maxctx) {
   loaded.checkpoint = open_base(paths.base.string());
   Checkpoint& checkpoint = *loaded.checkpoint;
   lmhead_base_capture(checkpoint);
-  for (const auto& overlay : paths.overlays) checkpoint.add_overlay(overlay.string().c_str());
+  for (const auto& overlay : paths.overlays)
+    if (const char* why = checkpoint.add_overlay(overlay.string().c_str()))
+      fprintf(stderr, "overlay %s: %s, skipped\n", overlay.string().c_str(), why);
   fprintf(stdout, "Loading %s weights...\n", paths.format == "hgn" ? "HGN" : "GGUF");
   fflush(stdout);
   gguf_dense_apply(checkpoint);
