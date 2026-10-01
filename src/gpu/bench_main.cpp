@@ -395,6 +395,7 @@ static LoadedModel load_model(const ModelPaths& paths, int maxctx) {
   memstats_capture_hip_baseline();
   devarena_init(checkpoint, maxctx);
   load_arena(checkpoint);
+  v2_init(checkpoint);  // hgn v2 sidecars / codebook (no-op for v1 and GGUF)
   loaded.model = std::make_unique<GpuModel>(checkpoint, maxctx);
   loaded.model->setup_draft_lmhead(g_lmhead_base_ok ? &g_lmhead_base : nullptr);
   gguf_dense_release(checkpoint);
