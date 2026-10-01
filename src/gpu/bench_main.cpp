@@ -349,6 +349,13 @@ static ModelPaths configured_model(const BenchConfig& config) {
       require_file(overlay, "HGN overlay");
       result.overlays.push_back(overlay);
     }
+    // PLE n-gram table: same file as MODEL_FILE for w4b, separate *-ngram.hgn for v2.
+    const auto ngram = rooted_path(config, config_value(config, "NGRAM_FILE"));
+    if (!ngram.empty()) {
+      require_file(ngram, "HGN n-gram table");
+      std::error_code ec;
+      if (!std::filesystem::equivalent(ngram, result.base, ec)) result.overlays.push_back(ngram);
+    }
     result.mtp = rooted_path(config, config_value(config, "MTP_FILE"));
     if (!result.mtp.empty()) {
       require_file(result.mtp, "HGN MTP weights");

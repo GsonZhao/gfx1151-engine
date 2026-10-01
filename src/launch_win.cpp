@@ -107,6 +107,23 @@ bool file_exists(const std::string& path) {
     return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
 }
 
+// 两个路径是否同一文件（卷序列号 + 文件 ID；打不开时退回字符串比较）。
+bool same_file(const std::string& a, const std::string& b) {
+    if (a == b) return true;
+    BY_HANDLE_FILE_INFORMATION ia{}, ib{};
+    auto info = [](const std::string& p, BY_HANDLE_FILE_INFORMATION* out) {
+        HANDLE h = CreateFileA(p.c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                               nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h == INVALID_HANDLE_VALUE) return false;
+        const bool ok = GetFileInformationByHandle(h, out) != 0;
+        CloseHandle(h);
+        return ok;
+    };
+    if (!info(a, &ia) || !info(b, &ib)) return false;
+    return ia.dwVolumeSerialNumber == ib.dwVolumeSerialNumber &&
+           ia.nFileIndexHigh == ib.nFileIndexHigh && ia.nFileIndexLow == ib.nFileIndexLow;
+}
+
 bool dir_exists(const std::string& path) {
     DWORD a = GetFileAttributesA(path.c_str());
     return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
@@ -862,6 +879,8 @@ int main(int argc, char** argv) {
 
     const std::string model_dir = cfg("MODEL_DIR", "models");
     const std::string model_file = cfg("MODEL_FILE", model_dir + "\\heretic.hgn");
+    // PLE n-gram 表所在文件：默认同 MODEL_FILE（w4b 单文件）；halogen v2 指向独立的 *-ngram.hgn。
+    const std::string ngram_file = cfg("NGRAM_FILE", model_file);
     const std::string mtp_file =
         cfg_optional("MTP_FILE", model_dir + "\\heretic-mtp.hgn");
     const std::string vision_file =
@@ -898,6 +917,8 @@ int main(int argc, char** argv) {
     if (!file_exists("build\\gdec-win.exe")) fail("缺少 build\\gdec-win.exe");
     if (!file_exists("build\\gdec-api-win.exe")) fail("缺少 build\\gdec-api-win.exe");
     if (!file_exists(model_file)) fail("找不到模型：" + model_file + "（修改 service.conf）");
+    if (!file_exists(ngram_file))
+        fail("找不到 n-gram 表：" + ngram_file + "（w4b 与 MODEL_FILE 相同，修改 service.conf）");
     if (!mtp_file.empty() && !file_exists(mtp_file)) fail("找不到 MTP 权重：" + mtp_file);
     if (!vision_file.empty() && !file_exists(vision_file))
         fail("找不到视觉塔：" + vision_file + "（纯文本可 set VISION_FILE= 后启动）");
@@ -983,6 +1004,7 @@ int main(int argc, char** argv) {
     std::vector<std::string>& engine_args = g_plan.engine_args;
     engine_args = {model_file};
     if (!overlay_file.empty()) engine_args.push_back(overlay_file);
+    if (!same_file(ngram_file, model_file)) engine_args.push_back(ngram_file);
     if (!mtp_file.empty()) engine_args.push_back(mtp_file);
     engine_args.insert(engine_args.end(),
                        {"--serve", "--host", engine_host, "--port", std::to_string(engine_port),

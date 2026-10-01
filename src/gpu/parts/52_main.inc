@@ -301,7 +301,9 @@ int main(int argc, char** argv) {
     // and none of the rope machinery touches weights. Use with
     // GDEC_MROPE_DUMP=<file> and compare via tools/cmp_mrope.py.
     Checkpoint ckpt(base.c_str());
-    for (const auto& o : overlays) ckpt.add_overlay(o.c_str());
+    for (const auto& o : overlays)
+      if (!ckpt.add_overlay(o.c_str()))
+        fprintf(stderr, "overlay %s: already mapped, skipped\n", o.c_str());
     if (tokens.empty()) {
       fprintf(stderr, "need --tokens\n");
       return 2;
@@ -348,7 +350,9 @@ int main(int argc, char** argv) {
     auto ckbase = open_base(base);
     Checkpoint& ckpt = *ckbase;
     lmhead_base_capture(ckpt);
-    for (const auto& o : overlays) ckpt.add_overlay(o.c_str());
+    for (const auto& o : overlays)
+      if (!ckpt.add_overlay(o.c_str()))
+        fprintf(stderr, "overlay %s: already mapped, skipped\n", o.c_str());
     fprintf(stderr, "loaded %zu tensors (base+%zu overlay)\n", ckpt.tensor_count(),
             overlays.size());
     gguf_dense_apply(ckpt);
@@ -368,6 +372,7 @@ int main(int argc, char** argv) {
     }
     devarena_init(ckpt, maxctx);
     load_arena(ckpt);
+    v2_init(ckpt);
     GpuModel m(ckpt, maxctx);
     m.setup_draft_lmhead(g_lmhead_base_ok ? &g_lmhead_base : nullptr);
     gguf_dense_release(ckpt);
@@ -419,7 +424,9 @@ int main(int argc, char** argv) {
   auto ckbase = open_base(base);
   Checkpoint& ckpt = *ckbase;
   lmhead_base_capture(ckpt);
-  for (const auto& o : overlays) ckpt.add_overlay(o.c_str());
+  for (const auto& o : overlays)
+    if (!ckpt.add_overlay(o.c_str()))
+      fprintf(stderr, "overlay %s: already mapped, skipped\n", o.c_str());
   fprintf(stderr, "loaded %zu tensors (base+%zu overlay)\n", ckpt.tensor_count(),
           overlays.size());
   gguf_dense_apply(ckpt);
@@ -436,6 +443,7 @@ int main(int argc, char** argv) {
   memstats_capture_hip_baseline();
   devarena_init(ckpt, maxctx);
   load_arena(ckpt);
+  v2_init(ckpt);
 
   GpuModel m(ckpt, maxctx);
   m.setup_draft_lmhead(g_lmhead_base_ok ? &g_lmhead_base : nullptr);

@@ -28,6 +28,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
+#include <filesystem>
 #include <list>
 #include <stdexcept>
 #include <string>
@@ -106,8 +107,15 @@ public:
   Checkpoint(const Checkpoint&) = delete;
   Checkpoint& operator=(const Checkpoint&) = delete;
 
-  // overlay tensors override base tensors with the same name
-  void add_overlay(const char* path) { map_file(path, true); }
+  // overlay tensors override base tensors with the same name. A file that is
+  // already mapped (e.g. NGRAM_FILE == MODEL_FILE on a single-file w4b) is
+  // skipped, so one path is never mapped twice. Returns false when skipped.
+  bool add_overlay(const char* path) {
+    for (const auto& m : maps_)
+      if (same_file(m.path, path)) return false;
+    map_file(path, true);
+    return true;
+  }
 
   // In-memory tensor (GGUF-derived) owning its bytes; overrides by name like
   // an overlay. t.data / t.data_size are set from buf.
@@ -255,7 +263,14 @@ public:
     const uint8_t* base;
     size_t len;
     void* os_handle = nullptr;  // Windows: 保持打开的句柄（OVERLAPPED|NO_BUFFERING，pload 直读用）
+    std::string path;           // as given to the constructor / add_overlay
   };
+  // mapping that holds p (tensor data pointer), or nullptr
+  const Mapping* mapping_of(const uint8_t* p) const {
+    for (const auto& m : maps_)
+      if (p >= m.base && p < m.base + m.len) return &m;
+    return nullptr;
+  }
   const std::vector<Mapping>& mappings() const { return maps_; }
   const std::unordered_map<std::string, Tensor>& tensors() const { return index_; }
 
@@ -264,6 +279,12 @@ private:
   std::unordered_map<std::string, Tensor> index_;
   std::list<std::vector<uint8_t>> owned_;  // synthetic tensor storage (stable addresses)
   size_t n_synth_ = 0;
+
+  static bool same_file(const std::string& a, const char* b) {
+    std::error_code ec;
+    const bool eq = std::filesystem::equivalent(a, b, ec);
+    return ec ? a == b : eq;
+  }
 
   void map_file(const char* path, bool is_overlay = false) {
 #ifdef _WIN32
@@ -288,7 +309,7 @@ private:
     const uint8_t* p = (const uint8_t*)MapViewOfFile(mh, FILE_MAP_READ, 0, 0, len);
     CloseHandle(mh);
     if (!p) throw std::runtime_error("MapViewOfFile");
-    maps_.push_back({p, len, (void*)fh});
+    maps_.push_back({p, len, (void*)fh, path});
 #else
     int fd = open(path, O_RDONLY | O_CLOEXEC);
     if (fd < 0) throw std::runtime_error(std::string("open ") + path + ": " + strerror(errno));
@@ -299,7 +320,7 @@ private:
         (const uint8_t*)mmap(nullptr, len, PROT_READ, MAP_PRIVATE, fd, 0);
     if (p == MAP_FAILED) throw std::runtime_error("mmap");
     // advise random? leave default; page cache shared with the running server
-    maps_.push_back({p, len});
+    maps_.push_back({p, len, nullptr, path});
 #endif
 
     Header h;

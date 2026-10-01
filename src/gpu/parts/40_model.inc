@@ -730,8 +730,18 @@ struct GpuModel {
     char buf[128];
     std::vector<float> tmp;
     auto upload = [&](const char* name, float* dst, size_t n) {
+      const Tensor& t = ckpt.at(name);
+      if (t.dtype == 16 || t.dtype == 24) {  // hgn v2 (fp32 indexer projection): decode on GPU
+        uint16_t* bf;
+        CK(hipMalloc(&bf, n * 2));
+        v2_deq_bf16(wview(t), bf, g_str);
+        k_bf16_to_f32<<<(unsigned)((n + 255) / 256), 256, 0, g_str>>>(bf, dst, n);
+        CK(hipStreamSynchronize(g_str));
+        CK(hipFree(bf));
+        return;
+      }
       tmp.resize(n);
-      ckpt.dequant(ckpt.at(name), tmp.data());
+      ckpt.dequant(t, tmp.data());
       CK(hipMemcpy(dst, tmp.data(), n * 4, hipMemcpyHostToDevice));
     };
     int gi = 0;
@@ -773,7 +783,11 @@ struct GpuModel {
       memcpy(ple_vsz, vs.data, 128);
       const Tensor& vo = ckpt.at("layers.1.ple.ple_embedding.ngram_heads_offsets");
       memcpy(ple_voff, vo.data, 128);
-      ple_table = &ckpt.at("layers.1.ple.ngram_embedding.weight");
+      ple_table = ckpt.find("layers.1.ple.ngram_embedding.weight");
+      if (!ple_table)
+        throw std::runtime_error(
+            "PLE n-gram table (layers.1.ple.ngram_embedding.weight) not found: hgn v2 keeps it "
+            "in a separate file — set NGRAM_FILE (gdec: pass that .hgn as an overlay)");
       ple_iq4 = ple_table->dtype == 11;
       if (ple_iq4) {
         // GGUF IQ4_NL table: 90 B rows, no global scale. The batch-read fd is
@@ -790,17 +804,22 @@ struct GpuModel {
 #endif
       } else {
       memcpy(&ple_tscale, ple_table->data + ple_table->numel(), 4);
-      // io_uring path: file offset of the PLE table in the base .hgn. The fd
-      // is the base file, so only the base mapping (maps from file offset 0)
-      // is meaningful — if an overlay shadows the table, fall back.
+      // io_uring / IOCP path: file offset of the PLE table in the file that
+      // holds it. open_base opened the base .hgn; a separate n-gram file
+      // (NGRAM_FILE, passed as an overlay — hgn v2 ships the table on its
+      // own) re-points the reader at that file. Every mapping maps its file
+      // from offset 0.
+      if (const auto* mp = ckpt.mapping_of(ple_table->data)) {
+        if (!ckpt.mappings().empty() && mp != &ckpt.mappings()[0]) {
+          ple_uring_open(mp->path.c_str());
+          fprintf(stderr, "ple: n-gram table from %s\n", mp->path.c_str());
+        }
 #ifdef _WIN32
-      if (g_ple_win.fh != INVALID_HANDLE_VALUE && !ckpt.mappings().empty()) {
+        if (g_ple_win.fh != INVALID_HANDLE_VALUE) {
 #else
-      if (g_ple_fd >= 0 && !ckpt.mappings().empty()) {
+        if (g_ple_fd >= 0) {
 #endif
-        const auto& mp0 = ckpt.mappings()[0];
-        if (ple_table->data >= mp0.base && ple_table->data < mp0.base + mp0.len) {
-          g_ple_foff = (uint64_t)(ple_table->data - mp0.base);
+          g_ple_foff = (uint64_t)(ple_table->data - mp->base);
           g_ple_off_ok = true;
         }
       }
@@ -1412,22 +1431,71 @@ struct GpuModel {
   bool moe_down_direct(int k, const WView& dn) const {
     return moe_down_topk && k == 10 && dn.cols == 640;
   }
-  void moe_down1(int k, const WView& dn, const int* topids) {
+  // Routed-expert tensor -> operands of the q4cp-style grouped kernels. q4cp
+  // (dtype 5): 64 B codebook header, one f16 scale per 32 cols (GSH 0). hgn v2
+  // i4r (dtype 23): codes at 0, linear -8..7 book, one scale per 128 (GSH 2).
+  struct XCodes {
+    const uint8_t* codes;
+    const uint8_t* scales;
+    const float* cb;
+  };
+  static XCodes xcodes(const WView& w) {
+    if (w.dtype == 23) return {w.data, w.data + w.rows * w.cols / 2, g_i4r_cb};
+    return {w.data + 64, w.data + 64 + w.rows * w.cols / 2, (const float*)w.data};
+  }
+  template <int GSH>
+  void moe_down1_t(int k, const WView& dn, const int* topids) {
+    const XCodes c = xcodes(dn);
     if (moe_down_direct(k, dn)) {
       const uint64_t row_pairs = (g_cfg.d + 1) / 2, warps_per_block = 128 / 32;
-      k_q4cp_gemv_gd_topk_h16<10><<<(unsigned)((row_pairs + warps_per_block - 1) / warps_per_block),
+      k_q4cp_gemv_gd_topk_h16<10, GSH><<<(unsigned)((row_pairs + warps_per_block - 1) / warps_per_block),
                                     128, 0, g_str>>>(
-          dn.data + 64, dn.data + 64 + dn.rows * dn.cols / 2, (const float*)dn.data, d_hid,
+          c.codes, c.scales, c.cb, d_hid,
           d_moeacc, topids, d_topw, (uint64_t)g_cfg.d, dn.cols, dn.scale_stride,
           (uint64_t)g_cfg.moe_mid, 1, 16 /*id_stride*/, (uint64_t)g_cfg.d);
       return;
     }
     // v3 kernel: 2 rows per warp -> k * (d/2) warp-pairs
     uint64_t pairs = (uint64_t)k * ((g_cfg.d + 1) / 2);
-    k_q4cp_gemv_gd<<<(unsigned)((pairs + 15) / 16), 512, 0, g_str>>>(
-        dn.data + 64, dn.data + 64 + dn.rows * dn.cols / 2, (const float*)dn.data, d_hid,
+    k_q4cp_gemv_gd<GSH><<<(unsigned)((pairs + 15) / 16), 512, 0, g_str>>>(
+        c.codes, c.scales, c.cb, d_hid,
         d_moeacc, topids, d_topw, (uint64_t)g_cfg.d, dn.cols, dn.scale_stride,
         (uint64_t)g_cfg.moe_mid, k, 16 /*id_stride*/, 0 /*acc_stride*/, k);
+  }
+  void moe_down1(int k, const WView& dn, const int* topids) {
+    if (dn.dtype == 23)
+      moe_down1_t<2>(k, dn, topids);
+    else
+      moe_down1_t<0>(k, dn, topids);
+  }
+  // hgn v2 rotation helpers (k_v2_rot): P rows of n values, f32 in / f32 or
+  // f16 out; pre = input plane (rot_in), post = output plane (rot_out).
+  void v2_rot(const float* x, uint64_t xs, void* y, uint64_t ys, const float* pre,
+              const float* post, int n, int P, bool outh = false) {
+    const unsigned waves = (unsigned)P * (n / 128);
+    if (outh)
+      k_v2_rot<float, true><<<(waves + 7) / 8, 256, 0, g_str>>>(x, xs, y, ys, pre, post, n, P);
+    else
+      k_v2_rot<float, false><<<(waves + 7) / 8, 256, 0, g_str>>>(x, xs, y, ys, pre, post, n, P);
+  }
+  // i4r routed experts for one token (decode / MTP-free trunk): x -> d_moeacc.
+  //   rot_in(x, su) -> gate_up (rotated) -> k_i4r_mid (rot_out, silu*u,
+  //   rot_in(down.suh)) -> down (rotated, weighted sum over experts) ->
+  //   rot_out(acc, down.svh). svh is shared by all experts of a layer, so the
+  //   output rotation runs once on the weighted sum.
+  void moe_v2_1(int k, const WView& gu, const WView& dn, const float* x, const int* topids) {
+    const int d = g_cfg.d, mid = g_cfg.moe_mid;
+    if (!moe_down_direct(k, dn)) CK(hipMemsetAsync(d_moeacc, 0, d * 4, g_str));
+    v2_rot(x, 0, d_ey, 0, gu.suh, nullptr, d, 1);  // d_ey: free until the shared expert
+    const XCodes c = xcodes(gu);
+    const uint64_t pairs = (uint64_t)k * mid;
+    k_q4cp_gemv_gg<2><<<(unsigned)((pairs + 15) / 16), 512, 0, g_str>>>(
+        c.codes, c.scales, c.cb, d_ey, d_guv, topids, (uint64_t)2 * mid, gu.cols,
+        gu.scale_stride, k, 0 /*x_stride*/, 16 /*id_stride*/, k);
+    k_i4r_mid<false><<<k, 2 * mid / 128 * 32, 0, g_str>>>(d_guv, 2 * mid, d_hid, mid, gu.svh,
+                                                          dn.suh, mid);
+    moe_down1(k, dn, topids);
+    v2_rot(d_moeacc, 0, d_moeacc, 0, nullptr, dn.svh, d, 1);
   }
   // GGUF routed experts g (trunk layer g_ggx[l] or the MTP layer g_ggx_mtp;
   // needs gg_on() for the scratch buffers): x f32 [P][d] with top-k
@@ -1561,13 +1629,16 @@ struct GpuModel {
       WView gu = wview(ckpt.at(buf));
       snprintf(buf, sizeof buf, "layers.%d.mlp.experts.down_proj.weight", l);
       WView dn = wview(ckpt.at(buf));
+      if (gu.dtype == 23) {
+        moe_v2_1(k, gu, dn, x, d_topids);
+      } else {
       if (!moe_down_direct(k, dn)) CK(hipMemsetAsync(d_moeacc, 0, g_cfg.d * 4, g_str));
       const int* topids = d_topids;  // 直读:ids 即专家号,免 D2H 同步
       // fused experts: one grouped launch each for gate_up / silu / down+accum
       {
         // v3 kernel: 2 rows per warp -> k * moe_mid warp-pairs
         uint64_t pairs = (uint64_t)k * g_cfg.moe_mid;
-        k_q4cp_gemv_gg<<<(unsigned)((pairs + 15) / 16), 512, 0, g_str>>>(
+        k_q4cp_gemv_gg<0><<<(unsigned)((pairs + 15) / 16), 512, 0, g_str>>>(
             gu.data + 64, gu.data + 64 + gu.rows * gu.cols / 2, (const float*)gu.data, x,
             d_guv, topids, (uint64_t)2 * g_cfg.moe_mid, gu.cols, gu.scale_stride, k,
             0 /*x_stride*/, 16 /*id_stride*/, k);
@@ -1575,6 +1646,7 @@ struct GpuModel {
       k_silu_mul_g<<<(k * g_cfg.moe_mid + 255) / 256, 256, 0, g_str>>>(d_guv, d_hid,
                                                                        g_cfg.moe_mid, k);
       moe_down1(k, dn, topids);
+      }
     }
     // shared expert
     snprintf(buf, sizeof buf, "layers.%d.mlp.shared_expert.gate_proj.weight", l);
@@ -1834,6 +1906,11 @@ struct GpuModel {
       uint64_t tot = N * K / 32;
       k_dequant_q8g32_bf16<<<(unsigned)((tot + 255) / 256), 256, 0, g_str>>>(
           (const int8_t*)w.data, (const __half*)(w.data + N * K), d_wbf16, N, K);
+      wp = d_wbf16;
+    } else if (w.dtype == 16 || w.dtype == 24) {  // hgn v2 ht / q6g64
+      if (N * K * 2 > ((size_t)64 << 20))
+        throw std::runtime_error("gemm: weight too big for d_wbf16");
+      v2_deq_bf16(w, d_wbf16, g_str);
       wp = d_wbf16;
     } else {
       throw std::runtime_error("gemm: unsupported dtype");
@@ -2232,7 +2309,7 @@ struct GpuModel {
     if (!ct) return inj_wcache_[prefix] = nullptr;
     const WView w = wview(*ct);
     if ((uint64_t)w.rows != 4 || (uint64_t)w.cols != (uint64_t)4 * g_cfg.d ||
-        !(w.dtype == 0 || w.dtype == 5 || w.dtype == 7 || w.dtype == 8))
+        !(w.dtype == 0 || w.dtype == 5 || w.dtype == 7 || w.dtype == 8 || w.dtype == 24))
       return inj_wcache_[prefix] = nullptr;
     const uint16_t* src = gemm_wbf16(w);
     uint16_t* dst = (uint16_t*)src;
@@ -3250,6 +3327,11 @@ struct GpuModel {
     WView gu = wview(ckpt.at(buf));
     snprintf(buf, sizeof buf, "layers.%d.mlp.experts.down_proj.weight", l);
     WView dn = wview(ckpt.at(buf));
+    if (gu.dtype == 23) {  // hgn v2 i4r: own paths (q4cp fast paths do not apply)
+      moe_b_v2(gu, dn, acc, P);
+      moe_b_shared(l, P, acc, direct_output);
+      return;
+    }
     // Shared expert first (its scratch d_guvb/d_hidb/d_xbf16b is dead before
     // the routed experts reuse it), so its add folds into the routed reduce.
     // GDEC_MOE_SG_FUSE=0: old order + k_axpy_sg.
@@ -3294,7 +3376,7 @@ struct GpuModel {
       }
       // v3 kernels: 2 rows per warp -> halved warp counts
       uint64_t pairs = (uint64_t)P * k * g_cfg.moe_mid;
-      k_q4cp_gemv_gg<<<(unsigned)((pairs + 15) / 16), 512, 0, g_str>>>(
+      k_q4cp_gemv_gg<0><<<(unsigned)((pairs + 15) / 16), 512, 0, g_str>>>(
           gu.data + 64, gu.data + 64 + gu.rows * gu.cols / 2, (const float*)gu.data,
           d_xb, d_guvb, topidsb, (uint64_t)2 * g_cfg.moe_mid, gu.cols,
           gu.scale_stride, P * k, (uint64_t)g_cfg.d, 16, k, slot_order);
@@ -3303,7 +3385,7 @@ struct GpuModel {
       if (direct_down) {
         uint64_t row_pairs = (g_cfg.d + 1) / 2;
         constexpr uint64_t warps_per_block = 128 / 32;
-        k_q4cp_gemv_gd_topk_h16<10><<<
+        k_q4cp_gemv_gd_topk_h16<10, 0><<<
             (unsigned)(((uint64_t)P * row_pairs + warps_per_block - 1) /
                        warps_per_block),
             128, 0, g_str>>>(
@@ -3313,7 +3395,7 @@ struct GpuModel {
             (uint64_t)g_cfg.moe_mid, P, 16, (uint64_t)g_cfg.d);
       } else {
         uint64_t pairs2 = (uint64_t)P * k * ((g_cfg.d + 1) / 2);
-        k_q4cp_gemv_gd<<<(unsigned)((pairs2 + 15) / 16), 512, 0, g_str>>>(
+        k_q4cp_gemv_gd<0><<<(unsigned)((pairs2 + 15) / 16), 512, 0, g_str>>>(
             dn.data + 64, dn.data + 64 + dn.rows * dn.cols / 2,
             (const float*)dn.data, d_hidb, acc, topidsb, d_topwb,
             (uint64_t)g_cfg.d, dn.cols, dn.scale_stride,
@@ -3717,6 +3799,72 @@ struct GpuModel {
       }
     }
     moe_b_shared(l, P, acc, direct_output);
+  }
+
+  // hgn v2 i4r routed experts for P rows of d_xb (topk in d_topidsb/d_topwb) ->
+  // acc f32 [P][d], fully overwritten. Same dataflow as moe_v2_1; small P
+  // (verify) runs the grouped GEMVs, larger P the kI4R LUT WMMA kernels on the
+  // moe_q4w_run workspaces (raw gate|up f32 in d_guvb, dead once k_i4r_mid has
+  // written the F16 down input to d_hidb; d_guvb then takes the down pairs).
+  void moe_b_v2(const WView& gu, const WView& dn, float* acc, int P) {
+    const int k = g_cfg.topk, E = g_cfg.experts, d = g_cfg.d, mid = g_cfg.moe_mid;
+    if (gu.cols != (uint64_t)d || gu.rows != (uint64_t)E * 2 * mid || dn.dtype != 23 ||
+        dn.cols != (uint64_t)mid || dn.rows != (uint64_t)E * d || mid % 128 || d % 128 ||
+        2 * mid > 2048)
+      throw std::runtime_error("moe_b_v2: unexpected i4r expert shapes");
+    const unsigned mid_threads = 2 * mid / 128 * 32;
+    const moelut::LutW pgu = lut_i4r_view(gu.data, gu.rows, gu.cols, g_i4r_cb, 2 * mid, mid);
+    const moelut::LutW pdn = lut_i4r_view(dn.data, dn.rows, dn.cols, g_i4r_cb, d, 0);
+    const bool lut = moe_q4w && !moe_naive && P > moe_naive_max && k == 10 && moe_deterministic &&
+                     !moe_host_route && !moe_ordered && !moe_untiled && P <= maxbatch_cap &&
+                     mid % 64 == 0 &&
+                     moelut::lut_ok(moelut::kI4R, pgu, true, d) &&
+                     moelut::lut_ok(moelut::kI4R, pdn, false, mid);
+    if (lut) {
+      static bool logged = false;
+      if (!logged) {
+        logged = true;
+        fprintf(stderr, "moe prefill: hgn v2 i4r LUT WMMA\n");
+      }
+      moe_routing.run(d_topidsb, d_topwb, d_tokidx, d_pweight, d_eoff, d_pairids, P, k, E);
+      k_moe_tiles<<<1, 512, 0, g_str>>>(d_eoff, d_moetiles, d_moentiles, E);
+      const int max_tiles = (P * k + 63) / 64 + E;
+      __half* x16 = (__half*)d_xbf16b;
+      __half* hid = (__half*)d_hidb;
+      v2_rot(d_xb, d, x16, d, gu.suh, nullptr, d, P, true);
+      moe_lut_up_raw(pgu, x16, d_tokidx, d_moetiles, d_moentiles, max_tiles, d_guvb, mid, d,
+                     g_str);
+      k_i4r_mid<true><<<P * k, mid_threads, 0, g_str>>>(d_guvb, 2 * mid, hid, mid, gu.svh,
+                                                        dn.suh, mid);
+      moe_lut_down(moelut::kI4R, pdn, hid, d_moetiles, d_moentiles, max_tiles, d_guvb, d, mid,
+                   g_str);
+      k_moe_reduce_pw<10><<<dim3((d + 255) / 256, P), 256, 0, g_str>>>(d_guvb, d_pairids,
+                                                                       d_pweight, acc, P, d);
+    } else {
+      const XCodes cg = xcodes(gu), cd = xcodes(dn);
+      const bool direct_down = moe_down_topk && k == 10;
+      if (!direct_down) CK(hipMemsetAsync(acc, 0, (size_t)P * d * 4, g_str));
+      v2_rot(d_xb, d, d_eyb, d, gu.suh, nullptr, d, P);  // d_eyb: free until the shared expert
+      const uint64_t pairs = (uint64_t)P * k * mid;
+      k_q4cp_gemv_gg<2><<<(unsigned)((pairs + 15) / 16), 512, 0, g_str>>>(
+          cg.codes, cg.scales, cg.cb, d_eyb, d_guvb, d_topidsb, (uint64_t)2 * mid, gu.cols,
+          gu.scale_stride, P * k, (uint64_t)d, 16, k, nullptr);
+      k_i4r_mid<false><<<P * k, mid_threads, 0, g_str>>>(d_guvb, 2 * mid, d_hidb, mid, gu.svh,
+                                                         dn.suh, mid);
+      if (direct_down) {
+        const uint64_t row_pairs = (d + 1) / 2, warps_per_block = 128 / 32;
+        k_q4cp_gemv_gd_topk_h16<10, 2><<<
+            (unsigned)(((uint64_t)P * row_pairs + warps_per_block - 1) / warps_per_block), 128, 0,
+            g_str>>>(cd.codes, cd.scales, cd.cb, d_hidb, acc, d_topidsb, d_topwb, (uint64_t)d,
+                     dn.cols, dn.scale_stride, (uint64_t)mid, P, 16, (uint64_t)d);
+      } else {
+        const uint64_t pairs2 = (uint64_t)P * k * ((d + 1) / 2);
+        k_q4cp_gemv_gd<2><<<(unsigned)((pairs2 + 15) / 16), 512, 0, g_str>>>(
+            cd.codes, cd.scales, cd.cb, d_hidb, acc, d_topidsb, d_topwb, (uint64_t)d, dn.cols,
+            dn.scale_stride, (uint64_t)mid, P * k, 16, (uint64_t)d, k);
+      }
+    }
+    v2_rot(acc, d, acc, d, nullptr, dn.svh, d, P);
   }
 
   // Shared expert of trunk layer l added into acc (routed sum), then acc -> d_yb.
@@ -4407,7 +4555,7 @@ struct GpuModel {
       if (!moe_down_direct(k, dn)) CK(hipMemsetAsync(d_moeacc, 0, g_cfg.d * 4, g_str));
       const int* topids = d_topids;  // 直读:ids 即专家号,免 D2H 同步
       uint64_t pairs = (uint64_t)k * g_cfg.moe_mid;
-      k_q4cp_gemv_gg<<<(unsigned)((pairs + 15) / 16), 512, 0, g_str>>>(
+      k_q4cp_gemv_gg<0><<<(unsigned)((pairs + 15) / 16), 512, 0, g_str>>>(
           gu.data + 64, gu.data + 64 + gu.rows * gu.cols / 2, (const float*)gu.data,
           x, d_guv, topids, (uint64_t)2 * g_cfg.moe_mid, gu.cols, gu.scale_stride,
           k, 0 /*x_stride*/, 16 /*id_stride*/, k);

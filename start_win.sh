@@ -34,6 +34,8 @@ esac
 
 MODEL_DIR="${MODEL_DIR:-./models}"
 MODEL_FILE="${MODEL_FILE:-$MODEL_DIR/heretic.hgn}"
+# PLE n-gram 表所在文件：默认同 MODEL_FILE（w4b 单文件）；v2 指向独立的 *-ngram.hgn。
+NGRAM_FILE="${NGRAM_FILE:-$MODEL_FILE}"
 MTP_FILE="${MTP_FILE-$MODEL_DIR/heretic-mtp.hgn}"
 VISION_FILE="${VISION_FILE-$MODEL_DIR/heretic-vision.hgn}"
 # 覆盖层（可选的高精度替换张量）：默认空=不叠加；非空但文件不存在则报错。
@@ -90,6 +92,7 @@ awk "BEGIN { exit !($ROPE_FACTOR >= 1 && $ROPE_BETA_FAST > 0 && $ROPE_BETA_SLOW 
 [[ -f build/gdec-win.exe ]] || fail '缺少 build/gdec-win.exe，请先运行 bash build_win.sh'
 [[ -f build/gdec-api-win.exe ]] || fail '缺少 build/gdec-api-win.exe，请先运行 bash build_win.sh api'
 [[ -r "$MODEL_FILE" ]] || fail "找不到模型：$MODEL_FILE"
+[[ -r "$NGRAM_FILE" ]] || fail "找不到 n-gram 表：$NGRAM_FILE（w4b 与 MODEL_FILE 相同）"
 [[ -z "$MTP_FILE" || -r "$MTP_FILE" ]] || fail "找不到 MTP 权重：$MTP_FILE"
 [[ -z "$VISION_FILE" || -r "$VISION_FILE" ]] || fail "找不到视觉塔：$VISION_FILE（纯文本可设 VISION_FILE=\"\"）"
 [[ -z "$OVERLAY_FILE" || -r "$OVERLAY_FILE" ]] || fail "找不到 overlay：$OVERLAY_FILE（无 overlay 可设 OVERLAY_FILE=\"\"）"
@@ -145,6 +148,7 @@ ENGINE_LOG="logs/engine-win-$(date +%Y%m%d-%H%M%S).log"
 
 engine=(build/gdec-win.exe "$MODEL_FILE")
 [[ -z "$OVERLAY_FILE" ]] || engine+=("$OVERLAY_FILE")
+[[ "$NGRAM_FILE" -ef "$MODEL_FILE" ]] || engine+=("$NGRAM_FILE")
 [[ -z "$MTP_FILE" ]] || engine+=("$MTP_FILE")
 engine+=(--serve --host "$ENGINE_HOST" --port "$ENGINE_PORT" --maxctx "$MAX_CONTEXT")
 [[ -z "$VISION_FILE" ]] || engine+=(--vision-tower "$VISION_FILE")

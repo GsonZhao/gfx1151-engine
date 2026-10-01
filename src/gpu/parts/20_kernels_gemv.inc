@@ -1528,6 +1528,7 @@ __global__ void k_moe_sort_slots(const int* __restrict__ ids, int P, int k,
 // v3 (decode GEMV governance): cb in LDS + 2 rows per warp; bit-exact vs the
 // original (same per-lane fma order and reduction). Grid must now cover
 // nslots * ceil(rows_per/2) warps, not nslots * rows_per.
+template <int GSH = 0>
 __global__ void k_q4cp_gemv_gg(const uint8_t* __restrict__ codes,
                                const uint8_t* __restrict__ scales,
                                const float* __restrict__ cb,
@@ -1557,12 +1558,12 @@ __global__ void k_q4cp_gemv_gg(const uint8_t* __restrict__ codes,
   float acc0 = 0.f, acc1 = 0.f;
   for (uint64_t g = lane; g < cols / 32; g += warpSize) {
     uint4 pk0 = *(const uint4*)(rc0 + g * 16);
-    float s0 = __half2float(*(const __half*)(rs0 + g * 2));
+    float s0 = __half2float(*(const __half*)(rs0 + (g >> GSH) * 2));
     uint4 pk1 = make_uint4(0, 0, 0, 0);
     float s1 = 0.f;
     if (has1) {
       pk1 = *(const uint4*)(rc1 + g * 16);
-      s1 = __half2float(*(const __half*)(rs1 + g * 2));
+      s1 = __half2float(*(const __half*)(rs1 + (g >> GSH) * 2));
     }
     const float* xg = xt + g * 32;
     float xv[32];
@@ -1615,6 +1616,7 @@ __global__ void k_silu_mul_g(const float* __restrict__ guv, float* __restrict__ 
 // per-row math bit-exact vs the LPW=32 original on wave32 (the atomicAdd set
 // per output element is unchanged). Grid must cover nslots*ceil(rows_per/2)
 // warps.
+template <int GSH = 0>
 __global__ void k_q4cp_gemv_gd(const uint8_t* __restrict__ codes,
                                const uint8_t* __restrict__ scales,
                                const float* __restrict__ cb,
@@ -1643,12 +1645,12 @@ __global__ void k_q4cp_gemv_gd(const uint8_t* __restrict__ codes,
   float acc0 = 0.f, acc1 = 0.f;
   for (uint64_t g = lane; g < cols / 32; g += warpSize) {
     uint4 pk0 = *(const uint4*)(rc0 + g * 16);
-    float s0 = __half2float(*(const __half*)(rs0 + g * 2));
+    float s0 = __half2float(*(const __half*)(rs0 + (g >> GSH) * 2));
     uint4 pk1 = make_uint4(0, 0, 0, 0);
     float s1 = 0.f;
     if (has1) {
       pk1 = *(const uint4*)(rc1 + g * 16);
-      s1 = __half2float(*(const __half*)(rs1 + g * 2));
+      s1 = __half2float(*(const __half*)(rs1 + (g >> GSH) * 2));
     }
     const float* xg = x + g * 32;
     float xv[32];
@@ -1689,7 +1691,7 @@ __global__ void k_q4cp_gemv_gd(const uint8_t* __restrict__ codes,
 // all top-10 expert partials in registers. Two 16-lane subgroups avoid the
 // 12 idle lanes of the K=640 full-wave mapping and eliminate atomic output
 // accumulation. This is intentionally limited to topk=10 by the host route.
-template <int KPT>
+template <int KPT, int GSH = 0>
 __global__ void k_q4cp_gemv_gd_topk_h16(
     const uint8_t* __restrict__ codes, const uint8_t* __restrict__ scales,
     const float* __restrict__ cb, const float* __restrict__ xs,
@@ -1719,7 +1721,7 @@ __global__ void k_q4cp_gemv_gd_topk_h16(
     const float* x = xs + ((size_t)tok * KPT + s) * x_stride;
     for (uint64_t g = lane; g < cols / 32; g += 16) {
       uint4 pk = *(const uint4*)(rc + g * 16);
-      float sc = __half2float(*(const __half*)(rs + g * 2));
+      float sc = __half2float(*(const __half*)(rs + (g >> GSH) * 2));
       const float* xg = x + g * 32;
       float xv[32];
 #pragma unroll
