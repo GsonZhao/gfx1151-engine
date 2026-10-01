@@ -66,9 +66,9 @@ int main() {
   check(engine_net::address(engine_net::kDefaultHost, 8730, &addr) &&
             addr.sin_addr.s_addr == htonl(INADDR_LOOPBACK) && ntohs(addr.sin_port) == 8730,
         "default engine address is loopback:8730, not wildcard");
-  for (const std::string& host : {"", "localhost", "::1", "999.0.0.1", "127.0.0",
+  for (const char* host : {"", "localhost", "::1", "999.0.0.1", "127.0.0",
                                  "127.00.0.1", "127.0.0.1:8730", "127.0.0.1junk"}) {
-    check(!engine_net::address(host, 8730, &addr), "reject invalid host '" + host + "'");
+    check(!engine_net::address(host, 8730, &addr), "reject invalid host '" + std::string(host) + "'");
   }
   check(!engine_net::address(engine_net::kDefaultHost, -1, &addr) &&
             !engine_net::address(engine_net::kDefaultHost, 65536, &addr),
