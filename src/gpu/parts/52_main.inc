@@ -364,9 +364,12 @@ int main(int argc, char** argv) {
       if (const char* e = getenv("GDEC_CONC_PREFILL_CHUNK")) {
         int v = atoi(e);
         if (v > 0) {
-          g_maxbatch_override = v;
-          fprintf(stderr, "gdec: parallel %d -> prefill chunk %d (GDEC_CONC_PREFILL_CHUNK)\n",
-                  eff_parallel(), eff_maxbatch(maxctx));
+          // 只缩不放：大于单路分段时沿用单路值（不放大工作区，也不拉长让出间隔）。
+          const int single = eff_maxbatch(maxctx);
+          g_maxbatch_override = std::min(v, single);
+          fprintf(stderr, "gdec: parallel %d -> prefill chunk %d (GDEC_CONC_PREFILL_CHUNK=%d%s)\n",
+                  eff_parallel(), eff_maxbatch(maxctx), v,
+                  v > single ? ", capped by single-stream chunk" : "");
         }
       }
     }

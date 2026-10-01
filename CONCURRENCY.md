@@ -27,11 +27,12 @@ rckpt 检查点连同 MTP 层的页一起钉住，恢复后继续 MTP 投机（`
 - **调度**：每个连接一个读线程（`PING/INFO/X` 随时响应），每个 `GEN` 一个工作线程；
   FIFO 票据锁拥有 GPU，持有者在让出点（spec 轮开头、prefill 分块边界、串行 decode
   每个 token）发现有人排队就交出。每条序列算出的结果与它单独运行逐位一致。
-- **并发时的 prefill 分段**：PARALLEL>1 时 prompt 按 `CONC_PREFILL_CHUNK`（默认 8192，引擎变量
-  `GDEC_CONC_PREFILL_CHUNK`）分段，单路仍是 16384。分段越小，长 prompt prefill 期间别的会话
-  卡得越短（32K prompt 实测最长卡顿 16384 时 830 ms、8192 时 624 ms），单独 prefill 的 PP 不变，
-  并发时这条 prompt 的首 token 约晚 8%。分段不逐位一致，对 BF16 真值的 KLD 相同（`tools/d1a_kld.sh`）。
-  0 = 并发时也用 16384。
+- **并发时的 prefill 分段**：PARALLEL>1 时 prompt 按 min(`CONC_PREFILL_CHUNK`, 单路分段) 分段
+  （默认 8192，引擎变量 `GDEC_CONC_PREFILL_CHUNK`；单路分段 = `PREFILL_CHUNK`，Linux 默认 16384），
+  只缩不放。`PREFILL_CHUNK` 管工作区显存和单条 prompt 的 PP，`CONC_PREFILL_CHUNK` 管并发响应：
+  分段越小，长 prompt prefill 期间别的会话卡得越短（32K prompt 实测最长卡顿 16384 时 830 ms、
+  8192 时 624 ms），代价是这条 prompt 的首 token 约晚 8%。它在启动时一次定死，只有一个请求时也按它分段。
+  分段不逐位一致，对 BF16 真值的 KLD 相同（`tools/d1a_kld.sh`）。0 = 并发时也用单路分段。
 - **超出路数**：第 N+1 个请求在引擎（和 API）里排队，直到有槽位空出；排队中可以取消。
 - **槽位复用**：新请求优先选 hist 是其严格前缀的空闲槽位（多轮对话免 prefill），其次
   空槽，再次连接已断开的最久未用槽，最后最久未用槽。

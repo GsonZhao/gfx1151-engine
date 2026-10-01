@@ -168,7 +168,9 @@ serve_run() {
     echo "KV：不分页（KV_PAGED=0）"
   fi
   if (( PARALLEL > 1 && CONC_PREFILL_CHUNK > 0 )); then
-    echo "prefill 分段：${CONC_PREFILL_CHUNK}（并发；单路 ${GDEC_PREFILL_CHUNK}）"
+    local conc=$CONC_PREFILL_CHUNK
+    (( conc > GDEC_PREFILL_CHUNK )) && conc=$GDEC_PREFILL_CHUNK
+    echo "prefill 分段：${conc}（并发，取 CONC_PREFILL_CHUNK 与单路 ${GDEC_PREFILL_CHUNK} 的较小值）"
   fi
   if (( CHECK )); then
     # 机器可读：引擎环境变量与命令行（tools/a5_verify.sh、pp_prod.sh 等解析这两段）
