@@ -886,7 +886,7 @@ int main(int argc, char** argv) {
     const std::string vision_file =
         cfg_optional("VISION_FILE", model_dir + "\\heretic-vision.hgn");
     // 覆盖层（可选的高精度替换张量，叠加在主权重之上、MTP 之前）：默认空。
-    const std::string overlay_file = cfg_optional("OVERLAY_FILE", "");
+    std::string overlay_file = cfg_optional("OVERLAY_FILE", "");
     const std::string tokenizer_dir =
         cfg("TOKENIZER_DIR", model_dir + "\\tokenizer");
     const std::string engine_host = cfg("ENGINE_HOST", engine_net::kDefaultHost);
@@ -922,9 +922,13 @@ int main(int argc, char** argv) {
     if (!mtp_file.empty() && !file_exists(mtp_file)) fail("找不到 MTP 权重：" + mtp_file);
     if (!vision_file.empty() && !file_exists(vision_file))
         fail("找不到视觉塔：" + vision_file + "（纯文本可 set VISION_FILE= 后启动）");
-    if (!overlay_file.empty() && !file_exists(overlay_file))
-        fail("找不到 overlay：" + overlay_file +
-             "（无 overlay 可在 service.conf 设 OVERLAY_FILE=\"\"）");
+    // overlay 可选：文件不在只警告并跳过（例如换成 v2 权重后忘了改配置）。
+    if (!overlay_file.empty() && !file_exists(overlay_file)) {
+        fprintf(stderr, "警告：找不到 overlay：%s，已跳过（v2 权重不用 overlay；"
+                        "不想看到这条可在 service.conf 设 OVERLAY_FILE=\"\"）\n",
+                overlay_file.c_str());
+        overlay_file.clear();
+    }
     if (!file_exists(tokenizer_dir + "\\tokenizer.json"))
         fail("找不到 tokenizer：" + tokenizer_dir);
     if (!dir_exists("build\\rocblas\\library") || !dir_exists("build\\hipblaslt\\library"))

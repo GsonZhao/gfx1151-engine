@@ -345,9 +345,13 @@ static ModelPaths configured_model(const BenchConfig& config) {
     result.base = rooted_path(config, config_value(config, "MODEL_FILE"));
     require_file(result.base, "HGN model");
     const auto overlay = rooted_path(config, config_value(config, "OVERLAY_FILE"));
-    if (!overlay.empty()) {
-      require_file(overlay, "HGN overlay");
-      result.overlays.push_back(overlay);
+    if (!overlay.empty()) {  // optional: warn and skip when missing (e.g. v2 with a stale config)
+      std::error_code ec;
+      if (std::filesystem::is_regular_file(overlay, ec))
+        result.overlays.push_back(overlay);
+      else
+        fprintf(stderr, "Warning: HGN overlay not found, skipped: %s (v2 weights need no overlay; "
+                        "set OVERLAY_FILE=\"\" to silence)\n", overlay.string().c_str());
     }
     // PLE n-gram table: same file as MODEL_FILE for w4b, separate *-ngram.hgn for v2.
     const auto ngram = rooted_path(config, config_value(config, "NGRAM_FILE"));

@@ -38,7 +38,7 @@ MODEL_FILE="${MODEL_FILE:-$MODEL_DIR/heretic.hgn}"
 NGRAM_FILE="${NGRAM_FILE:-$MODEL_FILE}"
 MTP_FILE="${MTP_FILE-$MODEL_DIR/heretic-mtp.hgn}"
 VISION_FILE="${VISION_FILE-$MODEL_DIR/heretic-vision.hgn}"
-# 覆盖层（可选的高精度替换张量）：默认空=不叠加；非空但文件不存在则报错。
+# 覆盖层（可选的高精度替换张量）：默认空=不叠加；非空但文件不存在则警告并跳过。
 OVERLAY_FILE="${OVERLAY_FILE-}"
 TOKENIZER_DIR="${TOKENIZER_DIR:-$MODEL_DIR/tokenizer}"
 ENGINE_HOST="${ENGINE_HOST:-127.0.0.1}"
@@ -95,7 +95,10 @@ awk "BEGIN { exit !($ROPE_FACTOR >= 1 && $ROPE_BETA_FAST > 0 && $ROPE_BETA_SLOW 
 [[ -r "$NGRAM_FILE" ]] || fail "找不到 n-gram 表：$NGRAM_FILE（w4b 与 MODEL_FILE 相同）"
 [[ -z "$MTP_FILE" || -r "$MTP_FILE" ]] || fail "找不到 MTP 权重：$MTP_FILE"
 [[ -z "$VISION_FILE" || -r "$VISION_FILE" ]] || fail "找不到视觉塔：$VISION_FILE（纯文本可设 VISION_FILE=\"\"）"
-[[ -z "$OVERLAY_FILE" || -r "$OVERLAY_FILE" ]] || fail "找不到 overlay：$OVERLAY_FILE（无 overlay 可设 OVERLAY_FILE=\"\"）"
+if [[ -n "$OVERLAY_FILE" && ! -r "$OVERLAY_FILE" ]]; then  # 可选：只警告并跳过
+  echo "警告：找不到 overlay：$OVERLAY_FILE，已跳过（v2 权重不用 overlay；不想看到这条可设 OVERLAY_FILE=\"\"）" >&2
+  OVERLAY_FILE=
+fi
 [[ -r "$TOKENIZER_DIR/tokenizer.json" ]] || fail "找不到 tokenizer：$TOKENIZER_DIR"
 [[ -d build/rocblas/library && -d build/hipblaslt/library ]] || fail '缺少 rocBLAS/hipBLASLt kernel db（build/*/library），请先运行 bash build_win.sh'
 for port in "$ENGINE_PORT" "$API_PORT"; do
