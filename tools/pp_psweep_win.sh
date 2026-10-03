@@ -5,6 +5,14 @@
 # chunk（PLE 冷读），取第 2、3 个 chunk 均值。每档开 GDEC_KPROF=1 + GDEC_PROF=1。
 # 引擎参数是启动期的，只能一档一进程。v2 模型（MODEL_FILE/NGRAM_FILE 可覆盖）。
 # 用法: bash tools/pp_psweep_win.sh [P ...]   （默认六档全跑）
+#
+# MODE=ttft（§11.2 M1b）：单 chunk TTFT 基线。走 --serve + gdec-api 同进程多请求：
+# 每档每 rep 先发 64 token dummy 暖 PLE（一次性表加载，不计时），再发正式 prompt
+# （yarn_ladder filler，rung 唯一化防 TokenCache 前缀命中），只计正式请求墙钟
+# （max_tokens=1）。每档 3 次取中位数。引擎开 KPROF，按 kprof 行的 P 匹配正式请求
+# 报 qsa:flash 等分段。PREFILL_CHUNK=16384（生产口径），--maxctx 17408。
+# 用法: MODE=ttft MODEL_FILE=models/qwen38-flash-next-v2.hgn \
+#       NGRAM_FILE=models/qwen38-flash-next-ngram.hgn bash tools/pp_psweep_win.sh
 set -u
 cd "$(dirname "$0")/.."
 
@@ -18,6 +26,118 @@ if [[ -z "${MODEL_FILE:-}" ]]; then
     MODEL_ARGS+=("models/qwen38-flash-next-w4b.overlay.hgn")
 elif [[ -n "${NGRAM_FILE:-}" ]]; then
     MODEL_ARGS+=("$NGRAM_FILE")
+fi
+
+# ---- MODE=ttft：M1b 单 chunk TTFT（§11.2）----
+if [[ "${MODE:-}" == "ttft" ]]; then
+  TTAG="${TAG:-v2}"
+  SIZES="${TTFT_SIZES:-512 1024 2048 3000 8192}"
+  REPS="${TTFT_REPS:-3}"
+  TMAXCTX=17408
+  ENGINE_LOG="logs/ttft_engine_${TTAG}.log"
+  API_LOG="logs/ttft_api_${TTAG}.log"
+  mkdir -p logs
+  env GDEC_KPROF=1 GDEC_PROF=1 \
+      GDEC_QSA_KV_BF16=1 GDEC_QSA_WMMA=1 GDEC_QSA_WMMA_BTV=1 \
+      GDEC_MOE_LT=1 GDEC_MOE_LT_BF16=1 GDEC_GR_BF16=1 \
+      GDEC_GDN_STREAM=1 GDEC_GDN_WAVE=1 \
+      GDEC_PREFILL_CHUNK=16384 GDEC_GEMM_WMMA=1 GDEC_GDN_FUSED=1 \
+      GDEC_INDEX_FUSED2=1 GDEC_PP_MOE_OUT=1 GDEC_INDEX_STREAM_SELECT=1 \
+      build/gdec-win "${MODEL_ARGS[@]}" \
+      --serve --host 127.0.0.1 --port 8730 --maxctx $TMAXCTX >"$ENGINE_LOG" 2>&1 &
+  EPID=$!
+  ttft_cleanup() {
+    kill $APID $EPID 2>/dev/null
+    taskkill //PID $APID //F //T >/dev/null 2>&1
+    taskkill //PID $EPID //F //T >/dev/null 2>&1
+  }
+  APID=''
+  trap ttft_cleanup EXIT
+  begin=$SECONDS
+  until grep -q 'serve: listening' "$ENGINE_LOG" 2>/dev/null; do
+    kill -0 $EPID 2>/dev/null || { tail -n 15 "$ENGINE_LOG" >&2; exit 1; }
+    (( SECONDS - begin < 300 )) || { echo "引擎启动超时" >&2; exit 1; }
+    sleep 2
+  done
+  build/gdec-api-win.exe --tokenizer models/tokenizer \
+      --engine 127.0.0.1:8730 --host 127.0.0.1 \
+      --port 8731 --context $TMAXCTX >"$API_LOG" 2>&1 &
+  APID=$!
+  begin=$SECONDS
+  until netstat -an | grep -E '[:.]8731\s+.*LISTENING' >/dev/null 2>&1; do
+    kill -0 $APID 2>/dev/null || { tail -n 15 "$API_LOG" >&2; exit 1; }
+    (( SECONDS - begin < 30 )) || { echo "API 启动超时" >&2; exit 1; }
+    sleep 1
+  done
+  SIZES="$SIZES" REPS="$REPS" TTAG="$TTAG" python - <<'EOF'
+import os, re, statistics, sys
+sys.path.insert(0, "tools")
+from yarn_ladder import build_prompt, chat
+
+base = "http://127.0.0.1:8731"
+sizes = [int(x) for x in os.environ["SIZES"].split()]
+reps = int(os.environ["REPS"])
+tag = os.environ["TTAG"]
+segs = ["gdn","qsa","moe:up","moe:down","moe:reduce","moe:shared","hc","ht_deq",
+        "gdn:scan","qsa:idx","qsa:flash"]
+
+runs = []  # (size, rep, actual_tokens, wall_s, cached)
+for p in sizes:
+    for r in range(reps):
+        warm, _ = build_prompt(f"warm-{tag}-{p}-{r}", 64, [], "w")
+        chat(base, warm, 1)
+        prompt, _ = build_prompt(f"ttft-{tag}-{p}-{r}", p, [], "t")
+        out, dt = chat(base, prompt, 1)
+        usage = out.get("usage") or {}
+        pt = usage.get("prompt_tokens") or 0
+        ct = (usage.get("prompt_tokens_details") or {}).get("cached_tokens") or 0
+        runs.append((p, r, pt, dt, ct))
+        print(f"P={p} rep{r}: tokens={pt} cached={ct} wall={dt*1000:.0f} ms "
+              f"({pt/dt:.0f} tok/s)", flush=True)
+
+# kprof 行按 P 匹配正式请求（dummy P~64 不会落入 size±80 窗口）
+kpl = [l for l in open(f"logs/ttft_engine_{tag}.log", encoding="utf-8",
+                       errors="replace") if l.startswith("kprof base=")]
+def segs_for(p, lo, hi):
+    acc, n, segsum = {}, 0, 0.0
+    for l in kpl:
+        m = re.search(r"kprof base=0 P=(\d+)", l)
+        if not m or not (lo <= int(m.group(1)) <= hi):
+            continue
+        n += 1
+        segsum += float(re.search(r"segsum=([0-9.]+) ms", l).group(1))
+        for s in segs:
+            m2 = re.search(r"(?:^|\| )\[?%s ([0-9.]+)" % re.escape(s), l)
+            if m2: acc[s] = acc.get(s, 0.0) + float(m2.group(1))
+    if n:
+        segsum /= n
+        for s in acc: acc[s] /= n
+    return n, segsum, acc
+
+print("\n==== M1b TTFT（PLE 暖，max_tokens=1，中位数）====")
+hdr = ["P","tokens","TTFT ms","tok/s","segsum","gap%","qsa:flash","qsa:idx",
+       "hc","moeΣ","ht_deq","gdn"]
+print("\t".join(hdr))
+for p in sizes:
+    rs = [r for r in runs if r[0] == p]
+    med = statistics.median(r[3] for r in rs)
+    pt = max(r[2] for r in rs)
+    n, segsum, acc = segs_for(p, int(pt*0.9), int(pt*1.1) + 80)
+    moe = sum(acc.get(s, 0.0) for s in ("moe:up","moe:down","moe:reduce","moe:shared"))
+    gap = (med*1000 - segsum) / (med*1000) * 100 if med else 0.0
+    row = [str(p), str(pt), f"{med*1000:.0f}", f"{pt/med:.0f}",
+           f"{segsum:.0f}" if n else "-", f"{gap:.0f}" if n else "-",
+           f"{acc.get('qsa:flash',0):.0f}" if n else "-",
+           f"{acc.get('qsa:idx',0):.0f}" if n else "-",
+           f"{acc.get('hc',0):.0f}" if n else "-",
+           f"{moe:.0f}" if n else "-",
+           f"{acc.get('ht_deq',0):.0f}" if n else "-",
+           f"{acc.get('gdn',0):.0f}" if n else "-"]
+    print("\t".join(row))
+print("gufo 参照: pp2048@d0 = 1628 tok/s, d4K = 1523 tok/s（GUFO-GAP）")
+EOF
+  rc=$?
+  exit $rc
 fi
 
 mkdir -p /tmp/psweep logs
