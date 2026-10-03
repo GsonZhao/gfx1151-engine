@@ -74,8 +74,12 @@ __global__ void k_moe_silu_bf16(const __hip_bfloat16* __restrict__ guv,
 // Weighted deterministic reduce: out[t][d] = sum_s pw[ids[s]] * pairs[ids[s]][d]
 // (same slot order as k_moe_reduce_fast; the router weight is applied here
 // instead of in the down kernel).
-template <int K>
-__global__ void k_moe_reduce_pw(const float* __restrict__ pairs,
+// PT: pairs element type — float (legacy) or __half (B1 f16 pairs, exact
+// __half2float widening; fp32 accumulate unchanged).
+__device__ __forceinline__ float mrd_pair(float f) { return f; }
+__device__ __forceinline__ float mrd_pair(__half h) { return __half2float(h); }
+template <int K, class PT = float>
+__global__ void k_moe_reduce_pw(const PT* __restrict__ pairs,
                                 const int* __restrict__ pairids,
                                 const float* __restrict__ pw,
                                 float* __restrict__ out, int P, int Dd) {
@@ -88,7 +92,7 @@ __global__ void k_moe_reduce_pw(const float* __restrict__ pairs,
   if (d >= Dd) return;
   float sum = 0.f;
 #pragma unroll
-  for (int s = 0; s < K; s++) sum += pw[ids[s]] * pairs[(size_t)ids[s] * Dd + d];
+  for (int s = 0; s < K; s++) sum += pw[ids[s]] * mrd_pair(pairs[(size_t)ids[s] * Dd + d]);
   out[(size_t)t * Dd + d] = sum;
 }
 
@@ -96,8 +100,8 @@ __global__ void k_moe_reduce_pw(const float* __restrict__ pairs,
 // pass: out = reduce + sigmoid(sg[t]) * ey[t][d]. Same expressions as the two
 // kernels (the add contracts to the same fma as `acc[i] += s * y[i]`), so the
 // result is bit-identical; saves the second read + write of out.
-template <int K>
-__global__ void k_moe_reduce_pw_sg(const float* __restrict__ pairs,
+template <int K, class PT = float>
+__global__ void k_moe_reduce_pw_sg(const PT* __restrict__ pairs,
                                    const int* __restrict__ pairids,
                                    const float* __restrict__ pw,
                                    const float* __restrict__ ey,
@@ -112,11 +116,48 @@ __global__ void k_moe_reduce_pw_sg(const float* __restrict__ pairs,
   if (d >= Dd) return;
   float sum = 0.f;
 #pragma unroll
-  for (int s = 0; s < K; s++) sum += pw[ids[s]] * pairs[(size_t)ids[s] * Dd + d];
+  for (int s = 0; s < K; s++) sum += pw[ids[s]] * mrd_pair(pairs[(size_t)ids[s] * Dd + d]);
   const size_t i = (size_t)t * Dd + d;
   float s = 1.f / (1.f + expf(-sg[t]));
   sum += s * ey[i];
   out[i] = sum;
+}
+
+// k_moe_reduce_pw_sg + the HC write-back (k_gr_write_b_hc_bf16 /
+// k_gr_scatter_norm_inj_bf16's write part) in one pass: instead of storing
+// out f32, add the result straight into the bf16 HC state R using the same
+// expression as those kernels, so R is bit-identical and the f32 out
+// round-trip disappears. w4 = inject gates [P][4] precomputed by k_inj_psum
+// (same inj_psum as the scatter kernel) or the inject GEMM; 4 branches.
+template <int K, class PT = float>
+__global__ void k_moe_reduce_pw_sg_hc(const PT* __restrict__ pairs,
+                                      const int* __restrict__ pairids,
+                                      const float* __restrict__ pw,
+                                      const float* __restrict__ ey,
+                                      const float* __restrict__ sg,
+                                      const float* __restrict__ w4,
+                                      uint16_t* __restrict__ R, int P, int Dd) {
+  __shared__ int ids[K];
+  int tid = threadIdx.x;
+  int t = blockIdx.y, d = tid + (int)blockIdx.x * blockDim.x;
+  if (t >= P) return;
+  if (tid < K) ids[tid] = pairids[t * K + tid];
+  __syncthreads();
+  if (d >= Dd) return;
+  float sum = 0.f;
+#pragma unroll
+  for (int s = 0; s < K; s++) sum += pw[ids[s]] * mrd_pair(pairs[(size_t)ids[s] * Dd + d]);
+  const size_t i = (size_t)t * Dd + d;
+  float s = 1.f / (1.f + expf(-sg[t]));
+  sum += s * ey[i];
+  uint16_t* Rt = R + (size_t)t * 4 * Dd + d;
+  const float* wt = w4 + (size_t)t * 4;
+  float inj[4];
+#pragma unroll
+  for (int b = 0; b < 4; b++) inj[b] = 2.f / (1.f + expf(-wt[b] * 0.25f));
+#pragma unroll
+  for (int b = 0; b < 4; b++)
+    Rt[(size_t)b * Dd] = f2bf(bf2f(Rt[(size_t)b * Dd]) + inj[b] * sum);
 }
 
 // bf16 pair variant (fp32 accumulate).

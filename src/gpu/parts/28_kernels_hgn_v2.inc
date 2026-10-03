@@ -16,28 +16,6 @@
 
 namespace hv2 {
 
-constexpr float kRs128 = 0.0883883476483184405f;  // 1 / sqrt(128)
-
-// Unnormalized in-wave FWHT of 128 values (lo' = lo + hi, hi' = lo - hi).
-__device__ __forceinline__ void fwht128(float& v0, float& v1, float& v2, float& v3,
-                                        int lane) {
-#pragma unroll
-  for (int s = 1; s < 32; s <<= 1) {
-    const float p0 = __shfl_xor(v0, s, 32), p1 = __shfl_xor(v1, s, 32);
-    const float p2 = __shfl_xor(v2, s, 32), p3 = __shfl_xor(v3, s, 32);
-    const bool hi = (lane & s) != 0;
-    v0 = hi ? p0 - v0 : v0 + p0;
-    v1 = hi ? p1 - v1 : v1 + p1;
-    v2 = hi ? p2 - v2 : v2 + p2;
-    v3 = hi ? p3 - v3 : v3 + p3;
-  }
-  const float a = v0 + v1, b = v0 - v1, c = v2 + v3, d = v2 - v3;  // stride 32
-  v0 = a + c;  // stride 64
-  v2 = a - c;
-  v1 = b + d;
-  v3 = b - d;
-}
-
 // ht code -> value: 16-bit trellis window, hash alphabet (no stored codebook).
 __device__ __forceinline__ float ht_val(uint32_t w16) {
   const uint32_t t = w16 * 0x83dcd12du;
@@ -63,6 +41,9 @@ __device__ __forceinline__ float ldx(const float* x, size_t i) { return x[i]; }
 __device__ __forceinline__ float ldx(const uint16_t* x, size_t i) {
   return __uint_as_float((uint32_t)x[i] << 16);
 }
+// pairs element loads: f32 (q4cp path) or f16 (v2 f16-pairs path)
+__device__ __forceinline__ float ldp(const float* p, size_t i) { return p[i]; }
+__device__ __forceinline__ float ldp(const __half* p, size_t i) { return __half2float(p[i]); }
 // 8 consecutive activations (16 B aligned for f32 pairs / bf16 octets).
 __device__ __forceinline__ void ldx8(const float* x, float* o) {
   const float4 a = *(const float4*)x, b = *(const float4*)(x + 4);
@@ -164,11 +145,12 @@ __global__ __launch_bounds__(512) void k_i4r_mid(const TG* __restrict__ guv, uin
 // i4r LUT prefill tail: k_moe_reduce_pw + rot_out (post = svh_dn) + optional
 // shared-expert add (k_axpy_sg) in one pass, one wave per (row t, 128 block).
 // Same slot order and expressions as the three separate kernels, so the result
-// is bit-identical to reduce -> k_v2_rot -> k_axpy_sg.
+// is bit-identical to reduce -> k_v2_rot -> k_axpy_sg. TP = float or __half
+// (f16 pairs from moe_lut_down(f16=true) halve the read traffic).
 // out[t][i] = svh[i] * H(sum_s pw[id_s] * pairs[id_s])[i] / sqrt128
 //             (+ sigmoid(sg[t]) * ey[t][i])
-template <int K>
-__global__ __launch_bounds__(256) void k_v2_reduce_rot(const float* __restrict__ pairs,
+template <int K, typename TP = float>
+__global__ __launch_bounds__(256) void k_v2_reduce_rot(const TP* __restrict__ pairs,
                                                        const int* __restrict__ pairids,
                                                        const float* __restrict__ pw,
                                                        const float* __restrict__ svh,
@@ -185,9 +167,9 @@ __global__ __launch_bounds__(256) void k_v2_reduce_rot(const float* __restrict__
   for (int s = 0; s < K; s++) {
     const int id = pairids[t * K + s];
     const float w = pw[id];
-    const float* pr = pairs + (size_t)id * d + b * 128;
+    const TP* pr = pairs + (size_t)id * d + b * 128;
 #pragma unroll
-    for (int j = 0; j < 4; j++) v[j] += w * pr[j * 32 + lane];
+    for (int j = 0; j < 4; j++) v[j] += w * hv2::ldp(pr, j * 32 + lane);
   }
   hv2::fwht128(v[0], v[1], v[2], v[3], lane);
   const float sgt = ey ? 1.f / (1.f + expf(-sg[t])) : 0.f;
@@ -197,6 +179,47 @@ __global__ __launch_bounds__(256) void k_v2_reduce_rot(const float* __restrict__
     float o = v[j] * hv2::kRs128 * svh[i];
     if (ey) o += sgt * ey[(size_t)t * d + i];
     out[(size_t)t * d + i] = o;
+  }
+}
+
+// k_v2_reduce_rot + the HC write-back (see k_moe_reduce_pw_sg_hc): the
+// rotated result is added straight into the bf16 HC state R with the same
+// expression as k_gr_write_b_hc_bf16, skipping the f32 out round-trip.
+template <int K, typename TP = float>
+__global__ __launch_bounds__(256) void k_v2_reduce_rot_hc(
+    const TP* __restrict__ pairs, const int* __restrict__ pairids,
+    const float* __restrict__ pw, const float* __restrict__ svh,
+    const float* __restrict__ ey, const float* __restrict__ sg,
+    const float* __restrict__ w4, uint16_t* __restrict__ R, int P, int d) {
+  const int lane = threadIdx.x & 31;
+  const int gw = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+  const int nb = d >> 7;
+  if (gw >= P * nb) return;
+  const int t = gw / nb, b = gw - t * nb;
+  float v[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+  for (int s = 0; s < K; s++) {
+    const int id = pairids[t * K + s];
+    const float w = pw[id];
+    const TP* pr = pairs + (size_t)id * d + b * 128;
+#pragma unroll
+    for (int j = 0; j < 4; j++) v[j] += w * hv2::ldp(pr, j * 32 + lane);
+  }
+  hv2::fwht128(v[0], v[1], v[2], v[3], lane);
+  const float sgt = ey ? 1.f / (1.f + expf(-sg[t])) : 0.f;
+  const float* wt = w4 + (size_t)t * 4;
+  float inj[4];
+#pragma unroll
+  for (int b2 = 0; b2 < 4; b2++) inj[b2] = 2.f / (1.f + expf(-wt[b2] * 0.25f));
+#pragma unroll
+  for (int j = 0; j < 4; j++) {
+    const int i = b * 128 + j * 32 + lane;
+    float o = v[j] * hv2::kRs128 * svh[i];
+    if (ey) o += sgt * ey[(size_t)t * d + i];
+    uint16_t* Rt = R + (size_t)t * 4 * d + i;
+#pragma unroll
+    for (int b2 = 0; b2 < 4; b2++)
+      Rt[(size_t)b2 * d] = f2bf(bf2f(Rt[(size_t)b2 * d]) + inj[b2] * o);
   }
 }
 

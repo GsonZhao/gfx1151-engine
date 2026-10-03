@@ -47,6 +47,15 @@ struct GpuModel {
   float *d_iproj = nullptr, *d_iq = nullptr, *d_ik = nullptr;
   float *d_iraw = nullptr, *d_inorm = nullptr, *d_iscores = nullptr;
   float* d_iw = nullptr;
+  // C1 f16 indexer: f16 twins of d_iq / d_ik / d_ikg（RNE 自同一份 fp32 值），
+  // 打分走 k_index_scores_wmma16<false>，score 复用 d_iscores 内存按 f16 存，
+  // select 走 ST=__half 变体。原型（logs/c1_f16_proto1.log）：重合率
+  // 0.99886-0.99992 ≥ 0.995 门，x1.93-2.00 vs t64。GDEC_INDEX_F16=0 退出；
+  // 其余 index 旧开关（OLDSEL/SCORE64=0/SEL2P=0）任一出现即整路回 fp32。
+  uint16_t *d_iqh = nullptr, *d_ikh = nullptr, *d_ikgh = nullptr;
+  bool index_f16() const {
+    return d_iqh != nullptr;
+  }
   // Block ranking is sensitive to projection rounding; retain FP32 here.
   bool index_f32 = getenv("GDEC_INDEX_BF16") == nullptr;
   bool index_fused2 = getenv("GDEC_INDEX_FUSED2") != nullptr;
@@ -59,6 +68,18 @@ struct GpuModel {
   static bool env_zero(const char* k) {
     const char* v = getenv(k);
     return v && v[0] == '0' && v[1] == 0;
+  }
+  // B3 split-K 门控（d_skx 分配与 gemm() dispatch 共用）：k1 (2560,6144)
+  // 在 P>=8192 时把 X 重排成 2 个连续 K=3072 切片跑两次 + slice1 原子加。
+  // proto（tools/b3_splitk_proto.cu，logs/b3_splitk3.log）：16K 下
+  // 14.5+0.5 ms vs 16.4 ms（x1.13）；收益来自 X 连续切片，strided 版 x0.84
+  // 已否决。默认开，GDEC_GEMM_SPLITK=0 退出。
+  static bool gemm_splitk_on() {
+    static const bool on = getenv("GDEC_GEMM_WMMA") != nullptr &&
+                           getenv("GDEC_GEMM_NO_K64") == nullptr &&
+                           getenv("GDEC_GEMM_RB") == nullptr &&
+                           !env_zero("GDEC_GEMM_SPLITK");
+    return on;
   }
   int* d_iselected = nullptr;
   int index_blocks = 0;
@@ -217,6 +238,9 @@ struct GpuModel {
   float* d_injp[2] = {nullptr, nullptr};
   int injp_cur = -1;
   std::string injp_for;
+  // B2-1: site whose HC write was already applied by the moe reduce
+  // (k_*_hc); the next gr_write_read_b on it runs y=nullptr (norm only).
+  std::string hcw_site_;
   std::unordered_map<std::string, uint16_t*> inj_wcache_;  // bf16 inject W per site
   float *d_qkvb, *d_zb, *d_g48b, *d_beta48b;
   float *d_qgb, *d_qsb, *d_gsb, *d_kbb, *d_vbb, *d_attnb;
@@ -232,9 +256,13 @@ struct GpuModel {
   uint16_t* d_wbf16;        // dequant workspace (64 MiB)
   uint16_t* d_xbf16;        // [maxctx, 10240] bf16 activations
   uint16_t* d_Rhatbf16 = nullptr;  // survives intermediate projection conversions
+  float* d_hcsc = nullptr;  // B2-2: [BP,4] rms inv scales（Rhat 不落盘时由 GEMM 现场归一化）
   // Non-cacheable gemm inputs (d_hidb, d_t320b, attn/conv outs) convert here so
   // they don't evict the d_xb/d_Rhatb cache entries in d_xbf16.
   uint16_t* d_xbf16b = nullptr;  // [maxctx, 6144] bf16
+  // B3 split-K: [BP, 6144] bf16，k1 (2560,6144) 的 X 重排成 2 个连续 K=3072
+  // 切片。层边界即死（仅单次 gemm 内活跃），与 d_wbf16 同理性不入 WS 小拷贝。
+  uint16_t* d_skx = nullptr;
   // GDEC_MOE_LT buffers (allocated only when enabled): gathered bf16 pair rows
   // and per-group dequant scratch.
   __hip_bfloat16* d_moexg = nullptr;   // [BP*topk, d]
@@ -509,6 +537,13 @@ struct GpuModel {
       DALLOC(&d_iq, (size_t)maxbatch_cap * 512 * 4);
       DALLOC(&d_ik, (size_t)kv_nl * ik_layer_blocks * 128 * 4);
       if (kv_paged) DALLOC(&d_ikg, (size_t)index_blocks * 128 * 4);
+      // C1 f16 twins（门控与 30_host_util.inc 的 arena 估算同步）
+      if (!env_zero("GDEC_INDEX_F16") && index_score64 && index_sel2p &&
+          getenv("GDEC_INDEX_OLDSEL") == nullptr) {
+        DALLOC(&d_iqh, (size_t)maxbatch_cap * 512 * 2);
+        DALLOC(&d_ikh, (size_t)kv_nl * ik_layer_blocks * 128 * 2);
+        if (kv_paged) DALLOC(&d_ikgh, (size_t)index_blocks * 128 * 2);
+      }
       DALLOC(&d_iraw, (size_t)nqsa * 4 * 128 * 4);
       CK(hipMemset(d_iraw, 0, (size_t)nqsa * 4 * 128 * 4));
       DALLOC(&d_inorm, (size_t)nqsa * 256 * 4);
@@ -628,6 +663,17 @@ struct GpuModel {
     DALLOC(&d_argmax, 4);
     DALLOC(&d_hnorm_mixer, 10240 * 4);
 
+    // GDEC_PAD_BATCH (bytes): debug knob — dummy allocation that shifts every
+    // batch-buffer arena offset. The k1 (2560,6144) oproj gemm's speed swings
+    // ~±15-30% with GB-level address placement (L2/DRAM placement luck).
+    {
+      const char* pbs = getenv("GDEC_PAD_BATCH");
+      if (pbs && atoll(pbs) > 0) {
+        void* pad_dummy = nullptr;
+        DALLOC(&pad_dummy, (size_t)atoll(pbs));
+      }
+    }
+
     // ---- prefill batch buffers (Phase 3a), allocated once at maxctx ----
     {
       size_t BP = (size_t)maxbatch_cap;
@@ -656,7 +702,11 @@ struct GpuModel {
       DALLOC(&d_topwb, BP * 16 * 4);
       DALLOC(&d_slot_order, 256 * 4);  // k_moe_sort_slots 输出（P*k ≤ 256）
       // Fused down reuses the otherwise idle gate/up workspace for pair outputs.
-      DALLOC(&d_guvb, BP * g_cfg.topk * (moe_deterministic ? 2560 : 1280) * 4);
+      // B1：v2+w4b pairs 全 f16（guvb_f16_env，与 30_host_util 估算同步）后按
+      // f16 尺寸分配，省一半；任一回退 env 在位则保持 f32 全尺寸。
+      DALLOC(&d_guvb,
+             BP * g_cfg.topk * (moe_deterministic ? 2560 : 1280) *
+                 (guvb_f16_env() ? 2 : 4));
       DALLOC(&d_hidb, BP * g_cfg.topk * 640 * 4);
       DALLOC(&d_moeaccb, BP * 2560 * 4);
       DALLOC(&d_eyb, BP * 2560 * 4);
@@ -667,7 +717,9 @@ struct GpuModel {
       DALLOC(&d_wbf16, (size_t)64 << 20);  // fits q_proj 12288x2560 bf16
       DALLOC(&d_xbf16, BP * 10240 * 2);
       DALLOC(&d_xbf16b, BP * 6144 * 2);  // largest non-cacheable K = 6144
+      if (gemm_splitk_on()) DALLOC(&d_skx, BP * 6144 * 2);
       if (prefill_fused) DALLOC(&d_Rhatbf16, BP * 10240 * 2);
+      if (prefill_fused) DALLOC(&d_hcsc, BP * 4 * 4);
       DALLOC(&d_tokidx, BP * g_cfg.topk * 4);
       DALLOC(&d_pweight, BP * g_cfg.topk * 4);
       DALLOC(&d_eoff, (g_cfg.experts + 1) * 4);
@@ -1362,13 +1414,15 @@ struct GpuModel {
       snprintf(buf, sizeof buf, "layers.%d.self_attn.indexer.index_qk_proj.weight", l);
       gemv(wview(ckpt.at(buf)), x, d_iproj);
       float* keys = d_ik + (size_t)qi * ik_layer_blocks * 128;
+      uint16_t* keys16 =
+          d_ikh ? d_ikh + (size_t)qi * ik_layer_blocks * 128 : nullptr;
       k_index_q<<<dim3(1, 4), 128, 0, g_str>>>(d_iproj, d_inorm + qi * 256, d_iq,
                                               1, g_cfg.norm_eps, g_cfg.rope_theta, d_pos,
                                               0, nullptr, d_rdelta);
       k_index_append<<<1, 128, 0, g_str>>>(d_iproj, d_inorm + qi * 256 + 128,
                                            d_iraw + qi * 512, keys, d_pos,
                                            g_cfg.norm_eps, g_cfg.rope_theta,
-                                           d_rdelta, kvpt());
+                                           d_rdelta, kvpt(), keys16);
       k_index_scores<<<(index_blocks + 3) / 4, 128, 0, g_str>>>(d_iq, keys, d_iscores,
                                                                index_blocks, d_pos,
                                                                kvpt());
@@ -1574,9 +1628,12 @@ struct GpuModel {
   }
   // ey/sg (optional): shared-expert output + gate logit, added in the reduce
   // (k_moe_reduce_pw_sg) instead of by k_axpy_sg afterwards.
+  // w4hc/Rhc (optional, requires ey): the reduce fuses the HC write-back
+  // (k_moe_reduce_pw_sg_hc) and acc is left untouched.
   bool moe_q4w_run(const WView& gu, const WView& dn, const float* x, const int* topids,
                    const float* topw, float* acc, int P, const float* ey = nullptr,
-                   const float* sg = nullptr) {
+                   const float* sg = nullptr, const float* w4hc = nullptr,
+                   uint16_t* Rhc = nullptr) {
     const int k = g_cfg.topk, E = g_cfg.experts, d = g_cfg.d, mid = g_cfg.moe_mid;
     if (!moe_q4w_ok(gu, dn, P)) return false;
     const moelut::LutW pgu = lut_q4cp_view(gu.data, gu.rows, gu.cols, gu.scale_stride, 2 * mid, mid);
@@ -1586,6 +1643,7 @@ struct GpuModel {
       logged = true;
       fprintf(stderr, "moe prefill: q4cp LUT WMMA (GDEC_MOE_Q4W=0 disables)\n");
     }
+    KP("moe:route");
     moe_routing.run(topids, topw, d_tokidx, d_pweight, d_eoff, d_pairids, P, k, E);
     k_moe_tiles<<<1, 512, 0, g_str>>>(d_eoff, d_moetiles, d_moentiles, E);
     const int max_tiles = (P * k + 63) / 64 + E;
@@ -1593,13 +1651,35 @@ struct GpuModel {
     __half* hid = (__half*)d_hidb;
     const size_t n4 = (size_t)P * d / 4;
     k_f32_to_f16_v4<<<(unsigned)((n4 + 255) / 256), 256, 0, g_str>>>(x, x16, n4);
+    KP("moe:up");
     moe_lut_up(moelut::kQ4CP, pgu, x16, d_tokidx, d_moetiles, d_moentiles, max_tiles, hid, mid, d,
                g_str);
+    KP("moe:down");
+    // B1 w4b f16 pairs（与 v2 GDEC_V2_PAIRS_F16 同款）：down 写 f16、reduce 读
+    // f16（__half2float 精确拓宽，fp32 累加不变），reduce 读流量减半。默认开
+    // （KLD 过线后翻转，=0 回退）。w4b_pairs_f16_env 与分配门控
+    // guvb_f16_env 语义同步。
+    static const bool pairs_f16 = w4b_pairs_f16_env();
     moe_lut_down(moelut::kQ4CP, pdn, hid, d_moetiles, d_moentiles, max_tiles, d_guvb, d, mid,
-                 g_str);
+                 g_str, pairs_f16);
+    KP("moe:reduce");
     if (ey)
-      k_moe_reduce_pw_sg<10><<<dim3((d + 255) / 256, P), 256, 0, g_str>>>(
-          d_guvb, d_pairids, d_pweight, ey, sg, acc, P, d);
+      if (Rhc)
+        if (pairs_f16)
+          k_moe_reduce_pw_sg_hc<10, __half><<<dim3((d + 255) / 256, P), 256, 0, g_str>>>(
+              (const __half*)d_guvb, d_pairids, d_pweight, ey, sg, w4hc, Rhc, P, d);
+        else
+          k_moe_reduce_pw_sg_hc<10><<<dim3((d + 255) / 256, P), 256, 0, g_str>>>(
+              d_guvb, d_pairids, d_pweight, ey, sg, w4hc, Rhc, P, d);
+      else if (pairs_f16)
+        k_moe_reduce_pw_sg<10, __half><<<dim3((d + 255) / 256, P), 256, 0, g_str>>>(
+            (const __half*)d_guvb, d_pairids, d_pweight, ey, sg, acc, P, d);
+      else
+        k_moe_reduce_pw_sg<10><<<dim3((d + 255) / 256, P), 256, 0, g_str>>>(
+            d_guvb, d_pairids, d_pweight, ey, sg, acc, P, d);
+    else if (pairs_f16)
+      k_moe_reduce_pw<10, __half><<<dim3((d + 255) / 256, P), 256, 0, g_str>>>(
+          (const __half*)d_guvb, d_pairids, d_pweight, acc, P, d);
     else
       k_moe_reduce_pw<10><<<dim3((d + 255) / 256, P), 256, 0, g_str>>>(d_guvb, d_pairids,
                                                                        d_pweight, acc, P, d);
@@ -1889,28 +1969,36 @@ struct GpuModel {
       if (N * K * 2 > ((size_t)64 << 20))
         throw std::runtime_error("gemm: weight too big for d_wbf16");
       uint64_t tot = N * K / 32;
+      KP_SUB("ht_deq");
       k_dequant_q4cp_bf16<<<(unsigned)((tot + 255) / 256), 256, 0, g_str>>>(
           w.data + 64, w.data + 64 + N * K / 2, (const float*)w.data, d_wbf16, N, K,
           w.scale_stride);
+      KP_SUB_END();
       wp = d_wbf16;
     } else if (w.dtype == 7) {
       if (N * K * 2 > ((size_t)64 << 20))
         throw std::runtime_error("gemm: weight too big for d_wbf16");
       uint64_t tot = N * K / 64;
+      KP_SUB("ht_deq");
       k_dequant_q8g64_bf16<<<(unsigned)((tot + 255) / 256), 256, 0, g_str>>>(
           w.data, d_wbf16, N, K);
+      KP_SUB_END();
       wp = d_wbf16;
     } else if (w.dtype == 8) {
       if (N * K * 2 > ((size_t)64 << 20))
         throw std::runtime_error("gemm: weight too big for d_wbf16");
       uint64_t tot = N * K / 32;
+      KP_SUB("ht_deq");
       k_dequant_q8g32_bf16<<<(unsigned)((tot + 255) / 256), 256, 0, g_str>>>(
           (const int8_t*)w.data, (const __half*)(w.data + N * K), d_wbf16, N, K);
+      KP_SUB_END();
       wp = d_wbf16;
     } else if (w.dtype == 16 || w.dtype == 24) {  // hgn v2 ht / q6g64
       if (N * K * 2 > ((size_t)64 << 20))
         throw std::runtime_error("gemm: weight too big for d_wbf16");
+      KP_SUB("ht_deq");
       v2_deq_bf16(w, d_wbf16, g_str);
+      KP_SUB_END();
       wp = d_wbf16;
     } else {
       throw std::runtime_error("gemm: unsupported dtype");
@@ -2010,13 +2098,32 @@ struct GpuModel {
     // GDEC_GEMM_RB above takes precedence if both are set.
     static const bool gemm_wmma = getenv("GDEC_GEMM_WMMA") != nullptr;
     static const bool gemm_k64 = getenv("GDEC_GEMM_NO_K64") == nullptr;
+    if (gemm_dbg)
+      fprintf(stderr, "gemm-ptr: N=%llu K=%llu P=%d wp=%p xp=%p y=%p\n",
+              (unsigned long long)N, (unsigned long long)K, P,
+              (const void*)wp, (const void*)xp, (void*)y);
     if (gemm_wmma && P >= 1024) {
       if (gemm_k64 && ((N == 320 && K == 10240) || (N == 2560 && K == 6144))) {
         if (N == 320)
           k_gemm_wmma<64, 160, 2, 2, 2, 5, 64, 128>
               <<<(unsigned)(((P + 63) / 64) * 2), 128, 0, g_str>>>(
                   xp, wp, y, P, (int)K, (int)N, 1);
-        else
+        else if (gemm_splitk_on() && P >= 8192 && d_skx) {
+          // B3 split-K：X 重排成 2 个连续 K=3072 切片（W 维持原布局 strided
+          // 读），slice0 写 Y，slice1 Epi=3 原子加。16K 下单 GEMM 省 ~1.5 ms
+          //（proto x1.13 扣除 repack 0.23 ms）。P<8192 收益消失（x1.01）。
+          const int ks = 3072;
+          const unsigned grid = (unsigned)(((P + 63) / 64) * 20);
+          k_splitk_repack2<<<1024, 256, 0, g_str>>>(xp, d_skx, P, (int)K);
+          k_gemm_wmma<64, 128, 2, 2, 2, 4, 64, 128>
+              <<<grid, 128, 0, g_str>>>(d_skx, wp, y, P, ks, (int)N, 1,
+                                        nullptr, nullptr, nullptr, nullptr, 0,
+                                        (unsigned)K);
+          k_gemm_wmma<64, 128, 2, 2, 2, 4, 64, 128, 3>
+              <<<grid, 128, 0, g_str>>>(d_skx + (size_t)P * ks, wp + ks, y, P,
+                                        ks, (int)N, 1, nullptr, nullptr,
+                                        nullptr, nullptr, 0, (unsigned)K);
+        } else
           k_gemm_wmma<64, 128, 2, 2, 2, 4, 64, 128>
               <<<(unsigned)(((P + 63) / 64) * 20), 128, 0, g_str>>>(
                   xp, wp, y, P, (int)K, (int)N, 1);
@@ -2200,7 +2307,24 @@ struct GpuModel {
   // (fp32) + d_xbf16 exactly like the unfused pair. Returns false (caller
   // runs the unfused pair) unless that exact route would have been taken.
   // Opt-out GDEC_HC_FUSE=0 (tools/hcmix_verify.sh).
-  bool hc_up_fused(const WView& w, int P) {
+  // B2-2 (GDEC_HC_NORHAT=1 显式开启，默认关): sc 非空时 Rh 实参应是未归一化
+  // 的 d_Rb，epilogue 现场乘 (R*sc)*(1+Hw)（见 k_gemm_wmma Epi=1 注释），Rhat
+  // 不落盘。终判否决（2026-10-03，128k@16384 背靠背 1175.7 vs 1216.4 = -3.3%，
+  // KPROF hc+hc2 +293ms/chunk）：Epi=2 staging 归一化的 VALU + Sc/Hw 额外读
+  // 超过省下的 Rhat 落盘带宽；正确性全过（c8192 0.08129 vs 0.08249），代码留存。
+  bool hc_norhat(int P) const {
+    static const bool on = getenv("GDEC_HC_NORHAT") != nullptr &&
+                           !env_zero("GDEC_HC_NORHAT") &&
+                           !env_zero("GDEC_HC_FUSE") &&
+                           getenv("GDEC_GEMM_WMMA") != nullptr &&
+                           getenv("GDEC_GEMM_RB") == nullptr &&
+                           getenv("GDEC_GEMM_NO_K64") == nullptr;
+    return on && prefill_fused && gr_bf16 && P >= 1024 && g_cfg.branches == 4 &&
+           (uint64_t)g_cfg.d * 4 == 10240 &&
+           ((((uintptr_t)d_t320b | (uintptr_t)d_xbf16b) & 15) == 0);
+  }
+  bool hc_up_fused(const WView& w, int P, const float* sc = nullptr,
+                   const float* hw = nullptr) {
     static const bool on = !env_zero("GDEC_HC_FUSE") &&
                            getenv("GDEC_GEMM_WMMA") != nullptr &&
                            getenv("GDEC_GEMM_RB") == nullptr;
@@ -2219,7 +2343,8 @@ struct GpuModel {
     // still bit-identical (K accumulation order is tile-independent).
     const unsigned grid = (unsigned)(((P + 127) / 128) * (int)(N / 128));
     k_gemm_wmma<128, 128, 4, 2, 2, 4, 32, 256, 1><<<grid, 256, 0, g_str>>>(
-        d_xbf16b, wp, d_xb, P, (int)K, (int)N, 2, d_Rhatbf16, d_xbf16);
+        d_xbf16b, wp, d_xb, P, (int)K, (int)N, 2,
+        sc ? (const uint16_t*)d_Rb : d_Rhatbf16, d_xbf16, sc, hw);
     if (prof)
       p_gemm += std::chrono::duration<double, std::milli>(
                     std::chrono::steady_clock::now() - pt0)
@@ -2227,14 +2352,43 @@ struct GpuModel {
     return true;
   }
 
-  void gr_mix_b(const std::string& prefix, int P) {
+  void gr_mix_b(const std::string& prefix, int P, float* hw = nullptr,
+                bool norhat = false) {
     char buf[128];
     snprintf(buf, sizeof buf, "%s.input_mix_weight_down.weight", prefix.c_str());
-    gemm(wview(ckpt.at(buf)), d_Rhatb, d_t320b, P, 0,
-         gr_bf16 ? d_Rhatbf16 : nullptr);
+    if (norhat) {
+      // B2-2: mix-down 的 A = 未归一化的 d_Rb，Epi=2 在 staging 现场归一化
+      //（与 rmsnorm 同一表达式 -> A tile 与被取代的 Rhat 逐 bit）。路线条件与
+      // gemm() 的 (320,10240) k64 分流一致（hc_norhat 已核）。
+      auto pt0 = std::chrono::steady_clock::now();
+      const uint16_t* wp = gemm_wbf16(wview(ckpt.at(buf)));
+      k_gemm_wmma<64, 160, 2, 2, 2, 5, 64, 128, 2>
+          <<<(unsigned)(((P + 63) / 64) * 2), 128, 0, g_str>>>(
+              (const uint16_t*)d_Rb, wp, d_t320b, P, 10240, 320, 1, nullptr,
+              nullptr, d_hcsc, hw);
+      if (prof)
+        p_gemm += std::chrono::duration<double, std::milli>(
+                      std::chrono::steady_clock::now() - pt0)
+                      .count();
+    } else {
+      gemm(wview(ckpt.at(buf)), d_Rhatb, d_t320b, P, 0,
+           gr_bf16 ? d_Rhatbf16 : nullptr);
+    }
     k_silu_scale<<<(P * 320 + 255) / 256, 256, 0, g_str>>>(d_t320b, 0.25f, P * 320);
     snprintf(buf, sizeof buf, "%s.input_mix_weight_up.weight", prefix.c_str());
     const WView wup = wview(ckpt.at(buf));
+    if (norhat) {
+      // hc_norhat 与 hc_up_fused 条件逐一对应；仍失败说明 Rhat 未落盘而
+      // 后续读者存在——不能静默走旧路（会读 stale Rhat），直接 fatal。
+      if (!hc_up_fused(wup, P, d_hcsc, hw)) {
+        fprintf(stderr, "hc_norhat: up-fused route fell back with Rhat unwritten\n");
+        exit(1);
+      }
+      xf16_src = d_xb;
+      xf16_xs = xf16_K = g_cfg.d;
+      xf16_P = P;
+      return;
+    }
     if (prefill_fused && gr_bf16 && hc_up_fused(wup, P)) {
       xf16_src = d_xb;
       xf16_xs = xf16_K = g_cfg.d;
@@ -2321,16 +2475,24 @@ struct GpuModel {
     return inj_wcache_[prefix] = dst;
   }
 
-  void gr_write_b(const std::string& prefix, int P) {
+  // First half of gr_write_b: make d_w4b for prefix (inject partials psum or
+  // the N=4 GEMM). Bit-identical to what gr_write_b would compute; injp_cur
+  // is left untouched so a non-fused fallback recomputes the same d_w4b.
+  void gr_write_prep_b(const std::string& prefix, int P) {
     char buf[128];
     if (injp_cur >= 0 && injp_for == prefix) {
       k_inj_psum<<<(P * 4 + 255) / 256, 256, 0, g_str>>>(d_injp[injp_cur], d_w4b, P);
-      injp_cur = -1;
     } else {
       snprintf(buf, sizeof buf, "%s.block_inject_weight.weight", prefix.c_str());
       gemm(wview(ckpt.at(buf)), d_Rhatb, d_w4b, P, 0,
            gr_bf16 ? d_Rhatbf16 : nullptr);
     }
+  }
+
+  void gr_write_b(const std::string& prefix, int P) {
+    const bool had_p = injp_cur >= 0 && injp_for == prefix;
+    gr_write_prep_b(prefix, P);
+    if (had_p) injp_cur = -1;
     if (gr_bf16)
       k_gr_write_b_hc_bf16<<<(P * 2560 + 255) / 256, 256, 0, g_str>>>(
           d_w4b, (uint16_t*)d_Rb, d_yb, g_cfg.d, g_cfg.branches, P);
@@ -2342,8 +2504,12 @@ struct GpuModel {
   void gr_write_read_b(const std::string& write_prefix,
                        const std::string& read_prefix, int P) {
     char buf[128];
+    // B2-1: the moe reduce already applied this site's write (R is
+    // post-write); the scatter below only norms. pfull/pin go unused.
+    const bool write_done = !hcw_site_.empty() && hcw_site_ == write_prefix;
+    if (write_done) hcw_site_.clear();
     const bool have_p = injp_cur >= 0 && injp_for == write_prefix;
-    if (!have_p) {
+    if (!have_p && !write_done) {
       snprintf(buf, sizeof buf, "%s.block_inject_weight.weight",
                write_prefix.c_str());
       gemm(wview(ckpt.at(buf)), d_Rhatb, d_w4b, P, 0,
@@ -2351,26 +2517,38 @@ struct GpuModel {
     }
     float* hw = ensure_hcnorm(read_prefix);
     const uint16_t* wn = inj_fuse_on() ? inj_wbf16(read_prefix) : nullptr;
-    if (!wn && have_p)  // partials exist but this site can't fuse (defensive)
+    if (!wn && write_done)  // R is already post-write; a writing scatter would double-apply
+      throw std::runtime_error("gr_write_read_b: fused HC write but read site can't fuse");
+    if (!wn && have_p && !write_done)  // partials exist but this site can't fuse (defensive)
       k_inj_psum<<<(P * 4 + 255) / 256, 256, 0, g_str>>>(d_injp[injp_cur], d_w4b, P);
     if (wn) {
       static bool said = false;
       if (!said) { said = true; fprintf(stderr, "[hc-inj-fuse] on (inject GEMM folded into scatter_norm)\n"); }
       const int nxt = injp_cur == 0 ? 1 : 0;  // pin != pout
+      const float* pfull = (have_p || write_done) ? nullptr : d_w4b;
+      const float* pin = (have_p && !write_done) ? d_injp[injp_cur] : nullptr;
+      const float* y = write_done ? nullptr : d_yb;
+      // B2-2: Rhat 不落盘，scatter 只写 P×4 inv scales（gr_read_b 站除外——
+      // 那里的 Rhat 还要喂后续 inject GEMM，维持旧路，见 gr_read_b）。
+      const bool nr = hc_norhat(P);
+      uint16_t* const rh = nr ? nullptr : d_Rhatbf16;
+      float* const sc = nr ? d_hcsc : nullptr;
       // Verify sizes (P<=8): 1 token/block -> 4P blocks instead of 4*ceil(P/4).
       // Per-(t,b) arithmetic is T-invariant (proto: R/Rhat bit-identical), the
       // 4-token serial loop was pure latency at 4 blocks. GDEC_SCAT_T1=0: T=4.
       static const bool scat_t1 = !env_zero("GDEC_SCAT_T1");
-      if (scat_t1 && P <= 8)
+      if (scat_t1 && P <= 8 && !write_done)
         k_gr_scatter_norm_inj_bf16<1><<<4 * P, 256, 0, g_str>>>(
-            have_p ? nullptr : d_w4b, have_p ? d_injp[injp_cur] : nullptr,
-            (uint16_t*)d_Rb, d_yb, hw, d_Rhatbf16, wn, d_injp[nxt], g_cfg.d, P,
-            g_cfg.norm_eps);
+            pfull, pin, (uint16_t*)d_Rb, y, hw, rh, wn, d_injp[nxt],
+            g_cfg.d, P, g_cfg.norm_eps, sc);
+      else if (write_done)
+        k_gr_scatter_norm_inj_bf16<4, false><<<4 * ((P + 3) / 4), 256, 0, g_str>>>(
+            nullptr, nullptr, (uint16_t*)d_Rb, nullptr, hw, rh, wn,
+            d_injp[nxt], g_cfg.d, P, g_cfg.norm_eps, sc);
       else
         k_gr_scatter_norm_inj_bf16<4><<<4 * ((P + 3) / 4), 256, 0, g_str>>>(
-            have_p ? nullptr : d_w4b, have_p ? d_injp[injp_cur] : nullptr,
-            (uint16_t*)d_Rb, d_yb, hw, d_Rhatbf16, wn, d_injp[nxt], g_cfg.d, P,
-            g_cfg.norm_eps);
+            pfull, pin, (uint16_t*)d_Rb, y, hw, rh, wn, d_injp[nxt],
+            g_cfg.d, P, g_cfg.norm_eps, sc);
       injp_cur = nxt;
       injp_for = read_prefix;
     } else if (gr_bf16)
@@ -2392,7 +2570,7 @@ struct GpuModel {
           g_cfg.norm_eps);
     if (!wn) injp_cur = -1;
     if (xf16_src == d_Rhatb) xf16_src = nullptr;
-    gr_mix_b(read_prefix, P);
+    gr_mix_b(read_prefix, P, hw, wn && hc_norhat(P));
   }
 
   // GDN: projections batched. Chunked path: conv/l2norm/gates batched, then
@@ -2400,6 +2578,7 @@ struct GpuModel {
   // GDEC_GDN_LOOP=1 falls back to the per-token recurrence loop.
   void gdn_b(int l, int gi, int P) {
     char buf[128];
+    KP_SUB("gdn:proj");
     snprintf(buf, sizeof buf, "layers.%d.linear_attn.in_proj_qkv.weight", l);
     gemm(wview(ckpt.at(buf)), d_xb, d_qkvb, P);
     snprintf(buf, sizeof buf, "layers.%d.linear_attn.in_proj_a.weight", l);
@@ -2408,6 +2587,7 @@ struct GpuModel {
     gemm(wview(ckpt.at(buf)), d_xb, d_beta48b, P);
     snprintf(buf, sizeof buf, "layers.%d.linear_attn.in_proj_z.weight", l);
     gemm(wview(ckpt.at(buf)), d_xb, d_zb, P);
+    KP_SUB_END();
     float* convst = d_convst + (size_t)gi * 3 * 10240;
     const float* cw = d_convw + (size_t)gi * 10240 * 4;
     const float* Alog = d_Alog + (size_t)gi * 48;
@@ -2416,6 +2596,7 @@ struct GpuModel {
     const float* gnw = d_gdnnorm + (size_t)gi * 128;
     float qscale = 1.f / sqrtf(128.f);
     if (!gdn_loop) {
+      KP_SUB("gdn:conv");
       // conv+silu and the q/k l2norm in one pass (k_gdn_conv_l2n_b, bit-exact
       // vs the pair, tools/convl2_verify.sh); opt-out GDEC_GDN_CONVL2=0.
       static const bool convl2 = !env_zero("GDEC_GDN_CONVL2");
@@ -2439,12 +2620,14 @@ struct GpuModel {
         k_l2norm_qk_b<<<dim3(16, P), 128, 0, g_str>>>(d_convb, 128, qscale, 10240, 16);
       k_gdn_gates<<<P, 64, 0, g_str>>>(d_g48b, d_beta48b, Alog, dtb, d_g48b, d_beta48b,
                                        48, 48);
+      KP_SUB_END();
       if (spec_snap) {
         int ngdn = g_cfg.layers - g_cfg.layers / 4;
         k_gdn_snap<<<48, 512, 0, g_str>>>(
             d_convb, d_g48b, d_beta48b, S, d_Ssnap + (size_t)gi * 48 * 128 * 128,
             P, 10240, (size_t)ngdn * 48 * 128 * 128);
       }
+      KP_SUB("gdn:scan");
       if (ngram_verify_active && !ngram_legacy_gdn && P <= 65) {
         k_gdn_verify<<<48, 512, 0, g_str>>>(
             d_convb, d_g48b, d_beta48b, S, d_convb, P, 10240);
@@ -2519,12 +2702,17 @@ struct GpuModel {
         }
         if (pipe) CK(hipStreamWaitEvent(g_str, ev_s[lastw & 1], 0));
       }
+      KP_SUB_END();
+      KP_SUB("gdn:norm");
       k_gdn_gatednorm_b<true><<<dim3(48, (P + 31) / 32), 128, 0, g_str>>>(
           d_convb + 4096, d_zb, gnw, nullptr, g_cfg.norm_eps, 10240, 6144,
           d_xbf16b, P);
+      KP_SUB_END();
+      KP_SUB("gdn:oproj");
       snprintf(buf, sizeof buf, "layers.%d.linear_attn.out_proj.weight", l);
       gemm(wview(ckpt.at(buf)), d_convb + 4096, d_yb, P, 10240 /*row stride*/,
            d_xbf16b);
+      KP_SUB_END();
       return;
     }
     for (int t = 0; t < P; t++) {
@@ -2786,6 +2974,7 @@ struct GpuModel {
         CK(hipMemset(d_vcbt, 0, nqsa * qsa_vt_blocks * 2 * 256 * 4 * 2));
     }
     if (d_ik && kv_zero_has('i')) CK(hipMemset(d_ik, 0, (size_t)kv_nl * ik_layer_blocks * 128 * 4));
+    if (d_ikh && kv_zero_has('i')) CK(hipMemset(d_ikh, 0, (size_t)kv_nl * ik_layer_blocks * 128 * 2));
   }
   // A3: pin / unpin / adopt the live prefix for RAM checkpoints.
   std::vector<int> kv_pin(int pos) {
@@ -2870,6 +3059,9 @@ struct GpuModel {
       if (d_ik)
         fn(d_ik + ((size_t)qi * ik_layer_blocks + g * KV_PAGE_BLOCKS) * 128,
            (size_t)KV_PAGE_BLOCKS * 128 * 4, 'i');
+      if (d_ikh)  // C1 f16 twin: COW/zero/guard treat it like the fp32 page
+        fn(d_ikh + ((size_t)qi * ik_layer_blocks + g * KV_PAGE_BLOCKS) * 128,
+           (size_t)KV_PAGE_BLOCKS * 128 * 2, 'i');
     }
   }
   bool kv_guard_dirty() {
@@ -3015,6 +3207,7 @@ struct GpuModel {
     char buf[128];
     const uint16_t* attn_bf = nullptr;  // gated o_proj input already in bf16
     if (!qsa_dense) {
+      KP_SUB("qsa:idx");
       // rope cos/sin table for the indexer kernels below (idempotent; the QSA
       // prep path re-ensures the same (base, P) later and hits the cache)
       ensure_rope_tab(g_cfg.rope_theta, 64);
@@ -3026,10 +3219,12 @@ struct GpuModel {
         gemm(wview(ckpt.at(buf)), d_xb, d_iproj, P);
       }
       float* keys = d_ik + (size_t)qi * ik_layer_blocks * 128;
+      uint16_t* keys16 =
+          d_ikh ? d_ikh + (size_t)qi * ik_layer_blocks * 128 : nullptr;
       k_index_q<<<dim3(P, 4), 128, 0, g_str>>>(d_iproj, d_inorm + qi * 256, d_iq,
                                               P, g_cfg.norm_eps, g_cfg.rope_theta,
                                               nullptr, base, d_ropecs, nullptr,
-                                              vbptr());
+                                              vbptr(), d_iqh);
       // absolute 4-token blocks [base/4, (base+P)/4); a left-straddling block
       // (base%4 != 0) is completed with history rows from the raw ring
       int nb = (base + P) / 4, b0 = base / 4;
@@ -3038,7 +3233,7 @@ struct GpuModel {
                                                  keys, g_cfg.norm_eps,
                                                  g_cfg.rope_theta, base,
                                                  d_iraw + qi * 512, d_ropecs, kvpt(),
-                                                 vbptr());
+                                                 vbptr(), keys16);
       k_index_ring<<<min(P, 4), 128, 0, g_str>>>(d_iproj, d_iraw + qi * 512, P, base,
                                                  vbptr());
       if (spec_snap)
@@ -3048,9 +3243,14 @@ struct GpuModel {
       // gather them into d_ikg first (same values, same sgemm shape -> the
       // scores and selections stay bit-identical to the unpaged layout).
       const float* skeys = keys;
+      const uint16_t* skeys16 = keys16;
       if (kv_paged && nb > 0 && std::max(2051, base) < base + P) {
         k_ik_gather<<<nb, 128, 0, g_str>>>(keys, d_ptab, d_ikg, nb);
         skeys = d_ikg;
+        if (keys16) {
+          k_ik_gather16<<<nb, 128, 0, g_str>>>(keys16, d_ptab, d_ikgh, nb);
+          skeys16 = d_ikgh;
+        }
       }
       const float one = 1.f, zero = 0.f;
       // NOTE: nb (m/ldc) is the absolute pooled-block count, matching the
@@ -3068,13 +3268,29 @@ struct GpuModel {
                                : min(first + INDEX_BATCH, base + P);
         int count = nxt - first;
         if (index_fused2 && count >= 16 && getenv("GDEC_INDEX_OLDSEL") == nullptr) {
+          int* const selrow = d_iselected + (size_t)(first - base) * 512;  // batch-local
+          if (index_f16()) {
+            // C1: f16 WMMA 打分 + f16 score（复用 d_iscores 内存）+ f16 select
+            uint16_t* const sc16 = (uint16_t*)d_iscores;
+            k_index_scores_wmma16<false>
+                <<<index_wmma16_grid(nb, count), 256, 0, g_str>>>(
+                    d_iqh + (size_t)(first - base) * 512, skeys16, sc16, nb,
+                    count, first);
+            if ((first + count) / 4 <= 8192)
+              k_index_select_rs<true, __half><<<count, 256, 0, g_str>>>(
+                  (const __half*)sc16, nb, selrow, first);
+            else
+              k_index_select_2p<__half><<<count, 256, 0, g_str>>>(
+                  (const __half*)sc16, nb, selrow, first);
+            first = nxt;
+            continue;
+          }
           if (index_score64)
             k_index_scores_t64<<<index_t64_grid(nb, count), 256, 0, g_str>>>(
                 d_iq + (size_t)(first - base) * 512, skeys, d_iscores, nb, count, first);
           else
             k_index_scores_tiled<<<dim3((nb + 31) / 32, (count + 15) / 16), 256, 0, g_str>>>(
                 d_iq + (size_t)(first - base) * 512, skeys, d_iscores, nb, count, first);
-          int* const selrow = d_iselected + (size_t)(first - base) * 512;  // batch-local
           if ((first + count) / 4 <= 8192)
             k_index_select_rs<true><<<count, 256, 0, g_str>>>(
                 d_iscores, nb, selrow, first);
@@ -3101,13 +3317,16 @@ struct GpuModel {
                      count);
         first = nxt;
       }
+      KP_SUB_END();
     }
+    KP_SUB("qsa:proj");
     snprintf(buf, sizeof buf, "layers.%d.self_attn.q_proj.weight", l);
     gemm(wview(ckpt.at(buf)), d_xb, d_qgb, P);
     snprintf(buf, sizeof buf, "layers.%d.self_attn.k_proj.weight", l);
     gemm(wview(ckpt.at(buf)), d_xb, d_kbb, P);
     snprintf(buf, sizeof buf, "layers.%d.self_attn.v_proj.weight", l);
     gemm(wview(ckpt.at(buf)), d_xb, d_vbb, P);
+    KP_SUB_END();
     snprintf(buf, sizeof buf, "layers.%d.self_attn.q_norm.weight", l);
     float* qnw = ensure_norm256(buf);
     snprintf(buf, sizeof buf, "layers.%d.self_attn.k_norm.weight", l);
@@ -3125,6 +3344,7 @@ struct GpuModel {
       // directly (qsplit skips its gs copy). GDEC_QSA_GATE_BF16=0 disables.
       static const bool gate_bf16_on = !env_zero("GDEC_QSA_GATE_BF16");
       const bool gate_bf16 = gate_bf16_on && P > 8;
+      KP_SUB("qsa:prep");
       k_qsa_qsplit<true><<<dim3(24, P), 256, 0, g_str>>>(
           d_qgb, qnw, d_qsb, gate_bf16 ? nullptr : d_gsb, 256, g_cfg.norm_eps, base,
           d_ropecs);
@@ -3139,7 +3359,10 @@ struct GpuModel {
         // copy (unpaged) or one copy per physically contiguous page run
         kv_rows_store(kc, d_kbb, base, P);
         kv_rows_store(vc, d_vbb, base, P);
+        KP_SUB_END();
+        KP_SUB("qsa:flash");
         qsa_flash_b(kc, vc, P, dense_P, base, nullptr, kvpt());
+        KP_SUB_END();
       } else {
         uint16_t* kc = d_kcb + qsa_off;
         uint16_t* vc = d_vcb + qsa_off;
@@ -3211,9 +3434,13 @@ struct GpuModel {
                              g_str>>>(vct, kvpt(), r0, r1,
                                       tv ? (uint16_t)strtoul(tv, nullptr, 16) : 0);
         }
+        KP_SUB_END();
+        KP_SUB("qsa:flash");
         qsa_flash_b(kc, vc, P, dense_P, base, vct, kvpt());
+        KP_SUB_END();
         if (base > 0 && getenv("GDEC_ATTN_HASH")) dbg_attn_hash(qi, base, P, kc, vc, vct);
       }
+      KP_SUB("qsa:gate");
       if (gate_bf16) {  // see qsplit above
         const uint64_t n4 = (uint64_t)P * 6144 / 4;
         k_sigmoid_gate_bf16_v4<<<(unsigned)((n4 + 255) / 256), 256, 0, g_str>>>(
@@ -3223,6 +3450,7 @@ struct GpuModel {
         k_sigmoid_gate<<<(P * 6144 + 255) / 256, 256, 0, g_str>>>(d_attnb, d_gsb,
                                                                   d_attnb, P * 6144);
       }
+      KP_SUB_END();
     } else {
       for (int t = 0; t < P; t++) {
         const int* pabs = d_posarr + base + t;  // absolute position
@@ -3258,13 +3486,18 @@ struct GpuModel {
         k_sigmoid_gate<<<(6144 + 255) / 256, 256, 0, g_str>>>(att, gs, att, 6144);
       }
     }
+    KP_SUB("qsa:oproj");
     snprintf(buf, sizeof buf, "layers.%d.self_attn.o_proj.weight", l);
     gemm(wview(ckpt.at(buf)), d_attnb, d_yb, P, 0, attn_bf);
+    KP_SUB_END();
   }
 
   // MoE: router batched; expert GEMVs grouped over P*k slots (naive: full
   // weight traffic per token — correct but slow; optimized in a later phase).
-  void moe_b(int l, int P) {
+  // Returns true when the HC write-back of the moe output was fused into the
+  // reduce (B2-1; only on the LUT sg_fuse paths with try_hcw set): R is
+  // updated, acc/d_yb are not written and the caller skips gr_write_b.
+  bool moe_b(int l, int P, bool try_hcw = false) {
     char buf[128];
     const bool direct_output = pp_moe_out && P > 8;
     float* const acc = direct_output ? d_yb : d_moeaccb;
@@ -3321,32 +3554,36 @@ struct GpuModel {
     if (gg_on()) {
       moe_gguf(g_ggx.at(l), d_xb, d_topidsb, d_topwb, acc, P);
       moe_b_shared(l, P, acc, direct_output);
-      return;
+      return false;
     }
     snprintf(buf, sizeof buf, "layers.%d.mlp.experts.gate_up_proj.weight", l);
     WView gu = wview(ckpt.at(buf));
     snprintf(buf, sizeof buf, "layers.%d.mlp.experts.down_proj.weight", l);
     WView dn = wview(ckpt.at(buf));
     if (gu.dtype == 23) {  // hgn v2 i4r: own paths (q4cp fast paths do not apply)
-      moe_b_v2(l, gu, dn, acc, P, direct_output);
-      return;
+      return moe_b_v2(l, gu, dn, acc, P, direct_output, try_hcw ? d_w4b : nullptr,
+                      try_hcw ? (uint16_t*)d_Rb : nullptr);
     }
     // Shared expert first (its scratch d_guvb/d_hidb/d_xbf16b is dead before
     // the routed experts reuse it), so its add folds into the routed reduce.
     // GDEC_MOE_SG_FUSE=0: old order + k_axpy_sg.
     static const bool sg_fuse = !env_zero("GDEC_MOE_SG_FUSE");
     if (!moe_naive && P > moe_naive_max && sg_fuse && moe_q4w_ok(gu, dn, P)) {
+      KP("moe:shared");
       moe_b_shared_ey(l, P);
-      moe_q4w_run(gu, dn, d_xb, d_topidsb, d_topwb, acc, P, d_eyb, d_sgb);
+      moe_q4w_run(gu, dn, d_xb, d_topidsb, d_topwb, acc, P, d_eyb, d_sgb,
+                  try_hcw ? d_w4b : nullptr, try_hcw ? (uint16_t*)d_Rb : nullptr);
+      if (try_hcw) return true;
       if (!direct_output)
         CK(hipMemcpyAsync(d_yb, acc, (size_t)P * g_cfg.d * 4, hipMemcpyDeviceToDevice,
                           g_str));
-      return;
+      return false;
     }
     if (!moe_naive && P > moe_naive_max &&
         moe_q4w_run(gu, dn, d_xb, d_topidsb, d_topwb, acc, P)) {
+      KP("moe:shared");
       moe_b_shared(l, P, acc, direct_output);
-      return;
+      return false;
     }
     // fused kernels require exact tiling (guards would spill accumulators)
     bool fused_ok = g_cfg.moe_mid % MOE_CT == 0 && g_cfg.d % MOE_CT == 0 &&
@@ -3798,18 +4035,22 @@ struct GpuModel {
       }
     }
     moe_b_shared(l, P, acc, direct_output);
+    return false;
   }
 
   // hgn v2 i4r MoE of trunk layer l for P rows of d_xb (topk in d_topidsb /
   // d_topwb): routed + shared expert -> acc f32 [P][d] (then d_yb unless
   // direct_output). Same dataflow as moe_v2_1; small P (verify) runs the
   // grouped GEMVs, larger P the kI4R LUT WMMA kernels on the moe_q4w_run
-  // workspaces (raw gate|up F16 in d_guvb, dead once k_i4r_mid has written the
-  // F16 down input to d_hidb; d_guvb then takes the down pairs). LUT path: the
+  // workspaces (moe_lut_up_mid writes the F16 down input straight to d_hidb;
+  // d_guvb takes the down pairs). LUT path: the
   // shared expert runs first (its d_guvb / d_hidb scratch is dead by then) and
   // k_v2_reduce_rot folds reduce + rot_out + shared add into one pass
   // (GDEC_MOE_SG_FUSE=0: shared expert afterwards via k_axpy_sg).
-  void moe_b_v2(int l, const WView& gu, const WView& dn, float* acc, int P, bool direct_output) {
+  // w4hc/Rhc: fuse the HC write-back into k_v2_reduce_rot_hc (B2-1) and
+  // return true; only on the LUT sg_fuse path.
+  bool moe_b_v2(int l, const WView& gu, const WView& dn, float* acc, int P,
+                bool direct_output, const float* w4hc = nullptr, uint16_t* Rhc = nullptr) {
     const int k = g_cfg.topk, E = g_cfg.experts, d = g_cfg.d, mid = g_cfg.moe_mid;
     if (gu.cols != (uint64_t)d || gu.rows != (uint64_t)E * 2 * mid || dn.dtype != 23 ||
         dn.cols != (uint64_t)mid || dn.rows != (uint64_t)E * d || mid % 128 || d % 128 ||
@@ -3830,30 +4071,59 @@ struct GpuModel {
         fprintf(stderr, "moe prefill: hgn v2 i4r LUT WMMA\n");
       }
       static const bool sg_fuse = !env_zero("GDEC_MOE_SG_FUSE");
+      KP("moe:shared");
       if (sg_fuse) moe_b_shared_ey(l, P);
+      KP("moe:route");
       moe_routing.run(d_topidsb, d_topwb, d_tokidx, d_pweight, d_eoff, d_pairids, P, k, E);
       k_moe_tiles<<<1, 512, 0, g_str>>>(d_eoff, d_moetiles, d_moentiles, E);
       const int max_tiles = (P * k + 63) / 64 + E;
       __half* x16 = (__half*)d_xbf16b;
       __half* hid = (__half*)d_hidb;
-      __half* guv16 = (__half*)d_guvb;
+      KP("moe:rot_in");
       v2_rot(d_xb, d, x16, d, gu.suh, nullptr, d, P, true);
-      moe_lut_up_raw(pgu, x16, d_tokidx, d_moetiles, d_moentiles, max_tiles, guv16, mid, d,
-                     g_str);
-      k_i4r_mid<__half, true><<<P * k, mid_threads, 0, g_str>>>(guv16, 2 * mid, hid, mid,
-                                                                gu.svh, dn.suh, mid);
+      KP("moe:up");
+      // up + mid fused (方向 3): hid = fwht(silu(g)*u*suh) 直接落盘，
+      // 省掉 guv16 的写读往返和 k_i4r_mid 那次 launch，数学逐位一致。
+      moe_lut_up_mid(pgu, x16, d_tokidx, d_moetiles, d_moentiles, max_tiles, hid, gu.svh, dn.suh,
+                     mid, d, g_str);
+      KP("moe:mid");
+      KP("moe:down");
+      // f16 pairs（down 写/reduce 读，v2-only，省一半 pairs 往返流量）。
+      // 实测（Windows, 2026-10-02）：reduce −148 ms/16K，down 几乎不变，整体
+      // +1.2~1.5%。终判（10-03，Linux BF16 基准 data/kld/bf16_c512.kld 64×512）：
+      // mean_kld 0.106993(关) → 0.107705(开)，门槛 0.10699+0.002=0.10899 过线，
+      // 默认开；GDEC_V2_PAIRS_F16=0 回退 fp32 pairs。
+      static const bool pairs_f16 = !env_zero("GDEC_V2_PAIRS_F16");
       moe_lut_down(moelut::kI4R, pdn, hid, d_moetiles, d_moentiles, max_tiles, d_guvb, d, mid,
-                   g_str);
+                   g_str, pairs_f16);
+      KP("moe:reduce");
       const unsigned waves = (unsigned)P * (d / 128);
-      k_v2_reduce_rot<10><<<(waves + 7) / 8, 256, 0, g_str>>>(
-          d_guvb, d_pairids, d_pweight, dn.svh, sg_fuse ? d_eyb : nullptr, d_sgb, acc, P, d);
+      if (sg_fuse && Rhc) {
+        if (pairs_f16)
+          k_v2_reduce_rot_hc<10, __half><<<(waves + 7) / 8, 256, 0, g_str>>>(
+              (const __half*)d_guvb, d_pairids, d_pweight, dn.svh, d_eyb, d_sgb, w4hc,
+              Rhc, P, d);
+        else
+          k_v2_reduce_rot_hc<10><<<(waves + 7) / 8, 256, 0, g_str>>>(
+              d_guvb, d_pairids, d_pweight, dn.svh, d_eyb, d_sgb, w4hc, Rhc, P, d);
+        KP("moe:tail");
+        return true;
+      }
+      if (pairs_f16)
+        k_v2_reduce_rot<10, __half><<<(waves + 7) / 8, 256, 0, g_str>>>(
+            (const __half*)d_guvb, d_pairids, d_pweight, dn.svh, sg_fuse ? d_eyb : nullptr,
+            d_sgb, acc, P, d);
+      else
+        k_v2_reduce_rot<10><<<(waves + 7) / 8, 256, 0, g_str>>>(
+            d_guvb, d_pairids, d_pweight, dn.svh, sg_fuse ? d_eyb : nullptr, d_sgb, acc, P, d);
+      KP("moe:tail");
       if (sg_fuse) {
         if (!direct_output)
           CK(hipMemcpyAsync(d_yb, acc, (size_t)P * d * 4, hipMemcpyDeviceToDevice, g_str));
       } else {
         moe_b_shared(l, P, acc, direct_output);
       }
-      return;
+      return false;
     } else {
       const XCodes cg = xcodes(gu), cd = xcodes(dn);
       const bool direct_down = moe_down_topk && k == 10;
@@ -3880,6 +4150,7 @@ struct GpuModel {
     }
     v2_rot(acc, d, acc, d, nullptr, dn.svh, d, P);
     moe_b_shared(l, P, acc, direct_output);
+    return false;
   }
 
   // Shared expert of trunk layer l added into acc (routed sum), then acc -> d_yb.
@@ -3954,6 +4225,7 @@ struct GpuModel {
     char attn_prefix[128], mlp_prefix[128];
     snprintf(attn_prefix, sizeof attn_prefix,
              "layers.%d.attn_hyper_connection", l);
+    KP("hc");
     if (fuse_prev_mlp) {
       snprintf(mlp_prefix, sizeof mlp_prefix,
                "layers.%d.mlp_hyper_connection", l - 1);
@@ -3961,6 +4233,7 @@ struct GpuModel {
     } else {
       gr_read_b(attn_prefix, P);
     }
+    KP(is_qsa(l) ? "qsa" : "gdn");
     if (is_qsa(l))
       qsa_b(l, l / 4, P, base);
     else
@@ -3971,18 +4244,42 @@ struct GpuModel {
     }
     snprintf(mlp_prefix, sizeof mlp_prefix,
              "layers.%d.mlp_hyper_connection", l);
+    KP("hc2");
     if (gr_scatter_norm)
       gr_write_read_b(attn_prefix, mlp_prefix, P);
     else {
       gr_write_b(attn_prefix, P);
       gr_read_b(mlp_prefix, P);
     }
-    moe_b(l, P);
+    KP("moe");
+    // B2-1 (GDEC_HC_FUSE_WRITE, 默认关 — KPROF 实测回退，见 HANDOFF-PREFILL-ALL
+    // §4 B2-1 状态段): fold the mlp site's HC write-back into the moe reduce
+    // (saves the d_yb f32 write + re-read; R bit-identical). Requires the
+    // gr_bf16 write path; the deferred (flush_mlp=false) consumer additionally
+    // needs the inj-fused scatter's Write=false mode. moe_b fuses only on the
+    // LUT sg_fuse paths and reports back; otherwise the precomputed d_w4b is
+    // recomputed bit-identically by the normal write path.
+    static const bool hcw_env =
+        getenv("GDEC_HC_FUSE_WRITE") != nullptr && !env_zero("GDEC_HC_FUSE_WRITE");
+    const bool can_hcw = hcw_env && !dbg && gr_bf16 &&
+                         (flush_mlp || (gr_scatter_norm && inj_fuse_on()));
+    bool hcw = false;
+    if (can_hcw) {
+      gr_write_prep_b(mlp_prefix, P);
+      hcw = moe_b(l, P, true);
+    } else {
+      moe_b(l, P);
+    }
     if (dbg) {
       h_rms("gpu", l, "mlp-x", d_xb + (size_t)(P - 1) * 2560, 2560);
       h_rms("gpu", l, "mlp-y", d_yb + (size_t)(P - 1) * 2560, 2560);
     }
-    if (flush_mlp) gr_write_b(mlp_prefix, P);
+    KP("hc3");
+    if (flush_mlp) {
+      if (!hcw) gr_write_b(mlp_prefix, P);
+    } else if (hcw) {
+      hcw_site_ = mlp_prefix;
+    }
     if (!dbg && isatty(2)) {  // per-layer \r is terminal-only; logs use prefill-live
       fprintf(stderr, "\rprefill L%02d/%d", l + 1, g_cfg.layers);
       fflush(stderr);
@@ -4261,6 +4558,7 @@ struct GpuModel {
           });
       }
     }
+    KP("embed_ple");
     CK(hipMemcpyAsync(d_tokarr, tokens.data(), P * 4, hipMemcpyHostToDevice, g_str));
     // embed all tokens: gather rows then repeat to 4 branches (in-place safe)
     WView et = wview(ckpt.at("embed_tokens.weight"));
@@ -4361,6 +4659,7 @@ struct GpuModel {
       }
     }
     phase("L25-47", TP);
+    KP("tail");
     // MTP tap capture: d_Rb now holds the final 48-layer stream for every row.
     if (mtp_tap_capture) {
       // Taps are stored at chunk-local rows (0..P) regardless of the absolute
@@ -4399,6 +4698,8 @@ struct GpuModel {
     if (final && prog_total > 0) prog_wait(P);
     if (final) CK(hipMemcpy(&id, d_argmax, 4, hipMemcpyDeviceToHost));
     phase("argmax_d2h", TP);
+    KP("end");
+    if (g_kprof_on) g_kprof_ring.flush(base, P, quiet);
     double sec =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - T0).count();
     // quiet: spec-verify re-ingest chunks (<= gamma+1 tokens each round).
@@ -4512,7 +4813,10 @@ struct GpuModel {
                                                d_mpos, 0, nullptr, d_rdelta);
       k_index_append<<<1, 128, 0, g_str>>>(d_iproj, d_minorm + 128, d_miraw,
                                            d_mik, d_mpos, g_cfg.norm_eps,
-                                           g_cfg.rope_theta, d_rdelta, kvpt());
+                                           g_cfg.rope_theta, d_rdelta, kvpt(),
+                                           d_ikh ? d_ikh + (size_t)(g_cfg.layers / 4) *
+                                                       ik_layer_blocks * 128
+                                                 : nullptr);
       k_index_scores<<<(index_blocks + 3) / 4, 128, 0, g_str>>>(
           d_iq, d_mik, d_iscores, index_blocks, d_mpos, kvpt());
       index_select(d_iscores, index_blocks, d_iselected, 0, 1, d_mpos);
@@ -4734,19 +5038,28 @@ struct GpuModel {
       }
       k_index_q<<<dim3(P, 4), 128, 0, g_str>>>(d_iproj, d_minorm, d_iq, P,
                                                g_cfg.norm_eps, g_cfg.rope_theta,
-                                               nullptr, base, d_ropecs);
+                                               nullptr, base, d_ropecs, nullptr,
+                                               nullptr, d_iqh);
+      uint16_t* const mikh =
+          d_ikh ? d_ikh + (size_t)(g_cfg.layers / 4) * ik_layer_blocks * 128
+                : nullptr;
       int nb = (base + P) / 4, b0 = base / 4;
       if (nb > b0)
         k_index_pool<<<nb - b0, 128, 0, g_str>>>(d_iproj, d_minorm + 128, d_mik,
                                                  g_cfg.norm_eps,
                                                  g_cfg.rope_theta, base, d_miraw,
-                                                 d_ropecs, kvpt());
+                                                 d_ropecs, kvpt(), nullptr, mikh);
       k_index_ring<<<min(P, 4), 128, 0, g_str>>>(d_iproj, d_miraw, P, base);
       // paged: gather the keys contiguous for the scores (as trunk qsa_b)
       const float* skeys = d_mik;
+      const uint16_t* skeys16 = mikh;
       if (kv_paged && nb > 0 && std::max(2051, base) < base + P) {
         k_ik_gather<<<nb, 128, 0, g_str>>>(d_mik, d_ptab, d_ikg, nb);
         skeys = d_ikg;
+        if (mikh) {
+          k_ik_gather16<<<nb, 128, 0, g_str>>>(mikh, d_ptab, d_ikgh, nb);
+          skeys16 = d_ikgh;
+        }
       }
       const float one = 1.f, zero = 0.f;
       const int a0 = std::max(2051, base);
@@ -4763,13 +5076,28 @@ struct GpuModel {
         static const bool mtp_sgemm = getenv("GDEC_MTP_INDEX_SGEMM") != nullptr;
         if (index_fused2 && !mtp_sgemm && count >= 16 &&
             getenv("GDEC_INDEX_OLDSEL") == nullptr) {
+          int* const selrow = d_iselected + (size_t)(first - base) * 512;
+          if (index_f16()) {
+            uint16_t* const sc16 = (uint16_t*)d_iscores;
+            k_index_scores_wmma16<false>
+                <<<index_wmma16_grid(nb, count), 256, 0, g_str>>>(
+                    d_iqh + (size_t)(first - base) * 512, skeys16, sc16, nb,
+                    count, first);
+            if ((first + count) / 4 <= 8192)
+              k_index_select_rs<true, __half><<<count, 256, 0, g_str>>>(
+                  (const __half*)sc16, nb, selrow, first);
+            else
+              k_index_select_2p<__half><<<count, 256, 0, g_str>>>(
+                  (const __half*)sc16, nb, selrow, first);
+            first = nxt;
+            continue;
+          }
           if (index_score64)
             k_index_scores_t64<<<index_t64_grid(nb, count), 256, 0, g_str>>>(
                 d_iq + (size_t)(first - base) * 512, skeys, d_iscores, nb, count, first);
           else
             k_index_scores_tiled<<<dim3((nb + 31) / 32, (count + 15) / 16), 256, 0, g_str>>>(
                 d_iq + (size_t)(first - base) * 512, skeys, d_iscores, nb, count, first);
-          int* const selrow = d_iselected + (size_t)(first - base) * 512;
           if ((first + count) / 4 <= 8192)
             k_index_select_rs<true><<<count, 256, 0, g_str>>>(
                 d_iscores, nb, selrow, first);
@@ -6870,6 +7198,7 @@ struct GpuModel {
     hipStream_t cap;
     CK(hipStreamCreate(&cap));
     g_str = cap;
+    g_kprof_mute = true;  // hipEventRecord 进捕获流会把 event 录进图里
     hipGraph_t g1, g2;
     CK(hipStreamBeginCapture(cap, hipStreamCaptureModeGlobal));
     CK(hipMemcpyAsync(d_token, p_token, 4, hipMemcpyHostToDevice, cap));
@@ -6883,6 +7212,7 @@ struct GpuModel {
     k_step_incr<<<1, 1, 0, cap>>>(d_pos, d_ringpos);
     CK(hipStreamEndCapture(cap, &g2));
     g_str = nullptr;
+    g_kprof_mute = false;
     CK(hipGraphInstantiate(&g1_exec, g1, nullptr, nullptr, 0));
     CK(hipGraphInstantiate(&g2_exec, g2, nullptr, nullptr, 0));
     CK(hipStreamDestroy(cap));
@@ -6950,13 +7280,14 @@ struct GpuModel {
   // d_moetiles/d_moentiles/moe_routing/moe_lt/qsa_union paths are never taken
   // at P <= conc_rmax_; conc_borrow_yield refuses to lend when they are on.
 #define GDEC_WS_FIELDS(X)                                                     \
-  X(d_Rb) X(d_Rhatb) X(d_Rhatbf16) X(d_xb) X(d_yb) X(d_Gb) X(d_t320b)        \
+  X(d_Rb) X(d_Rhatb) X(d_Rhatbf16) X(d_hcsc) X(d_xb) X(d_yb) X(d_Gb)          \
+  X(d_t320b)                                                                  \
   X(d_w4b) X(d_qkvb) X(d_zb) X(d_g48b) X(d_beta48b) X(d_qgb) X(d_qsb)        \
   X(d_gsb) X(d_kbb) X(d_vbb) X(d_ropecs) X(d_attnb) X(d_routerb)             \
   X(d_topidsb) X(d_topwb) X(d_slot_order) X(d_guvb) X(d_hidb) X(d_moeaccb)   \
   X(d_eyb) X(d_sgb) X(d_eb) X(d_xbf16) X(d_xbf16b) X(d_tokidx) X(d_pweight)  \
   X(d_pairids) X(d_convb) X(d_keysb) X(d_plevb) X(d_qnb) X(d_Ub) X(d_Unb)    \
-  X(d_convoutb) X(d_tokarr) X(d_img_inj) X(d_iproj) X(d_iq) X(d_iselected)   \
+  X(d_convoutb) X(d_tokarr) X(d_img_inj) X(d_iproj) X(d_iq) X(d_iqh) X(d_iselected)   \
   X(d_iscores) X(d_mRb) X(d_mRhatb) X(d_mtap)
   struct WsPtrs {
 #define GDEC_WS_DECL(f) decltype(GpuModel::f) f = nullptr;
@@ -6983,6 +7314,7 @@ struct GpuModel {
     GDEC_WS_DUP(d_Rb, B * 10240 * 4);
     GDEC_WS_DUP(d_Rhatb, B * 10240 * 4);
     GDEC_WS_DUP(d_Rhatbf16, B * 10240 * 2);
+    GDEC_WS_DUP(d_hcsc, B * 4 * 4);
     GDEC_WS_DUP(d_xb, B * 2560 * 4);
     GDEC_WS_DUP(d_yb, B * 2560 * 4);
     GDEC_WS_DUP(d_Gb, B * 10240 * 4);
@@ -7026,6 +7358,7 @@ struct GpuModel {
     if (d_iproj) {  // !qsa_dense indexer block
       DALLOC(&ws_small_.d_iproj, B * 640 * 4);
       DALLOC(&ws_small_.d_iq, B * 512 * 4);
+      if (d_iqh) DALLOC(&ws_small_.d_iqh, B * 512 * 2);
       DALLOC(&ws_small_.d_iselected, B * INDEX_BUDGET * 4);
       DALLOC(&ws_small_.d_iscores,
              (size_t)std::min(R, INDEX_BATCH) * 4 * index_blocks * 4);

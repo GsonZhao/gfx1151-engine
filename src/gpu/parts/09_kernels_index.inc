@@ -1,6 +1,7 @@
 // ---------------- Lightning indexer: fused score + top-512 select kernels ----
 // Self-contained (HIP only, no engine globals) so tools/index_fast_test.cu can
 // include it next to the production kernels it is checked against.
+#include <hip/hip_fp16.h>
 //
 // Old (reference) kernels, moved verbatim from 10_ple_io.inc:
 //   k_index_select_rs      n <= 8192, LDS row cache, 4 MSD radix passes
@@ -9,6 +10,27 @@
 // Fast bit-exact replacements (2026-09-28, 128K prefill work):
 //   k_index_scores_t64     64q x 128k tile, 4q x 4h x 8k per thread
 //   k_index_select_2p      2 global passes (8192-bin histogram + LDS candidates)
+// C1 (2026-10-03): k_index_scores_bf16 (bf16 WMMA) + ST-templated selectors
+// reading bf16 score rows (NOT bit-identical to fp32; overlap/KLD gated).
+
+// score-load helpers: fp32 identity / bf16 -> fp32 (exact, bits << 16) /
+// f16 -> fp32 (exact __half2float; f16 subset of f32). Non-negative f16 bit
+// patterns are already monotone as raw uint16 (scores are ReLU-clamped), but
+// converting to exact f32 keeps the histogram/radix code identical to fp32.
+__device__ __forceinline__ float isel_ldf(float f) { return f; }
+__device__ __forceinline__ float isel_ldf(uint16_t u) {
+  return __uint_as_float((unsigned)u << 16);
+}
+__device__ __forceinline__ float isel_ldf(__half h) { return __half2float(h); }
+__device__ __forceinline__ unsigned isel_bits(float f) {
+  return __float_as_uint(f);
+}
+__device__ __forceinline__ unsigned isel_bits(uint16_t u) {
+  return (unsigned)u << 16;
+}
+__device__ __forceinline__ unsigned isel_bits(__half h) {
+  return __float_as_uint(__half2float(h));
+}
 
 // Exact top-512 selection, bit-identical output to k_index_select (same
 // combined-score formula and the same total order: score desc, then smaller
@@ -19,8 +41,8 @@
 // Emission scans b ascending, so ids come out in the same ascending order the
 // old kernel's final IdSort produced. Requires n <= 8192 (LDS combined-score
 // cache); larger n keeps the old kernel. n <= 512 fills directly (same as old).
-template <bool Combined = false>
-__global__ void k_index_select_rs(const float* __restrict__ scores, int stride,
+template <bool Combined = false, class ST = float>
+__global__ void k_index_select_rs(const ST* __restrict__ scores, int stride,
                                   int* __restrict__ selected, int first,
                                   const int* __restrict__ pos = nullptr) {
   __shared__ float sbuf[8192];
@@ -38,11 +60,11 @@ __global__ void k_index_select_rs(const float* __restrict__ scores, int stride,
   // combine (ReLU per head, ordered sum, scale) into LDS + top-byte histogram
   hist[tid] = 0;
   __syncthreads();
-  const float* qb = scores + (size_t)q * 4 * stride;
+  const ST* qb = scores + (size_t)q * 4 * stride;
   for (int b = tid; b < n; b += 256) {
     float s = 0.f;
     if constexpr (Combined) {
-      s = scores[(size_t)q * stride + b];
+      s = isel_ldf(scores[(size_t)q * stride + b]);
     } else {
 #pragma unroll
       for (int h = 0; h < 4; h++) s += fmaxf(0.f, qb[(size_t)h * stride + b]);
@@ -430,6 +452,142 @@ static inline dim3 index_t64_grid(int nb, int count) {
 }
 
 // ---------------------------------------------------------------------------
+// C1: bf16 WMMA score kernel + bf16 score storage. NOT bit-identical to the
+// fp32 path (bf16 q/k rounding, wmma f32 accumulation order, bf16 score out);
+// gated by selection overlap vs fp32 (tools/index_fast_test.cu, target
+// >= 99.5%) + long-context KLD + needle retrieval.
+using isel_shortx16 = __attribute__((ext_vector_type(16))) short;
+using isel_floatx8 = __attribute__((ext_vector_type(8))) float;
+__device__ __forceinline__ isel_shortx16 isel_ld16(const uint16_t* p) {
+  short tmp[16];
+  *(uint4*)&tmp[0] = *(const uint4*)p;
+  *(uint4*)&tmp[8] = *(const uint4*)(p + 8);
+  isel_shortx16 v;
+  memcpy(&v, tmp, 32);
+  return v;
+}
+__device__ __forceinline__ float isel_bf2f(uint16_t u) {
+  return __uint_as_float((unsigned)u << 16);
+}
+__device__ __forceinline__ uint16_t isel_f2bf(float f) {  // round-to-nearest-even
+  const unsigned u = __float_as_uint(f);
+  return (uint16_t)((u + 0x7FFFu + ((u >> 16) & 1)) >> 16);
+}
+__device__ __forceinline__ uint16_t isel_f2h(float f) {  // RNE f16 bit pattern
+  return __half_as_ushort(__float2half_rn(f));
+}
+
+// k_index_scores_wmma16<BF16>: score[t][b] (bf16/f16) = (sum_h max(0,
+// q[t*4+h] . k[b])) * 1/sqrt(128), same output/skip rules as
+// k_index_scores_t64: written only for t < count, b < nb,
+// b < (first + t + 1) / 4; grid = (ceil(nb/128), ceil(count/16)),
+// block = 256.
+// CTA: 16 tokens (64 head-rows) x 128 keys, K=128 staged whole (no double
+// buffer). Warp grid 2x4, each warp 32x32 (2x2 frags of wmma 16x16x16).
+// The 8 frag rows a lane holds are exactly 2 tokens x 4 heads (row =
+// token*4+head, rh a multiple of 8), so the ReLU+head-sum is intra-lane.
+// wmma accumulates in f32; only the q/k inputs and the final score are
+// rounded (bf16: RNE via isel_f2bf; f16: __float2half_rn). Inputs are
+// RMS-normed indexer vectors (~unit scale), scores <= ~hundreds << 65504,
+// so f16 range is ample; f16's 11-bit mantissa is 8x finer than bf16's.
+template <bool BF16>
+__global__ void __launch_bounds__(256)
+k_index_scores_wmma16(const uint16_t* __restrict__ q,
+                      const uint16_t* __restrict__ keys,
+                      uint16_t* __restrict__ out, int nb, int count, int first) {
+  constexpr int LSA = 128 + 8;        // LDS row stride (elems)
+  constexpr int BREG = 8 * LSA + 8;   // keys 8-row region stride
+  const int q0 = (int)blockIdx.y * 16, n0 = (int)blockIdx.x * 128;
+  if (q0 >= count || n0 >= min(nb, (first + min(q0 + 16, count)) / 4)) return;
+  __shared__ __align__(16) uint16_t As[64 * LSA];
+  __shared__ __align__(16) uint16_t Bs[(128 / 8) * BREG];
+  const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
+  // stage q: 64 rows x 16 uint4 (4 per thread); keys: 128 x 16 (8 per thread)
+#pragma unroll
+  for (int j = 0; j < 4; j++) {
+    const int idx = tid + j * 256, row = idx >> 4, c8 = (idx & 15) * 8;
+    uint4 v = make_uint4(0, 0, 0, 0);
+    if (q0 + (row >> 2) < count)
+      v = *(const uint4*)(q + (size_t)(q0 * 4 + row) * 128 + c8);
+    *(uint4*)&As[row * LSA + c8] = v;
+  }
+#pragma unroll
+  for (int j = 0; j < 8; j++) {
+    const int idx = tid + j * 256, row = idx >> 4, c8 = (idx & 15) * 8;
+    uint4 v = make_uint4(0, 0, 0, 0);
+    if (n0 + row < nb)
+      v = *(const uint4*)(keys + (size_t)(n0 + row) * 128 + c8);
+    *(uint4*)&Bs[(row >> 3) * BREG + (row & 7) * LSA + c8] = v;
+  }
+  __syncthreads();
+  // warp tile: 2x2 frags (32 rows x 32 keys)
+  const int wm0 = (w >> 2) * 32, wp0 = (w & 3) * 32;
+  // wmma A lane mapping identical to k_gemm_wmma (lane 2r -> row r, lanes
+  // 17+2(r-8) -> row 8+r, complementary dummy rows on ignored lanes)
+  const int base_ = lane >> 1;
+  const int qrowA = (lane & 1) ? ((lane & 16) ? base_ : ((base_ + 4) & 7))
+                               : ((lane & 16) ? 8 + ((base_ + 4) & 7) : base_);
+  uint32_t aoff[2], boff[2];
+#pragma unroll
+  for (int i = 0; i < 2; i++) aoff[i] = ((wm0 + i * 16 + qrowA) * LSA) * 2;
+#pragma unroll
+  for (int j = 0; j < 2; j++) {
+    const int pl = wp0 + j * 16 + (lane & 15);
+    boff[j] = ((pl >> 3) * BREG + (pl & 7) * LSA) * 2;
+  }
+  isel_floatx8 acc[2][2];
+#pragma unroll
+  for (int i = 0; i < 2; i++)
+#pragma unroll
+    for (int j = 0; j < 2; j++)
+#pragma unroll
+      for (int e = 0; e < 8; e++) acc[i][j][e] = 0.f;
+#pragma unroll
+  for (int kh = 0; kh < 8; kh++) {
+#pragma unroll
+    for (int i = 0; i < 2; i++) {
+      const isel_shortx16 af =
+          isel_ld16((const uint16_t*)((const char*)&As[0] + aoff[i] + kh * 32));
+#pragma unroll
+      for (int j = 0; j < 2; j++) {
+        const isel_shortx16 bfj =
+            isel_ld16((const uint16_t*)((const char*)&Bs[0] + boff[j] + kh * 32));
+        if constexpr (BF16)
+          acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(af, bfj, acc[i][j]);
+        else
+          acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(af, bfj, acc[i][j]);
+      }
+    }
+  }
+  // epilogue: lane covers rows rh..rh+7 (= 2 tokens x 4 heads), col cl
+  const int rh = (lane >> 4) * 8, cl = lane & 15;
+#pragma unroll
+  for (int i = 0; i < 2; i++) {
+    const int r0 = wm0 + i * 16 + rh;  // CTA-local head-row base (mult of 8)
+#pragma unroll
+    for (int j = 0; j < 2; j++) {
+      const int b = n0 + wp0 + j * 16 + cl;
+      float s0 = 0.f, s1 = 0.f;
+#pragma unroll
+      for (int e = 0; e < 4; e++) {
+        s0 += fmaxf(0.f, acc[i][j][e]);
+        s1 += fmaxf(0.f, acc[i][j][4 + e]);
+      }
+      const int t0 = q0 + (r0 >> 2), t1 = t0 + 1;
+      const float sc0 = s0 * 0.08838834764831845f;
+      const float sc1 = s1 * 0.08838834764831845f;
+      if (t0 < count && b < min(nb, (first + t0 + 1) / 4))
+        out[(size_t)t0 * nb + b] = BF16 ? isel_f2bf(sc0) : isel_f2h(sc0);
+      if (t1 < count && b < min(nb, (first + t1 + 1) / 4))
+        out[(size_t)t1 * nb + b] = BF16 ? isel_f2bf(sc1) : isel_f2h(sc1);
+    }
+  }
+}
+static inline dim3 index_wmma16_grid(int nb, int count) {
+  return dim3((nb + 127) / 128, (count + 15) / 16);
+}
+
+// ---------------------------------------------------------------------------
 // k_index_select_2p: exact top-512 over combined score rows, bit-identical to
 // k_index_select_stream<true> / k_index_select_rs<true> / k_index_select
 // (score desc, ties -> smaller block id; output = the 512 ids ascending;
@@ -518,8 +676,9 @@ __device__ __forceinline__ unsigned isel_kth(int cnt, int K, Get get, unsigned* 
   return prefix;
 }
 
+template <class ST = float>
 __global__ void __launch_bounds__(256)
-k_index_select_2p(const float* __restrict__ scores, int stride,
+k_index_select_2p(const ST* __restrict__ scores, int stride,
                   int* __restrict__ selected, int first, int cap = ISEL_CAP) {
   __shared__ unsigned big[ISEL_BINS];  // pass 1 histogram; then cand bits | cand ids
   __shared__ int sel[512];
@@ -536,7 +695,7 @@ k_index_select_2p(const float* __restrict__ scores, int stride,
     return;
   }
   cap = min(cap, ISEL_CAP);
-  const float* row = scores + (size_t)q * stride;
+  const ST* row = scores + (size_t)q * stride;
   for (int i = tid; i < ISEL_BINS; i += 256) big[i] = 0;
   if (tid == 0) s_nsel = s_ncand = s_eq = 0;
   __syncthreads();
@@ -545,7 +704,7 @@ k_index_select_2p(const float* __restrict__ scores, int stride,
   for (int b0 = tid; b0 < n; b0 += 256 * 8) {
     unsigned v[8];
 #pragma unroll
-    for (int k = 0; k < 8; k++) v[k] = b0 + 256 * k < n ? __float_as_uint(row[b0 + 256 * k]) : 0u;
+    for (int k = 0; k < 8; k++) v[k] = b0 + 256 * k < n ? isel_bits(row[b0 + 256 * k]) : 0u;
 #pragma unroll
     for (int k = 0; k < 8; k++)
       if (b0 + 256 * k < n) atomicAdd(&big[isel_bin(v[k])], 1u);
@@ -569,7 +728,7 @@ k_index_select_2p(const float* __restrict__ scores, int stride,
       h256[tid] = 0;
       __syncthreads();
       for (int b = tid; b < n; b += 256) {
-        const unsigned bits = __float_as_uint(row[b]);
+        const unsigned bits = isel_bits(row[b]);
         if ((p == 0 ? isel_bin(bits) : bits >> (shift + wdt)) == prefix)
           atomicAdd(&h256[(bits >> shift) & ((1u << wdt) - 1u)], 1u);
       }
@@ -587,7 +746,7 @@ k_index_select_2p(const float* __restrict__ scores, int stride,
 #pragma unroll 1
     for (int c0 = 0; c0 < n; c0 += 256) {
       const int b = c0 + tid;
-      unsigned bits = b < n ? __float_as_uint(row[b]) : 0u;
+      unsigned bits = b < n ? isel_bits(row[b]) : 0u;
       bool gt = b < n && bits > sstar;
       bool eq = b < n && bits == sstar;
       unsigned long long bal_eq = __ballot_sync(~0ull, eq);
@@ -622,7 +781,7 @@ k_index_select_2p(const float* __restrict__ scores, int stride,
   for (int b0 = tid; b0 < n; b0 += 256 * 8) {
     unsigned v[8];
 #pragma unroll
-    for (int k = 0; k < 8; k++) v[k] = b0 + 256 * k < n ? __float_as_uint(row[b0 + 256 * k]) : 0u;
+    for (int k = 0; k < 8; k++) v[k] = b0 + 256 * k < n ? isel_bits(row[b0 + 256 * k]) : 0u;
 #pragma unroll
     for (int k = 0; k < 8; k++) {
       const int b = b0 + 256 * k;

@@ -83,6 +83,29 @@ static bool moe_q4w_env() {
   return !(s && *s == '0');
 }
 
+// B1 w4b f16 pairs（k_moe_lut<kQ4CP,...,kF16Pairs> 写 + k_moe_reduce_pw*<K,
+// __half> 读）。默认开（KLD 过线后翻转），GDEC_W4B_PAIRS_F16=0 回退 f32。
+// 与 40_model.inc moe_q4w_run 的 pairs_f16 必须保持同一语义。
+static bool w4b_pairs_f16_env() {
+  const char* s = getenv("GDEC_W4B_PAIRS_F16");
+  return !s || !(s[0] == '0' && s[1] == 0);
+}
+// d_guvb 可按 f16 pairs 尺寸分配的条件（40_model.inc 构造函数同款）：v2+w4b
+// 两条 LUT 路径的 pairs 全 f16 后，剩余 d_guvb 读者要么被这些 env 排除
+// （GGUF 专家 / moe_lt / tiled w4 / v2 xcodes 回退），要么每 token-slot 字节数
+// 与 f16 pairs 相同（naive gemv 部分积 / 共享专家 scratch / decode 小 P），
+// 没有全尺寸 f32 读者。
+static bool guvb_f16_env() {
+  const char* v2 = getenv("GDEC_V2_PAIRS_F16");
+  const char* nm = getenv("GDEC_MOE_NAIVE_MAX");
+  return w4b_pairs_f16_env() && !(v2 && v2[0] == '0' && v2[1] == 0) &&
+         moe_q4w_env() && !getenv("GDEC_MOE_NAIVE") &&
+         getenv("GDEC_MOE_ATOMIC") == nullptr &&
+         !getenv("GDEC_MOE_HOST_ROUTE") && !getenv("GDEC_MOE_ORDERED") &&
+         !getenv("GDEC_MOE_UNTILED") && getenv("GDEC_GGUF") == nullptr &&
+         (!nm || atoi(nm) <= 16) && g_cfg.topk == 10 && g_cfg.moe_mid % 64 == 0;
+}
+
 // 镜像 GpuModel 构造函数的分配公式（含相同 env 分支），用于 arena 精确 sizing。
 // 每项 256B 对齐后求和；估少了一律有 dalloc_arena 的 hipMalloc 回退兜底。
 static size_t devarena_estimate(const Checkpoint& ck, int maxctx) {
@@ -161,6 +184,19 @@ static size_t devarena_estimate(const Checkpoint& ck, int maxctx) {
     add(bc * 512 * 4);                      // d_iq
     add(nkv * ik_rows * 128 * 4);           // d_ik（含 MTP 层）
     if (kv_paged) add(ib * 128 * 4);        // d_ikg
+    // C1 f16 twins（与 40_model.inc 的分配门控同步）
+    if (!(getenv("GDEC_INDEX_F16") && getenv("GDEC_INDEX_F16")[0] == '0' &&
+          getenv("GDEC_INDEX_F16")[1] == 0) &&
+        !(getenv("GDEC_INDEX_SCORE64") &&
+          getenv("GDEC_INDEX_SCORE64")[0] == '0' &&
+          getenv("GDEC_INDEX_SCORE64")[1] == 0) &&
+        !(getenv("GDEC_INDEX_SEL2P") && getenv("GDEC_INDEX_SEL2P")[0] == '0' &&
+          getenv("GDEC_INDEX_SEL2P")[1] == 0) &&
+        getenv("GDEC_INDEX_OLDSEL") == nullptr) {
+      add(bc * 512 * 2);                // d_iqh
+      add(nkv * ik_rows * 128 * 2);     // d_ikh
+      if (kv_paged) add(ib * 128 * 2);  // d_ikgh
+    }
     add(nqsa * 4 * 128 * 4);                // d_iraw
     add(nqsa * 256 * 4);                    // d_inorm
     if (index_f32) add(nqsa * 640 * 2560 * 4);  // d_iw
@@ -191,9 +227,15 @@ static size_t devarena_estimate(const Checkpoint& ck, int maxctx) {
   add(BP * 32 * sizeof(float2));  // ropecs
   add(BP * 4 * 4 + BP * 16 * 4 * 2 + BP * 4);  // w4b topidsb topwb sgb
   add(BP * 16 * 4 * 2);       // injp[2] (HC inject fusion partials)
-  add(BP * g_cfg.topk * (moe_det ? 2560 : 1280) * 4);  // guvb
+  add(BP * g_cfg.topk * (moe_det ? 2560 : 1280) * (guvb_f16_env() ? 2 : 4));  // guvb
   add(BP * g_cfg.topk * 640 * 4);                    // hidb
   add(BP * 10240 * 2 + BP * 6144 * 2);               // xbf16 xbf16b
+  // d_skx（B3 split-K，与 GpuModel::gemm_splitk_on 同步）
+  if (getenv("GDEC_GEMM_WMMA") && !getenv("GDEC_GEMM_NO_K64") &&
+      !getenv("GDEC_GEMM_RB") &&
+      !(getenv("GDEC_GEMM_SPLITK") && getenv("GDEC_GEMM_SPLITK")[0] == '0' &&
+        getenv("GDEC_GEMM_SPLITK")[1] == 0))
+    add(BP * 6144 * 2);
   if (fused) add(BP * 10240 * 2);                    // Rhatbf16
   add(BP * g_cfg.topk * 4 * 2);                      // tokidx pweight
   add((g_cfg.experts + 1) * 4);                      // eoff

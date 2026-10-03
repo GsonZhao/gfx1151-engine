@@ -190,6 +190,98 @@ static std::vector<float> dget(const float* p, size_t n) {
   return v;
 }
 
+// Verbatim copy of k_gr_scatter_norm_inj_bf16 before the B2-1 y==nullptr
+// mode was added; the current kernel's y path must stay bit-identical to it.
+template <int T>
+__global__ void __launch_bounds__(256) k_gr_scatter_norm_inj_bf16_old(
+    const float* __restrict__ pfull, const float* __restrict__ pin,
+    uint16_t* __restrict__ R, const float* __restrict__ y,
+    const float* __restrict__ w, uint16_t* __restrict__ Rhat,
+    const uint16_t* __restrict__ winj, float* __restrict__ pout, int d, int P,
+    float eps) {
+  const int b = blockIdx.x & 3;
+  const int t0 = (blockIdx.x >> 2) * T;
+  const int lane = threadIdx.x;
+  __shared__ float sm[256];
+  __shared__ float red[8][4];
+  __shared__ float s_inj[T];
+  if (lane < T) {
+    const int t = t0 + lane;
+    float v = 0.f;
+    if (t < P) {
+      const float x = pin ? inj_psum(pin + (size_t)t * 16 + b) : pfull[(size_t)t * 4 + b];
+      v = 2.f / (1.f + expf(-x * 0.25f));
+    }
+    s_inj[lane] = v;
+  }
+  const float* wg = w + (size_t)b * d;
+  float wn[10], wr[4][10];
+#pragma unroll
+  for (int j = 0; j < 10; j++) {
+    const int c = lane + j * 256;
+    wn[j] = c < d ? 1.f + wg[c] : 0.f;
+#pragma unroll
+    for (int k = 0; k < 4; k++)
+      wr[k][j] = c < d ? bf2f(winj[(size_t)k * 4 * d + (size_t)b * d + c]) : 0.f;
+  }
+  __syncthreads();
+  for (int i = 0; i < T; i++) {
+    const int t = t0 + i;
+    if (t >= P) break;  // block-uniform
+    uint16_t* Rg = R + ((size_t)t * 4 + b) * d;
+    const float* yg = y + (size_t)t * d;
+    uint16_t* og = Rhat + ((size_t)t * 4 + b) * d;
+    const float inject = s_inj[i];
+    float values[10];
+    float ss = 0.f;
+#pragma unroll
+    for (int j = 0; j < 10; j++) {
+      int c = lane + j * 256;
+      float rounded = 0.f;
+      if (c < d) {
+        uint16_t r16 = f2bf(bf2f(Rg[c]) + inject * yg[c]);
+        Rg[c] = r16;
+        rounded = bf2f(r16);
+        ss += rounded * rounded;
+      }
+      values[j] = rounded;
+    }
+    sm[lane] = ss;
+    __syncthreads();
+    for (int off = 128; off > 0; off >>= 1) {
+      if (lane < off) sm[lane] += sm[lane + off];
+      __syncthreads();
+    }
+    float inv = rsqrtf(sm[0] / d + eps);
+    float a[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+    for (int j = 0; j < 10; j++) {
+      int c = lane + j * 256;
+      if (c < d) {
+        const uint16_t o = f2bf(values[j] * inv * wn[j]);
+        og[c] = o;
+        const float of = bf2f(o);
+#pragma unroll
+        for (int k = 0; k < 4; k++) a[k] += of * wr[k][j];
+      }
+    }
+#pragma unroll
+    for (int k = 0; k < 4; k++)
+#pragma unroll
+      for (int o = 16; o; o >>= 1) a[k] += __shfl_xor(a[k], o, 32);
+    if ((lane & 31) == 0)
+#pragma unroll
+      for (int k = 0; k < 4; k++) red[lane >> 5][k] = a[k];
+    __syncthreads();
+    if (lane < 4) {
+      float s = red[0][lane];
+#pragma unroll
+      for (int wv = 1; wv < 8; wv++) s += red[wv][lane];
+      pout[((size_t)t * 4 + b) * 4 + lane] = s;
+    }
+  }
+}
+
 int main() {
   // ---- 1. k_rmsnorm_zc_grouped batched wrap (grid = 4*P, ngroups = 4) ----
   {
@@ -1142,6 +1234,133 @@ int main() {
     TCK(hipFree(dey));
     TCK(hipFree(dacc));
     TCK(hipFree(dx));
+  }
+
+  // ---- 6b. B2-1 fused HC write-back (bitwise A/B, no tolerance) ----
+  {
+    const int P = 5, D = 2560, K = 10, S = P * K, B = 4;
+    std::vector<float> pairs(S * D), pw(S), ey(P * D), sg(P), w4(P * B), svh(D),
+        y(P * D), hw(B * D), pin(P * 16);
+    std::vector<int> pid(P * K);
+    std::vector<uint16_t> R0(P * B * D), winj(B * B * D);
+    for (auto& v : pairs) v = frand();
+    for (auto& v : pw) v = frand();
+    for (auto& v : ey) v = frand();
+    for (auto& v : sg) v = frand();
+    for (auto& v : w4) v = frand();
+    for (auto& v : svh) v = frand();
+    for (auto& v : y) v = frand();
+    for (auto& v : hw) v = frand();
+    for (auto& v : pin) v = frand();
+    for (int i = 0; i < P * K; i++) pid[i] = (i * 7 + 3) % S;
+    for (auto& u : R0) u = bf16_bits(frand());
+    for (auto& u : winj) u = bf16_bits(frand());
+    float* dpairs = dup(pairs), *dpw = dup(pw), *dey = dup(ey), *dsg = dup(sg),
+          *dw4 = dup(w4), *dsvh = dup(svh), *dy = dup(y), *dhw = dup(hw),
+          *dpin = dup(pin);
+    int* dpid = dup(pid);
+    uint16_t* dwinj = dup(winj);
+    float* dout = dalloc(P * D);
+    const float eps = 1e-6f;
+    auto getu16 = [&](const uint16_t* p, size_t n) {
+      std::vector<uint16_t> v(n);
+      TCK(hipMemcpy(v.data(), p, n * 2, hipMemcpyDeviceToHost));
+      return v;
+    };
+    auto bitdiff = [&](const char* name, const std::vector<uint16_t>& a,
+                       const std::vector<uint16_t>& b) {
+      size_t mm = 0;
+      for (size_t i = 0; i < a.size(); i++) mm += a[i] != b[i];
+      check(name, (double)mm, 0);
+    };
+    auto bitdifff = [&](const char* name, const std::vector<float>& a,
+                        const std::vector<float>& b) {
+      size_t mm = 0;
+      for (size_t i = 0; i < a.size(); i++) mm += memcmp(&a[i], &b[i], 4) != 0;
+      check(name, (double)mm, 0);
+    };
+    auto mkR = [&] { return dup(R0); };
+
+    // w4b: k_moe_reduce_pw_sg -> out + k_gr_write_b_hc_bf16 == *_hc
+    uint16_t* dR1 = mkR();
+    k_moe_reduce_pw_sg<10><<<dim3(D / 256, P), 256>>>(dpairs, dpid, dpw, dey, dsg,
+                                                      dout, P, D);
+    k_gr_write_b_hc_bf16<<<(P * D + 255) / 256, 256>>>(dw4, dR1, dout, D, B, P);
+    uint16_t* dR2 = mkR();
+    k_moe_reduce_pw_sg_hc<10><<<dim3(D / 256, P), 256>>>(dpairs, dpid, dpw, dey, dsg,
+                                                         dw4, dR2, P, D);
+    bitdiff("hcw_reduce_pw_sg", getu16(dR1, R0.size()), getu16(dR2, R0.size()));
+    TCK(hipFree(dR1));
+    TCK(hipFree(dR2));
+
+    // v2: k_v2_reduce_rot -> out + k_gr_write_b_hc_bf16 == *_hc
+    const unsigned waves = (unsigned)P * (D / 128);
+    uint16_t* dR3 = mkR();
+    k_v2_reduce_rot<10><<<(waves + 7) / 8, 256>>>(dpairs, dpid, dpw, dsvh, dey, dsg,
+                                                  dout, P, D);
+    k_gr_write_b_hc_bf16<<<(P * D + 255) / 256, 256>>>(dw4, dR3, dout, D, B, P);
+    uint16_t* dR4 = mkR();
+    k_v2_reduce_rot_hc<10><<<(waves + 7) / 8, 256>>>(dpairs, dpid, dpw, dsvh, dey,
+                                                   dsg, dw4, dR4, P, D);
+    bitdiff("hcw_v2_reduce_rot", getu16(dR3, R0.size()), getu16(dR4, R0.size()));
+    TCK(hipFree(dR3));
+    TCK(hipFree(dR4));
+
+    // Scatter kernel: y path unchanged vs the pre-edit copy, and the split
+    // flow (k_inj_psum -> pre-write -> scatter y=null) matches the old fused
+    // scatter bit for bit (R, Rhat, pout).
+    uint16_t *dRh1, *dRh2, *dRh3;
+    float *dpo1, *dpo2, *dpo3;
+    TCK(hipMalloc(&dRh1, R0.size() * 2));
+    TCK(hipMalloc(&dRh2, R0.size() * 2));
+    TCK(hipMalloc(&dRh3, R0.size() * 2));
+    TCK(hipMalloc(&dpo1, pin.size() * 4));
+    TCK(hipMalloc(&dpo2, pin.size() * 4));
+    TCK(hipMalloc(&dpo3, pin.size() * 4));
+    const unsigned sgrid = 4 * ((P + 3) / 4);
+    uint16_t* dR5 = mkR();
+    k_gr_scatter_norm_inj_bf16_old<4><<<sgrid, 256>>>(nullptr, dpin, dR5, dy, dhw,
+                                                      dRh1, dwinj, dpo1, D, P, eps);
+    uint16_t* dR6 = mkR();
+    k_gr_scatter_norm_inj_bf16<4><<<sgrid, 256>>>(nullptr, dpin, dR6, dy, dhw, dRh2,
+                                                  dwinj, dpo2, D, P, eps);
+    bitdiff("hcw_scat_ypath_R", getu16(dR5, R0.size()), getu16(dR6, R0.size()));
+    bitdiff("hcw_scat_ypath_Rhat", getu16(dRh1, R0.size()), getu16(dRh2, R0.size()));
+    bitdifff("hcw_scat_ypath_pout", dget(dpo1, pin.size()), dget(dpo2, pin.size()));
+    TCK(hipFree(dR5));
+    TCK(hipFree(dR6));
+    // split flow: dR7 pre-written with the psum inject gates, then norm-only
+    uint16_t* dR7 = mkR();
+    k_inj_psum<<<(P * 4 + 255) / 256, 256>>>(dpin, dw4, P);
+    k_gr_write_b_hc_bf16<<<(P * D + 255) / 256, 256>>>(dw4, dR7, dy, D, B, P);
+    k_gr_scatter_norm_inj_bf16<4, false><<<sgrid, 256>>>(nullptr, nullptr, dR7, nullptr,
+                                                         dhw, dRh3, dwinj, dpo3, D, P, eps);
+    uint16_t* dR8 = mkR();
+    k_gr_scatter_norm_inj_bf16_old<4><<<sgrid, 256>>>(nullptr, dpin, dR8, dy, dhw,
+                                                      dRh1, dwinj, dpo1, D, P, eps);
+    bitdiff("hcw_scat_split_R", getu16(dR8, R0.size()), getu16(dR7, R0.size()));
+    bitdiff("hcw_scat_split_Rhat", getu16(dRh1, R0.size()), getu16(dRh3, R0.size()));
+    bitdifff("hcw_scat_split_pout", dget(dpo1, pin.size()), dget(dpo3, pin.size()));
+    TCK(hipFree(dR7));
+    TCK(hipFree(dR8));
+    TCK(hipFree(dRh1));
+    TCK(hipFree(dRh2));
+    TCK(hipFree(dRh3));
+    TCK(hipFree(dpo1));
+    TCK(hipFree(dpo2));
+    TCK(hipFree(dpo3));
+    TCK(hipFree(dpairs));
+    TCK(hipFree(dpw));
+    TCK(hipFree(dey));
+    TCK(hipFree(dsg));
+    TCK(hipFree(dw4));
+    TCK(hipFree(dsvh));
+    TCK(hipFree(dy));
+    TCK(hipFree(dhw));
+    TCK(hipFree(dpin));
+    TCK(hipFree(dpid));
+    TCK(hipFree(dwinj));
+    TCK(hipFree(dout));
   }
 
   // ---- 7. k_f32_to_bf16 with row stride ----

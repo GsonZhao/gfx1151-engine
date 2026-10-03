@@ -983,6 +983,20 @@ static int restore_body(GpuModel& m, const CkEnt& e, const std::vector<int>& pro
     CK(hipGetLastError());
     CK(hipStreamSynchronize(g_str));
   }
+  // C1 f16 twins: derived state (not saved); rebuild the complete blocks
+  // [0, n/4) from the restored fp32 indexer keys, or f16 scoring in a later
+  // prefill would read stale twins for the prefix. The straddling block is
+  // re-pooled from the raw ring by the continuation prefill.
+  if (m.d_ikh && G.has_ik && n / 4 > 0) {
+    const int nb = n / 4;
+    for (int qi = 0; qi < m.kv_nl; qi++)
+      k_ik_twin_build<<<nb, 128, 0, g_str>>>(
+          m.d_ik + (size_t)qi * m.ik_layer_blocks * 128,
+          m.kv_paged ? m.d_ptab : nullptr,
+          m.d_ikh + (size_t)qi * m.ik_layer_blocks * 128, nb);
+    CK(hipGetLastError());
+    CK(hipStreamSynchronize(g_str));
+  }
   // host-side and scalar state: pos/ringpos (both mirrors), PLE token history
   m.pos = n;
   m.ple_ringpos = h.ringpos;

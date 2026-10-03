@@ -53,10 +53,11 @@ __global__ void k_q4cp_row_b_hc_bf16(
 
 __global__ void k_rmsnorm_zc_grouped_bf16(
     const uint16_t* __restrict__ x, const float* __restrict__ w,
-    uint16_t* __restrict__ out, int gsize, float eps, int ngroups) {
+    uint16_t* __restrict__ out, int gsize, float eps, int ngroups,
+    float* __restrict__ sc = nullptr) {
   const uint16_t* xg = x + (size_t)blockIdx.x * gsize;
   const float* wg = w + (size_t)(blockIdx.x % ngroups) * gsize;
-  uint16_t* og = out + (size_t)blockIdx.x * gsize;
+  uint16_t* og = out ? out + (size_t)blockIdx.x * gsize : nullptr;
   __shared__ float sm[1024];
   int t = threadIdx.x;
   float ss = 0.f;
@@ -71,6 +72,8 @@ __global__ void k_rmsnorm_zc_grouped_bf16(
     __syncthreads();
   }
   float inv = rsqrtf(sm[0] / gsize + eps);
+  if (sc && t == 0) sc[blockIdx.x] = inv;  // B2-2: 归一化挪进 GEMM，Rhat 不落盘
+  if (!og) return;
   for (int i = t; i < gsize; i += blockDim.x)
     og[i] = f2bf(bf2f(xg[i]) * inv * (1.f + wg[i]));
 }
@@ -475,20 +478,23 @@ __global__ void k_inj_psum(const float* __restrict__ pin, float* __restrict__ w4
 // the same inject scalar; only w4 changes (summation order vs the GEMM).
 // The scalar comes from the GEMM's w4 (pfull [P][4]) or from the previous
 // call's partials (pin [P][4][4]); pin != pout (other blocks still read pin).
-template <int T>
+// Write == false (B2-1, GDEC_HC_FUSE_WRITE, default off): the write was
+// already applied to R by the moe reduce (k_*_hc, same expression), so only
+// the norm / Rhat / pout work remains; y/pfull/pin are unused, pass null.
+template <int T, bool Write = true>
 __global__ void __launch_bounds__(256) k_gr_scatter_norm_inj_bf16(
     const float* __restrict__ pfull, const float* __restrict__ pin,
     uint16_t* __restrict__ R, const float* __restrict__ y,
     const float* __restrict__ w, uint16_t* __restrict__ Rhat,
     const uint16_t* __restrict__ winj, float* __restrict__ pout, int d, int P,
-    float eps) {
+    float eps, float* __restrict__ sc = nullptr) {
   const int b = blockIdx.x & 3;
   const int t0 = (blockIdx.x >> 2) * T;
   const int lane = threadIdx.x;
   __shared__ float sm[256];
   __shared__ float red[8][4];
   __shared__ float s_inj[T];
-  if (lane < T) {
+  if (Write && lane < T) {
     const int t = t0 + lane;
     float v = 0.f;
     if (t < P) {
@@ -512,9 +518,9 @@ __global__ void __launch_bounds__(256) k_gr_scatter_norm_inj_bf16(
     const int t = t0 + i;
     if (t >= P) break;  // block-uniform
     uint16_t* Rg = R + ((size_t)t * 4 + b) * d;
-    const float* yg = y + (size_t)t * d;
-    uint16_t* og = Rhat + ((size_t)t * 4 + b) * d;
-    const float inject = s_inj[i];
+    const float* yg = Write ? y + (size_t)t * d : nullptr;
+    uint16_t* og = Rhat ? Rhat + ((size_t)t * 4 + b) * d : nullptr;
+    const float inject = Write ? s_inj[i] : 0.f;
     float values[10];
     float ss = 0.f;
 #pragma unroll
@@ -522,8 +528,11 @@ __global__ void __launch_bounds__(256) k_gr_scatter_norm_inj_bf16(
       int c = lane + j * 256;
       float rounded = 0.f;
       if (c < d) {
-        uint16_t r16 = f2bf(bf2f(Rg[c]) + inject * yg[c]);
-        Rg[c] = r16;
+        uint16_t r16 = Rg[c];
+        if constexpr (Write) {
+          r16 = f2bf(bf2f(r16) + inject * yg[c]);
+          Rg[c] = r16;
+        }
         rounded = bf2f(r16);
         ss += rounded * rounded;
       }
@@ -536,13 +545,14 @@ __global__ void __launch_bounds__(256) k_gr_scatter_norm_inj_bf16(
       __syncthreads();
     }
     float inv = rsqrtf(sm[0] / d + eps);
+    if (sc && lane == 0) sc[(size_t)t * 4 + b] = inv;  // B2-2: Rhat 不落盘
     float a[4] = {0.f, 0.f, 0.f, 0.f};
 #pragma unroll
     for (int j = 0; j < 10; j++) {
       int c = lane + j * 256;
       if (c < d) {
         const uint16_t o = f2bf(values[j] * inv * wn[j]);
-        og[c] = o;
+        if (og) og[c] = o;
         const float of = bf2f(o);
 #pragma unroll
         for (int k = 0; k < 4; k++) a[k] += of * wr[k][j];
@@ -2184,6 +2194,26 @@ __device__ __forceinline__ float gw_bf2f(uint16_t b) {
   return f;
 }
 
+// Epi == 2 (B2-2 免 Rhat 落盘): A 是未归一化的 R bf16 [P][4d]，staging 时用
+// 与 k_rmsnorm_zc_grouped_bf16 / k_gr_scatter_norm_inj_bf16 逐字相同的表达式
+// ((R*inv)*wn 再舍 bf16) 现场归一化，inv 取 Sc[p*4+b]、wn = 1+Hw[k] —— A tile
+// 与被取代的 Rhat 逐 bit 一致。
+__device__ __forceinline__ uint4 gw_stage_normA(const uint16_t* p, int arow,
+                                                int k0, int d,
+                                                const float* __restrict__ Sc,
+                                                const float* __restrict__ Hw) {
+  uint4 raw = *(const uint4*)p;
+  const float s = __ldg(Sc + (size_t)arow * 4 + k0 / d);
+  const uint16_t* r16 = (const uint16_t*)&raw;
+  uint16_t o[8];
+#pragma unroll
+  for (int i = 0; i < 8; i++)
+    o[i] = gw_f2bf((gw_bf2f(r16[i]) * s) * (1.f + __ldg(Hw + k0 + i)));
+  uint4 r;
+  memcpy(&r, o, 16);
+  return r;
+}
+
 // Epi == 1: HC mix-up + combine fusion (replaces the (10240,320) G GEMM plus
 // k_gr_combine_b_hc_bf16). W is the [4*d, K] input_mix_weight_up, logically
 // permuted at staging time so logical column r maps to W row
@@ -2201,8 +2231,13 @@ __global__ void __launch_bounds__(NT)
     k_gemm_wmma(const uint16_t* __restrict__ X, const uint16_t* __restrict__ W,
                 float* __restrict__ Y, int P, int K, int N, int gm,
                 const uint16_t* __restrict__ Rh = nullptr,
-                uint16_t* __restrict__ Yb = nullptr) {
-  static_assert(Epi == 0 || (WP == 4 && PW * WP * 16 == BP), "hc epi layout");
+                uint16_t* __restrict__ Yb = nullptr,
+                const float* __restrict__ Sc = nullptr,
+                const float* __restrict__ Hw = nullptr,
+                // B3 split-K: A/B 的行距（元素），0 = K（原布局）。非 0 时
+                // X/W 可指向大 K 张量的列切片（X + s*ks, ldA=全 K），免重排。
+                unsigned ldA = 0, unsigned ldB = 0) {
+  static_assert(Epi != 1 || (WP == 4 && PW * WP * 16 == BP), "hc epi layout");
   constexpr int LSA = KST + 8;        // LDS row stride (elems)
   constexpr int BREG = 8 * LSA + 8;   // W 8-row region stride (elems)
   constexpr int NW = NT / 32;         // warps per block
@@ -2269,12 +2304,15 @@ __global__ void __launch_bounds__(NT)
   const uint16_t* ga[AN];
   const uint16_t* gb[BN];
   uint32_t saoff[AN], sboff[BN];
+  int arow[AN], aq[AN];  // Epi==2 staging 的行/列基（其余模式 DCE）
 #pragma unroll
   for (int j = 0; j < AN; ++j) {
     const int idx = tid + j * NT;
     const int q = idx % Q8, b = (idx / Q8) % RPW;
     const int row = (idx / (Q8 * RPW)) * RPW + (b & 1) * (RPW / 2) + (b / 2);
-    ga[j] = X + (size_t)min(m0 + row, P - 1) * K + q * 8;
+    arow[j] = min(m0 + row, P - 1);
+    aq[j] = q;
+    ga[j] = X + (size_t)arow[j] * (ldA ? ldA : (unsigned)K) + q * 8;
     saoff[j] = (row * LSA + q * 8) * 2;
   }
 #pragma unroll
@@ -2285,16 +2323,21 @@ __global__ void __launch_bounds__(NT)
     int wrow = min(n0 + row, N - 1);
     if constexpr (Epi == 1)
       wrow = ((wrow >> 4) & 3) * (N >> 2) + (wrow >> 6) * 16 + (wrow & 15);
-    gb[j] = W + (size_t)wrow * K + q * 8;
+    gb[j] = W + (size_t)wrow * (ldB ? ldB : (unsigned)K) + q * 8;
     sboff[j] = ((row >> 3) * BREG + (row & 7) * LSA + q * 8) * 2;
   }
 
-#define GWMMA_STAGE_LOAD(RA, RB, KS)                    \
-  do {                                                  \
-    _Pragma("unroll") for (int j = 0; j < AN; ++j)      \
-        RA[j] = *(const uint4*)(ga[j] + (KS)*KST);      \
-    _Pragma("unroll") for (int j = 0; j < BN; ++j)      \
-        RB[j] = *(const uint4*)(gb[j] + (KS)*KST);      \
+#define GWMMA_STAGE_LOAD(RA, RB, KS)                                       \
+  do {                                                                     \
+    _Pragma("unroll") for (int j = 0; j < AN; ++j) {                      \
+      if constexpr (Epi == 2)                                              \
+        RA[j] = gw_stage_normA(ga[j] + (KS)*KST, arow[j],                 \
+                               aq[j] * 8 + (KS)*KST, K / 4, Sc, Hw);      \
+      else                                                                 \
+        RA[j] = *(const uint4*)(ga[j] + (KS)*KST);                        \
+    }                                                                      \
+    _Pragma("unroll") for (int j = 0; j < BN; ++j)                        \
+        RB[j] = *(const uint4*)(gb[j] + (KS)*KST);                        \
   } while (0)
 #define GWMMA_STAGE_STORE(BUF, RA, RB)                          \
   do {                                                          \
@@ -2341,6 +2384,8 @@ __global__ void __launch_bounds__(NT)
   if constexpr (Epi == 1) {
     const int d = N >> 2;
     const int c = (n0 >> 2) + (wp0 >> 2) + cl;
+    // B2-2: Sc 非空时 Rh 指向未归一化的 R，现场乘 (R*sc)*wn（wn=1+Hw[b*d+c]），
+    // 比旧路径少一次 Rhat bf16 中间舍入（非逐 bit，KLD 门槛）。
 #pragma unroll
     for (int i = 0; i < WM; ++i) {
       const int p0 = m0 + wm0 + i * 16 + rh;
@@ -2353,7 +2398,10 @@ __global__ void __launch_bounds__(NT)
 #pragma unroll
           for (int b = 0; b < 4; ++b) {
             float gate = 1.f / (1.f + expf(-acc[i][b][e]));
-            a += gate * gw_bf2f(Rt[b * d]);
+            const float rv = gw_bf2f(Rt[b * d]);
+            a += gate * (Sc ? (rv * __ldg(Sc + (size_t)p * 4 + b)) *
+                                  (1.f + __ldg(Hw + (size_t)b * d + c))
+                            : rv);
           }
           const float value = a / 4;
           Y[(size_t)p * d + c] = value;
@@ -2372,8 +2420,32 @@ __global__ void __launch_bounds__(NT)
       if (n < N)
 #pragma unroll
         for (int e = 0; e < 8; ++e)
-          if (p0 + e < P) Y[(size_t)(p0 + e) * N + n] = acc[i][j][e];
+          if (p0 + e < P) {
+            // Epi==3（B3 split-K 第二片）：原子加进第一片已写好的 Y。每个
+            // 输出元素两次 launch 各属唯一 CTA → 恰好一次 RMW，跨 run 逐
+            // bit 确定；与全 K 顺序不同（非逐 bit，KLD 门槛）。
+            if constexpr (Epi == 3)
+              atomicAdd(&Y[(size_t)(p0 + e) * N + n], acc[i][j][e]);
+            else
+              Y[(size_t)(p0 + e) * N + n] = acc[i][j][e];
+          }
     }
 }
 // [gemm-wmma-end]
+
+// B3 split-K：X[P,K] bf16 重排成 2 个连续列切片 Xs = [P,K/2][P,K/2]
+//（k1 (2560,6144) 专用；proto 证明加速来自 X 连续化，W 维持 strided 原布局）。
+__global__ void k_splitk_repack2(const uint16_t* __restrict__ X,
+                                 uint16_t* __restrict__ Xs, int P, int K) {
+  const int rpw = K / 8, hpw = K / 16;  // uint4 数：每行 / 每半行
+  const size_t tot = (size_t)P * rpw;
+  for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < tot;
+       i += (size_t)gridDim.x * blockDim.x) {
+    const size_t p = i / rpw;
+    const int r = (int)(i % rpw);
+    const int s = r >= hpw;
+    ((uint4*)Xs)[s * ((size_t)P * hpw) + p * hpw + (r - s * hpw)] =
+        ((const uint4*)X)[i];
+  }
+}
 
