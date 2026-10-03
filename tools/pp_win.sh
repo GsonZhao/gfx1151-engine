@@ -39,7 +39,7 @@ MAXCTX=$((LEN + 8192))
 # 引擎默认先用全零 dummy 跑一轮预热（52_main.inc:460），打印一行 prefill。
 # 注意：GDEC_NOWARMUP / GDEC_PHASE 引擎判断的是变量“是否存在”，设 0 也生效，
 # 所以这里必须显式 unset，并从脚本自己的开关重新导出。
-CHUNK=8192
+CHUNK=${PREFILL_CHUNK:-8192}
 NCHUNK=$(( (LEN + CHUNK - 1) / CHUNK ))
 
 unset GDEC_NOWARMUP GDEC_PHASE
@@ -57,6 +57,13 @@ fi
 echo "预热: $WARMUP | GDEC_PHASE: $PHASE"
 
 LOG="$ROOT/logs/${LABEL}.log"
+# 默认 w4b + overlay；MODEL_FILE 覆盖底模（如 v2），此时用 NGRAM_FILE 作 overlay
+MODEL_ARGS=("${MODEL_FILE:-models/qwen38-flash-next-w4b.hgn}")
+if [[ -z "${MODEL_FILE:-}" ]]; then
+    MODEL_ARGS+=("models/qwen38-flash-next-w4b.overlay.hgn")
+elif [[ -n "${NGRAM_FILE:-}" ]]; then
+    MODEL_ARGS+=("$NGRAM_FILE")
+fi
 env "${EXTRA_ENV[@]}" \
     GDEC_QSA_KV_BF16=1 GDEC_QSA_WMMA=1 GDEC_QSA_WMMA_BTV=1 \
     GDEC_MOE_LT=1 GDEC_MOE_LT_BF16=1 GDEC_GR_BF16=1 \
@@ -64,7 +71,7 @@ env "${EXTRA_ENV[@]}" \
     GDEC_PREFILL_CHUNK=$CHUNK GDEC_GEMM_WMMA=1 GDEC_GDN_FUSED=1 \
     GDEC_INDEX_FUSED2=1 GDEC_PP_MOE_OUT=1 GDEC_INDEX_STREAM_SELECT=1 \
     GDEC_KVSNAP=1 GDEC_KVSNAP_MAX_GB=20 GDEC_PROF=1 \
-    build/gdec-win models/qwen38-flash-next-w4b.hgn models/qwen38-flash-next-w4b.overlay.hgn \
+    build/gdec-win "${MODEL_ARGS[@]}" \
     --tokens-file "$TOK" --gen 1 --maxctx "$MAXCTX" >"$LOG" 2>&1
 rc=$?
 echo "rc=$rc 日志: $LOG"

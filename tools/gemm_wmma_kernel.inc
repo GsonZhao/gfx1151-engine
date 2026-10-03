@@ -54,6 +54,26 @@ __device__ __forceinline__ float gw_bf2f(uint16_t b) {
   return f;
 }
 
+// Epi == 2 (B2-2 免 Rhat 落盘): A 是未归一化的 R bf16 [P][4d]，staging 时用
+// 与 k_rmsnorm_zc_grouped_bf16 / k_gr_scatter_norm_inj_bf16 逐字相同的表达式
+// ((R*inv)*wn 再舍 bf16) 现场归一化，inv 取 Sc[p*4+b]、wn = 1+Hw[k] —— A tile
+// 与被取代的 Rhat 逐 bit 一致。
+__device__ __forceinline__ uint4 gw_stage_normA(const uint16_t* p, int arow,
+                                                int k0, int d,
+                                                const float* __restrict__ Sc,
+                                                const float* __restrict__ Hw) {
+  uint4 raw = *(const uint4*)p;
+  const float s = __ldg(Sc + (size_t)arow * 4 + k0 / d);
+  const uint16_t* r16 = (const uint16_t*)&raw;
+  uint16_t o[8];
+#pragma unroll
+  for (int i = 0; i < 8; i++)
+    o[i] = gw_f2bf((gw_bf2f(r16[i]) * s) * (1.f + __ldg(Hw + k0 + i)));
+  uint4 r;
+  memcpy(&r, o, 16);
+  return r;
+}
+
 // Epi == 1: HC mix-up + combine fusion (replaces the (10240,320) G GEMM plus
 // k_gr_combine_b_hc_bf16). W is the [4*d, K] input_mix_weight_up, logically
 // permuted at staging time so logical column r maps to W row
@@ -71,8 +91,13 @@ __global__ void __launch_bounds__(NT)
     k_gemm_wmma(const uint16_t* __restrict__ X, const uint16_t* __restrict__ W,
                 float* __restrict__ Y, int P, int K, int N, int gm,
                 const uint16_t* __restrict__ Rh = nullptr,
-                uint16_t* __restrict__ Yb = nullptr) {
-  static_assert(Epi == 0 || (WP == 4 && PW * WP * 16 == BP), "hc epi layout");
+                uint16_t* __restrict__ Yb = nullptr,
+                const float* __restrict__ Sc = nullptr,
+                const float* __restrict__ Hw = nullptr,
+                // B3 split-K: A/B 的行距（元素），0 = K（原布局）。非 0 时
+                // X/W 可指向大 K 张量的列切片（X + s*ks, ldA=全 K），免重排。
+                unsigned ldA = 0, unsigned ldB = 0) {
+  static_assert(Epi != 1 || (WP == 4 && PW * WP * 16 == BP), "hc epi layout");
   constexpr int LSA = KST + 8;        // LDS row stride (elems)
   constexpr int BREG = 8 * LSA + 8;   // W 8-row region stride (elems)
   constexpr int NW = NT / 32;         // warps per block
@@ -139,12 +164,15 @@ __global__ void __launch_bounds__(NT)
   const uint16_t* ga[AN];
   const uint16_t* gb[BN];
   uint32_t saoff[AN], sboff[BN];
+  int arow[AN], aq[AN];  // Epi==2 staging 的行/列基（其余模式 DCE）
 #pragma unroll
   for (int j = 0; j < AN; ++j) {
     const int idx = tid + j * NT;
     const int q = idx % Q8, b = (idx / Q8) % RPW;
     const int row = (idx / (Q8 * RPW)) * RPW + (b & 1) * (RPW / 2) + (b / 2);
-    ga[j] = X + (size_t)min(m0 + row, P - 1) * K + q * 8;
+    arow[j] = min(m0 + row, P - 1);
+    aq[j] = q;
+    ga[j] = X + (size_t)arow[j] * (ldA ? ldA : (unsigned)K) + q * 8;
     saoff[j] = (row * LSA + q * 8) * 2;
   }
 #pragma unroll
@@ -155,16 +183,21 @@ __global__ void __launch_bounds__(NT)
     int wrow = min(n0 + row, N - 1);
     if constexpr (Epi == 1)
       wrow = ((wrow >> 4) & 3) * (N >> 2) + (wrow >> 6) * 16 + (wrow & 15);
-    gb[j] = W + (size_t)wrow * K + q * 8;
+    gb[j] = W + (size_t)wrow * (ldB ? ldB : (unsigned)K) + q * 8;
     sboff[j] = ((row >> 3) * BREG + (row & 7) * LSA + q * 8) * 2;
   }
 
-#define GWMMA_STAGE_LOAD(RA, RB, KS)                    \
-  do {                                                  \
-    _Pragma("unroll") for (int j = 0; j < AN; ++j)      \
-        RA[j] = *(const uint4*)(ga[j] + (KS)*KST);      \
-    _Pragma("unroll") for (int j = 0; j < BN; ++j)      \
-        RB[j] = *(const uint4*)(gb[j] + (KS)*KST);      \
+#define GWMMA_STAGE_LOAD(RA, RB, KS)                                       \
+  do {                                                                     \
+    _Pragma("unroll") for (int j = 0; j < AN; ++j) {                      \
+      if constexpr (Epi == 2)                                              \
+        RA[j] = gw_stage_normA(ga[j] + (KS)*KST, arow[j],                 \
+                               aq[j] * 8 + (KS)*KST, K / 4, Sc, Hw);      \
+      else                                                                 \
+        RA[j] = *(const uint4*)(ga[j] + (KS)*KST);                        \
+    }                                                                      \
+    _Pragma("unroll") for (int j = 0; j < BN; ++j)                        \
+        RB[j] = *(const uint4*)(gb[j] + (KS)*KST);                        \
   } while (0)
 #define GWMMA_STAGE_STORE(BUF, RA, RB)                          \
   do {                                                          \
@@ -211,6 +244,8 @@ __global__ void __launch_bounds__(NT)
   if constexpr (Epi == 1) {
     const int d = N >> 2;
     const int c = (n0 >> 2) + (wp0 >> 2) + cl;
+    // B2-2: Sc 非空时 Rh 指向未归一化的 R，现场乘 (R*sc)*wn（wn=1+Hw[b*d+c]），
+    // 比旧路径少一次 Rhat bf16 中间舍入（非逐 bit，KLD 门槛）。
 #pragma unroll
     for (int i = 0; i < WM; ++i) {
       const int p0 = m0 + wm0 + i * 16 + rh;
@@ -223,7 +258,10 @@ __global__ void __launch_bounds__(NT)
 #pragma unroll
           for (int b = 0; b < 4; ++b) {
             float gate = 1.f / (1.f + expf(-acc[i][b][e]));
-            a += gate * gw_bf2f(Rt[b * d]);
+            const float rv = gw_bf2f(Rt[b * d]);
+            a += gate * (Sc ? (rv * __ldg(Sc + (size_t)p * 4 + b)) *
+                                  (1.f + __ldg(Hw + (size_t)b * d + c))
+                            : rv);
           }
           const float value = a / 4;
           Y[(size_t)p * d + c] = value;
