@@ -14,7 +14,7 @@ PREFILL.md §10–11、GUFO-GAP.md（09-25）、KV 前缀复用遗留（09-26）
 
 | 场景 | 我们 | 参照 | 差距 |
 |---|---|---|---|
-| 128K，chunk 16384 | v2 Win 1439 / w4b Linux 1446 / GGUF Linux 1451 | halogen 1517 | ~5% |
+| 128K，chunk 16384 | v2 Win **1484.7**（10-03 深夜，C1-f16 select 向量化 + §11.5 MoE mt 后） / w4b Linux 1446 / GGUF Linux 1451 | halogen 1517 | **~2%** |
 | 32K，chunk 16384 | v2 Win ~1521 / w4b Linux 1512 | halogen 1567 | ~3% |
 | 8K prompt，chunk 2048 | w4b Linux ~1195（fdf805a，09-25） | gufo d0 1628 | **~36%** |
 | 32K prompt，chunk 2048 | GGUF Linux 1152（09-25） | gufo d32K 1422 | **~20%+** |
@@ -527,6 +527,19 @@ HC 融合收益，净亏。读 d_xbf16 代替 d_xb 省一半读流量但不逐 b
     c512_2}.log（twin 修复后复跑）、c1f16_{on,off}.log（pp 128k）、c1f16_kprof_{on,off}.log、
     c1f16_kprof128_{on,off}.log（KPROF 128k）、c1f16_w4b_smoke.log、c1f16_needle_rerun.log。
 
+  **状态（10-03 深夜，select f16 向量化已进引擎，补完上轮识别的遗留项）**：
+  上轮 microbench 里 select f16 因 2B 散读未向量化反而 x0.87/x0.83 慢于 fp32-2p，
+  本轮向量化 isel_h16 三处（k_index_select_rs combine、k_index_select_2p pass1
+  直方图、pass2 发射；纯读法改动，排序语义与逐 bit 结果不变）。
+  - **microbench（128K/256K last batch）**：select f16 **0.643/0.988 ms =
+    x1.91/x2.22** vs fp32-2p（1.225/2.194 ms），从慢 13~17% 变为快约 2 倍。
+    C1-f16 重合率 0.99912/0.99886 与改前完全一致；select_2p vs stream 全
+    identical；bf16 列未动。
+  - **ktest ALL PASS**（index_select_rs 7 项 exact=1）。
+  - **引擎 pp 128k@16384（健康态）**：稳态 **1483.8 vs F1-only 基线 1452.7 =
+    +2.1%**，step 0 chosen=248046 逐 bit 一致。日志 logs/self16_128k.log、
+    logs/f1_128k.log。
+
 ### C2. gdn:scan 深流水（≤3.5%，数天）
 
 `k_gdn_fused` 受延迟和占用率限制（48 CTA / 20 WGP = 3 波，波效率 ~60%）；LDS 已用到 57/64 KB，
@@ -925,6 +938,38 @@ tools/pp_psweep_win.sh`。F1 前基线（v2，健康机器）：
 - 预期：16K 时 up+down 2889 ms 中解码部分减半，整体 ~4–6%。这只是推算，先在 `moe_lut_test` 里做原型，数天工作量。
 - 适用于 128K/16K 长 prompt。短 prompt 和多轮增量都不受益。
 
+  **状态（10-03 深夜，已进引擎，默认开，`GDEC_MOE_MT=0` 回退；仅 v2/i4r 站）**：
+  原型（tools/moe_lut_test.cu --share N）先证逐 bit（SHARE=1..4 全过）与收益
+  （P=16384 原型 +9.3%，过 8% 门），随后落进引擎。
+  - **实现**：BN 放宽 64|128（非 kI4R 限 64）；`k_moe_tiles` 加 cap 参，仅 v2 LUT
+    站传 `mt ? 128 : 64`，其余 5 个调用点保持 64。up_mid：gate spill 直索引
+    128 slot 两相邻平面；up spill+mid 分两个 64-slot chunk 走单 uplane（覆写死
+    stage）；kMid BN=128 三平面布局（kStageOff=33280，kLdsBytes=54400；BN=64
+    布局逐字节不变）。down 直接移，SHARE=2 固定。新 wrapper
+    `moe_lut_up_mid_mt` / `moe_lut_down_mt`。**P 门槛**：
+    `mt = !GDEC_MOE_MT=0 && P*k >= 80*E`——交叉点在 2048~4096 之间（P=2048 实测
+    −5.2%、4096 +1.8%），取 avg≥80 保守；小 P 自动走原 64 路径。
+  - **验证（健康机器，全过）**：KLD 自 A/B **mean=-0.000000、p999=0.000051、
+    same_top=100.000**（逐 bit，与历史 bit-exact 指纹 p999 0.000050~52 同款）；
+    c512 绝对值改前 0.107066 与 F1 期逐位一致（门 0.10899 内）。microbench
+    （生产路径，全 RESULT PASS / 0 mismatch）：P=16384 total **+5.50%**
+    （up +3.3/down +9.8，35.995→34.800、18.275→16.486 ms）、8192 **+7.53%**、
+    4096 +1.8%、2048 −5.2%。pp 128k n=7：premt 1477.8 → 终版 **1484.7**
+    （±0.5% 噪声内）。KPROF 32k 稳态 chunk（base=16384）：**moe:up 1680.1→
+    1613.9（−3.9%）、moe:down 932.2→851.0（−8.7%）**，合计省 147 ms/16K，
+    segsum 持平。2k 1208.7（M1b 基线 1212，门槛正确走原路径无回归）；
+    `GDEC_MOE_MT=0` 32k 1519.9 回退正常。w4b（q4cp 未动）：2k smoke 1195.7
+    + c512 KLD 与 F1 期**逐位复现**。ktest ALL PASS（含 moe_tiles_layout 调用点
+    补 cap=64 修复）。
+  - **诚实结论**：kernel 段收益真实（up −3.9%/down −8.7%、microbench
+    +5.5~7.5%），但端到端 pp 中性——prefill 流水里 moe 与 gdn/qsa 段重叠，
+    省下的 ~147 ms/16K 被吸收，moe 当前不在关键路径。保留默认开的理由：
+    零回归 + 逐 bit 等价 + 未来 moe 成为关键路径时收益直接兑现。
+  - 日志：mtshare2_prod_16k.log、kld_v2_premt.kld（自 A/B 基线 8.1GB）、
+    kld_v2_mt_selfab.log、mt_{base,on,final}128k.log、mt_kprof_{base,on}.log、
+    mt_off32k.log、mt_w4b_smoke.log、kld_mt_w4b_c512.log。
+  - **遗留**：q4cp（w4b）的 mt 迁移。
+
 ### 11.6 修订后的优先级（覆盖 §10 的顺序，§10 各条内容仍有效）
 
 | 序 | 项 | 场景 | 预期 | 工作量 | 前置 |
@@ -942,6 +987,10 @@ tools/pp_psweep_win.sh`。F1 前基线（v2，健康机器）：
 | 5 | v2 `gemv_multi` P 上限（§10-2） | v2 小 P | ht_deq 10–20% 中的大头 | 小 | M1b |
 | 6 | MoE 多 tile 共享解码（§11.5） | P ≥ 4K、长 prompt | 16K ~4–6% | 数天 | 机器恢复 |
 | 7 | C2、select f16 向量化、w4b gdn +3%（§10-3、§10-5） | 长上下文 | ≤3.5% / 0.2 ms / — | — | — |
+
+序 6、序 7 的 select f16 向量化已完成（10-03 深夜）：MoE mt 进引擎默认开
+（kernel 段 up −3.9%/down −8.7%，端到端中性，见 §11.5 状态段）；select f16
+向量化 x1.91/x2.22、pp 128k +2.1%（见 §5-C1 末状态段）。
 
 测量纪律补充：
 
