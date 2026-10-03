@@ -2395,7 +2395,7 @@ int main() {
     int* dntiles;
     TCK(hipMalloc(&dtiles, tasks * sizeof(MoeTile)));
     TCK(hipMalloc(&dntiles, sizeof(int)));
-    k_moe_tiles<<<1, 512>>>(deoff, dtiles, dntiles, E);
+    k_moe_tiles<<<1, 512>>>(deoff, dtiles, dntiles, E, 64);
     int ntiles;
     TCK(hipMemcpy(&ntiles, dntiles, sizeof(int), hipMemcpyDeviceToHost));
     std::vector<MoeTile> tiles(ntiles);

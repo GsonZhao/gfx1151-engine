@@ -1595,7 +1595,7 @@ struct GpuModel {
     } else {
       if (P > maxbatch_cap) throw std::runtime_error("moe_gguf: P exceeds the batch buffers");
       moe_routing.run(topids, topw, d_tokidx, d_pweight, d_eoff, d_pairids, P, k, E);
-      k_moe_tiles<<<1, 512, 0, g_str>>>(d_eoff, d_moetiles, d_moentiles, E);
+      k_moe_tiles<<<1, 512, 0, g_str>>>(d_eoff, d_moetiles, d_moentiles, E, 64);
       tokidx = d_tokidx, pairids = d_pairids, ntiles = d_moentiles, pw = d_pweight;
       tiles = d_moetiles, x16 = (__half*)d_xbf16b, hid = (__half*)d_hidb, pairs = d_guvb;
       max_tiles = (P * k + 63) / 64 + E;
@@ -1645,7 +1645,7 @@ struct GpuModel {
     }
     KP("moe:route");
     moe_routing.run(topids, topw, d_tokidx, d_pweight, d_eoff, d_pairids, P, k, E);
-    k_moe_tiles<<<1, 512, 0, g_str>>>(d_eoff, d_moetiles, d_moentiles, E);
+    k_moe_tiles<<<1, 512, 0, g_str>>>(d_eoff, d_moetiles, d_moentiles, E, 64);
     const int max_tiles = (P * k + 63) / 64 + E;
     __half* x16 = (__half*)d_xbf16b;
     __half* hid = (__half*)d_hidb;
@@ -3836,7 +3836,7 @@ struct GpuModel {
         }
         if (moe_lt_cmp && l == 0) {
           // Reference: fused packed up on identical inputs -> d_hidb2.
-          k_moe_tiles<<<1, 512, 0, g_str>>>(d_eoff, d_moetiles, d_moentiles, E);
+          k_moe_tiles<<<1, 512, 0, g_str>>>(d_eoff, d_moetiles, d_moentiles, E, 64);
           k_moe_w4_up<true, true><<<dim3(g_cfg.moe_mid / MOE_CT, tasks), 256, 0,
                                        g_str>>>(
               gu.data + 64, gu.data + 64 + gu.rows * gu.cols / 2,
@@ -3916,7 +3916,7 @@ struct GpuModel {
           k_moe_reduce_pw<10><<<dim3((dd + 255) / 256, P), 256, 0, g_str>>>(
               d_guvb, d_pairids, d_pweight, acc, P, dd);
       } else if (tiled) {
-        k_moe_tiles<<<1, 512, 0, g_str>>>(d_eoff, d_moetiles, d_moentiles, E);
+        k_moe_tiles<<<1, 512, 0, g_str>>>(d_eoff, d_moetiles, d_moentiles, E, 64);
         if (packed) {
           if (!(xf16_src == d_xb && xf16_xs == g_cfg.d && xf16_K == g_cfg.d && xf16_P == P)) {
             k_f32_to_bf16_v4<<<((size_t)P * g_cfg.d / 4 + 255) / 256, 256, 0, g_str>>>(
@@ -4105,8 +4105,14 @@ struct GpuModel {
       if (sg_fuse) moe_b_shared_ey(l, P);
       KP("moe:route");
       moe_routing.run(d_topidsb, d_topwb, d_tokidx, d_pweight, d_eoff, d_pairids, P, k, E);
-      k_moe_tiles<<<1, 512, 0, g_str>>>(d_eoff, d_moetiles, d_moentiles, E);
-      const int max_tiles = (P * k + 63) / 64 + E;
+      // §11.5 多 tile 共享解码（mt）：tile 按 128 slot 合并（同专家两个 64-slot
+      // tile 一个 CTA 解码一遍），逐 bit 不变；默认开，GDEC_MOE_MT=0 回退。
+      // microbench：P=2048 亏 5%、4096 +1.8%、8192 +7.5%、16384 +5.5%——按平均
+      // 每专家 slot 数 >= 80 设门槛，小 P（tail chunk / 短 prompt）走原路径。
+      static const bool moe_mt_env = !env_zero("GDEC_MOE_MT");
+      const bool mt = moe_mt_env && (int64_t)P * k >= 80 * E;
+      k_moe_tiles<<<1, 512, 0, g_str>>>(d_eoff, d_moetiles, d_moentiles, E, mt ? 128 : 64);
+      const int max_tiles = mt ? (P * k + 127) / 128 + E : (P * k + 63) / 64 + E;
       __half* x16 = (__half*)d_xbf16b;
       __half* hid = (__half*)d_hidb;
       KP("moe:rot_in");
@@ -4114,8 +4120,12 @@ struct GpuModel {
       KP("moe:up");
       // up + mid fused (方向 3): hid = fwht(silu(g)*u*suh) 直接落盘，
       // 省掉 guv16 的写读往返和 k_i4r_mid 那次 launch，数学逐位一致。
-      moe_lut_up_mid(pgu, x16, d_tokidx, d_moetiles, d_moentiles, max_tiles, hid, gu.svh, dn.suh,
-                     mid, d, g_str);
+      if (mt)
+        moe_lut_up_mid_mt(pgu, x16, d_tokidx, d_moetiles, d_moentiles, max_tiles, hid, gu.svh,
+                          dn.suh, mid, d, g_str);
+      else
+        moe_lut_up_mid(pgu, x16, d_tokidx, d_moetiles, d_moentiles, max_tiles, hid, gu.svh, dn.suh,
+                       mid, d, g_str);
       KP("moe:mid");
       KP("moe:down");
       // f16 pairs（down 写/reduce 读，v2-only，省一半 pairs 往返流量）。
@@ -4124,8 +4134,12 @@ struct GpuModel {
       // mean_kld 0.106993(关) → 0.107705(开)，门槛 0.10699+0.002=0.10899 过线，
       // 默认开；GDEC_V2_PAIRS_F16=0 回退 fp32 pairs。
       static const bool pairs_f16 = !env_zero("GDEC_V2_PAIRS_F16");
-      moe_lut_down(moelut::kI4R, pdn, hid, d_moetiles, d_moentiles, max_tiles, d_guvb, d, mid,
-                   g_str, pairs_f16);
+      if (mt)
+        moe_lut_down_mt(pdn, hid, d_moetiles, d_moentiles, max_tiles, d_guvb, d, mid, g_str,
+                        pairs_f16);
+      else
+        moe_lut_down(moelut::kI4R, pdn, hid, d_moetiles, d_moentiles, max_tiles, d_guvb, d, mid,
+                     g_str, pairs_f16);
       KP("moe:reduce");
       const unsigned waves = (unsigned)P * (d / 128);
       if (sg_fuse && Rhc) {
@@ -5225,7 +5239,7 @@ struct GpuModel {
     moe_routing.run(d_topidsb, d_topwb, d_tokidx, d_pweight, d_eoff, d_pairids,
                     P, k, E);
     int tasks = (npairs + 63) / 64 + E;
-    k_moe_tiles<<<1, 512, 0, g_str>>>(d_eoff, d_moetiles, d_moentiles, E);
+    k_moe_tiles<<<1, 512, 0, g_str>>>(d_eoff, d_moetiles, d_moentiles, E, 64);
     k_f32_to_bf16_v4<<<(unsigned)(((size_t)P * g_cfg.d / 4 + 255) / 256), 256, 0,
                        g_str>>>(d_xb, d_xbf16, g_cfg.d, P, g_cfg.d);
     k_moe_w4_up<true, true><<<dim3(g_cfg.moe_mid / MOE_CT, tasks), 256, 0,

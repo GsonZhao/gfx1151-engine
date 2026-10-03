@@ -117,7 +117,8 @@ __launch_bounds__(256) __global__
   using namespace moegg;
   using namespace moelut;
   constexpr int BM = 128, BK = 2;
-  static_assert(BN % 16 == 0 && BN <= 64, "BN must match the MoeTile size (<= 64)");
+  static_assert(BN == 64 || BN == 128, "BN = MoeTile slots: 64, or 128 for the merged super-tiles (mt)");
+  static_assert(BN == 64 || kLut == kI4R, "BN=128 is validated for kI4R only");
   static_assert(kLut == kQ4CP || kLut == kIQ4NL || kLut == kIQ4XS || kLut == kI4R, "LUT type");
   static_assert(!kRaw || kPair, "kRaw is a gate/up epilogue");
   static_assert(!kMid || (kLut == kI4R && !kPair && !kF16Pairs), "kMid is the i4r fused up+mid");
@@ -133,12 +134,17 @@ __launch_bounds__(256) __global__
   // range after the last __syncthreads of pass 1. Row stride is BM+2 halves:
   // the pass epilogue writes column wave*16+2*l+half per slot, and a BM stride
   // puts all 16 slots of a wave in the same bank (16-way conflict).
+  // BN=128 (mt super-tiles): the gate pass spills all 128 slots into two
+  // adjacent planes at lds[0, 32K) and the stage moves to lds[32K, 32K+kStageBytes);
+  // the up pass's 128 slots cannot coexist with those, so the up spill + mid
+  // run in two 64-slot chunks through a single up plane over the dead stage.
   constexpr int kMidRow = BM + 2;
   constexpr int kMidPlaneB = 64 * kMidRow * 2;
-  constexpr int kStageOff = kMid ? kMidPlaneB : 0;
+  constexpr int kStageOff = kMid ? (BN > 64 ? 2 * kMidPlaneB : kMidPlaneB) : 0;
   constexpr int kLdsStage = kStageBytes > 8 * 1024 ? kStageBytes : 8 * 1024;
-  constexpr int kLdsBytes = kMid ? 2 * kMidPlaneB : kLdsStage;
-  static_assert(!kMid || kMidPlaneB + kStageBytes <= 2 * kMidPlaneB, "kMid LDS");
+  constexpr int kLdsBytes =
+      kMid ? kStageOff + (kStageBytes > kMidPlaneB ? kStageBytes : kMidPlaneB) : kLdsStage;
+  static_assert(!kMid || kLdsBytes <= 64 * 1024, "kMid LDS");
   __shared__ __attribute__((aligned(16))) uint8_t lds[kLdsBytes];
   __shared__ uint32_t s_cbp[kLut == kI4R || kQ4Perm ? 1 : 256];  // i4r: arithmetic; perm: registers
   auto* s_codes = reinterpret_cast<uint4*>(lds + kStageOff);
@@ -211,7 +217,7 @@ __launch_bounds__(256) __global__
   uint32_t f_sl = 0;  // IQ4_XS: scales_l[0..3]
   int f_ib = 0;       // IQ4_XS: sub-block
   uint4 f_scv = make_uint4(0u, 0u, 0u, 0u);  // q4cp: scales of K blocks kb0 & ~7 .. +7
-  constexpr int kActFetch = 2;
+  constexpr int kActFetch = 2 * (BN / 64);
   constexpr int kActChunks = BN * BK * 4;
   static_assert(kActChunks <= kActFetch * 256, "activation fetch");
   uint4 a_data[kActFetch];
@@ -409,14 +415,33 @@ __launch_bounds__(256) __global__
       // which is dead after the loop's last __syncthreads. C fragment lane
       // mapping (from the pair/down epilogues): acc[j][l] = (token j*16 +
       // sub_lane, row wave*16 + 2*l + half_id).
-      __half* plane = reinterpret_cast<__half*>(lds) + pass * 64 * kMidRow;
+      // BN=128: pass 0 spills all 128 gate slots into the two adjacent planes
+      // at lds[0, 32K) (indexed by t directly); pass 1's up spill is chunked
+      // with the mid phase below and happens there, not here.
+      if constexpr (BN > 64) {
+        if (pass == 0) {
+          __half* plane = reinterpret_cast<__half*>(lds);
 #pragma unroll
-      for (int j = 0; j < kTokTiles; ++j) {
-        if (j >= live_tok_tiles) break;
-        const int t = j * 16 + sub_lane;
-        if (t < nrows)
+          for (int j = 0; j < kTokTiles; ++j) {
+            if (j >= live_tok_tiles) break;
+            const int t = j * 16 + sub_lane;
+            if (t < nrows)
 #pragma unroll
-          for (int l = 0; l < 8; ++l) plane[t * kMidRow + wave_id * 16 + 2 * l + half_id] = __float2half(acc[j][l]);
+              for (int l = 0; l < 8; ++l)
+                plane[t * kMidRow + wave_id * 16 + 2 * l + half_id] = __float2half(acc[j][l]);
+          }
+        }
+      } else {
+        __half* plane = reinterpret_cast<__half*>(lds) + pass * 64 * kMidRow;
+#pragma unroll
+        for (int j = 0; j < kTokTiles; ++j) {
+          if (j >= live_tok_tiles) break;
+          const int t = j * 16 + sub_lane;
+          if (t < nrows)
+#pragma unroll
+            for (int l = 0; l < 8; ++l)
+              plane[t * kMidRow + wave_id * 16 + 2 * l + half_id] = __float2half(acc[j][l]);
+        }
       }
     }
   }
@@ -425,12 +450,7 @@ __launch_bounds__(256) __global__
     // Fused i4r mid (replaces the k_i4r_mid launch), one slot per wave:
     //   g|u = svh_gu . H(z)/sqrt128;  h = silu(g)*u*suh_dn;  out = H(h)/sqrt128
     // Same op order and f32 math as k_i4r_mid on guv16.
-    __syncthreads();  // both planes fully written
-    const __half* gplane = reinterpret_cast<const __half*>(lds);
-    const __half* uplane = gplane + 64 * kMidRow;
-    for (int s = wave_id; s < nrows; s += 8) {
-      const __half* gr = gplane + s * kMidRow;
-      const __half* ur = uplane + s * kMidRow;
+    const auto mid_slot = [&](int s, const __half* gr, const __half* ur) {
       float g[4], u[4];
 #pragma unroll
       for (int j = 0; j < 4; ++j) {
@@ -451,7 +471,38 @@ __launch_bounds__(256) __global__
       __half* o = out_half + (size_t)(slot0 + s) * m + r_block;
 #pragma unroll
       for (int j = 0; j < 4; ++j) o[j * 32 + lane_id] = __float2half(v[j] * hv2::kRs128);
+    };
+    if constexpr (BN > 64) {
+      // acc still holds the up pass's values; the gate pass's 128 slots sit in
+      // the two planes at lds[0, 32K). The 128 up slots go through a single
+      // plane over the dead stage in two 64-slot chunks: spill the chunk, mid
+      // it against the matching gate plane, then overwrite with the next.
+      __half* uplane = reinterpret_cast<__half*>(lds) + 2 * 64 * kMidRow;
+      const int nchunk = (nrows + 63) / 64;
+      for (int c = 0; c < nchunk; ++c) {
+#pragma unroll
+        for (int j = 0; j < kTokTiles; ++j) {
+          if (j >= live_tok_tiles) break;
+          const int t = j * 16 + sub_lane;
+          if (t >= c * 64 && t < c * 64 + 64 && t < nrows)
+#pragma unroll
+            for (int l = 0; l < 8; ++l)
+              uplane[(t - c * 64) * kMidRow + wave_id * 16 + 2 * l + half_id] =
+                  __float2half(acc[j][l]);
+        }
+        __syncthreads();
+        const __half* gplane = reinterpret_cast<const __half*>(lds) + c * 64 * kMidRow;
+        const int send = nrows < (c + 1) * 64 ? nrows : (c + 1) * 64;
+        for (int s = c * 64 + wave_id; s < send; s += 8)
+          mid_slot(s, gplane + (s - c * 64) * kMidRow, uplane + (s - c * 64) * kMidRow);
+        __syncthreads();  // mid readers done before the next chunk overwrites uplane
+      }
+      return;
     }
+    __syncthreads();  // both planes fully written
+    const __half* gplane = reinterpret_cast<const __half*>(lds);
+    const __half* uplane = gplane + 64 * kMidRow;
+    for (int s = wave_id; s < nrows; s += 8) mid_slot(s, gplane + s * kMidRow, uplane + s * kMidRow);
     return;
   }
 
@@ -593,6 +644,37 @@ static bool moe_lut_up_mid(const moelut::LutW& p, const __half* x, const int* to
   dim3 grid(m / 128, max_tiles);
   k_moe_lut<moelut::kI4R, false, 64, false, false, true><<<grid, 256, 0, st>>>(
       p, x, tokidx, tiles, ntiles, nullptr, hid, m, k, svh_gu, suh_dn);
+  return true;
+}
+
+// §11.5 multi-tile (mt) variants: the same kernels run on super-tiles of up to
+// 128 slots (two of the baseline's 64-slot tiles of one expert, merged by
+// k_moe_tiles with cap 128). Each weight K stage is fetched and decoded once
+// for both tile halves. The per-(slot, row) K order and wmma sequence are the
+// baseline's, so outputs are bit-identical; the kMid up spill + fused mid run
+// in two 64-slot chunks through one up plane (LDS stays <= 54K).
+static bool moe_lut_up_mid_mt(const moelut::LutW& p, const __half* x, const int* tokidx,
+                              const MoeTile* tiles, const int* ntiles, int max_tiles, __half* hid,
+                              const float* svh_gu, const float* suh_dn, int m, int k,
+                              hipStream_t st) {
+  if (m % 128 || !moelut::lut_ok(moelut::kI4R, p, true, k)) return false;
+  dim3 grid(m / 128, max_tiles);
+  k_moe_lut<moelut::kI4R, false, 128, false, false, true><<<grid, 256, 0, st>>>(
+      p, x, tokidx, tiles, ntiles, nullptr, hid, m, k, svh_gu, suh_dn);
+  return true;
+}
+
+static bool moe_lut_down_mt(const moelut::LutW& p, const __half* hid, const MoeTile* tiles,
+                            const int* ntiles, int max_tiles, float* pairs, int m, int k,
+                            hipStream_t st, bool f16) {
+  if (m % 128 || !moelut::lut_ok(moelut::kI4R, p, false, k)) return false;
+  dim3 grid(m / 128, max_tiles);
+  if (f16)
+    k_moe_lut<moelut::kI4R, false, 128, false, true><<<grid, 256, 0, st>>>(p, hid, nullptr, tiles,
+                                                                          ntiles, pairs, nullptr, m, k);
+  else
+    k_moe_lut<moelut::kI4R, false, 128><<<grid, 256, 0, st>>>(p, hid, nullptr, tiles, ntiles, pairs,
+                                                             nullptr, m, k);
   return true;
 }
 

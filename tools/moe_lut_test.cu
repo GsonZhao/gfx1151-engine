@@ -14,6 +14,11 @@
 //   common: [--P N] [--iters N] [--check-experts N] [--seed S] [--tol X]
 //           [--q4perm 1]  hgn only: register-perm codebook decode (A1);
 //                         bit-compared against the s_cbp path, both timed
+//           [--share N]   v2 only: multi-tile shared-decode prototype (§11.5),
+//                         N = 1..4 same-expert tiles per CTA; bit-compared
+//                         against the production kernels, both timed.
+//                         With --mid 1: production-path A/B (up_mid / down-f16
+//                         vs the BN=128 mt variants on merged tiles)
 //
 // Routing: random top-10 (distinct experts per token, mildly skewed), like
 // tools/moe_gguf_test.cu. Correctness: outputs are pre-filled with NaN and
@@ -443,6 +448,248 @@ static bool moe_lut_down_opt(int opt, const moelut::LutW& p, const __half* hid, 
   return true;
 }
 
+// ---------------------------------------------------------------------------
+// HANDOFF-PREFILL-ALL §11.5 prototype: multi-tile shared decode. One CTA owns
+// SHARE consecutive same-expert token tiles (host-merged into a single MoeTile
+// with count <= 64*SHARE) and decodes each weight K stage once for all of
+// them, instead of one CTA per tile re-decoding the same rows. i4r only
+// (arithmetic decode, identical to k_moe_lut's kI4R path). The per-(slot,
+// row) K order and wmma sequence are the baseline's, so the output must be
+// bit-identical to k_moe_lut<kI4R> run on the unmerged tiles. kPair writes
+// the kRaw epilogue (guv16), !kPair f32 pairs. kMid is not supported.
+template <int SHARE, bool kPair>
+__launch_bounds__(256) __global__
+    void k_moe_lut_mt(moelut::LutW p, const __half* __restrict__ x, const int* __restrict__ tokidx,
+                      const MoeTile* __restrict__ tiles, const int* __restrict__ ntiles,
+                      float* __restrict__ out, __half* __restrict__ out_half, int m, int k) {
+  using namespace moegg;
+  using namespace moelut;
+  constexpr int BM = 128, BK = 2;
+  constexpr int BN = 64 * SHARE;
+  constexpr int kTokTiles = BN / 16;
+  constexpr int kCodeBytes = BM * BK * 16;
+  constexpr int kScaleBytes = BM * 4;  // i4r: one scale per row per stage
+  constexpr int kActStride = BN + 1;
+  constexpr int kActBytes = BK * 4 * kActStride * 16;
+  constexpr int kStageBytes = kCodeBytes + kScaleBytes + kActBytes;
+  constexpr int kLdsBytes = kStageBytes > 8 * 1024 ? kStageBytes : 8 * 1024;
+  __shared__ __attribute__((aligned(16))) uint8_t lds[kLdsBytes];
+  auto* s_codes = reinterpret_cast<uint4*>(lds);
+  auto* s_scale = reinterpret_cast<uint32_t*>(lds + kCodeBytes);
+  auto* s_act = reinterpret_cast<uint4*>(lds + kCodeBytes + kScaleBytes);
+
+  if ((int)blockIdx.y >= *ntiles) return;
+  const int tid = threadIdx.x;
+
+  const MoeTile tile = tiles[blockIdx.y];
+  const int expert = tile.expert;
+  const int slot0 = tile.first;
+  const int nrows = tile.count;  // <= BN
+  const int live_tok_tiles = (nrows + 15) / 16;
+  const int num_kb = k / 32;
+  const size_t rb = (size_t)k / 2;
+
+  const int wave_id = tid >> 5;
+  const int lane_id = tid & 31;
+  const int sub_lane = lane_id & 15;
+  const int half_id = lane_id >> 4;
+  constexpr int kRows = kPair ? BM / 2 : BM;
+  const int r_block = (int)blockIdx.x * kRows;
+
+  // Weight fetch: thread = (row tid/2, K block kb0 + tid%2) — same as k_moe_lut.
+  const int f_c = tid & 1;
+  const uint8_t* f_ptr;
+  const uint8_t* f_sp;
+  bool f_live;
+  {
+    const bool upper = kPair && (tid >> 1) >= kRows;
+    const int r = r_block + (kPair ? (tid >> 1) % kRows : (tid >> 1));
+    f_live = r < m;
+    const size_t row = (size_t)expert * p.e_rows + (upper ? p.up_off : 0) + (f_live ? r : (m - 1));
+    f_ptr = (upper ? p.w_up : p.w) + row * rb;
+    f_sp = (upper ? p.sc_up : p.sc) + row * (size_t)p.sstride;
+  }
+  uint4 f_codes = make_uint4(0u, 0u, 0u, 0u);
+  uint32_t f_s = 0;
+  constexpr int kActFetch = 2 * SHARE;
+  constexpr int kActChunks = BN * BK * 4;
+  static_assert(kActChunks <= kActFetch * 256, "activation fetch");
+  uint4 a_data[kActFetch];
+  const __half* a_src[kActFetch];
+  int a_slot[kActFetch];
+#pragma unroll
+  for (int i = 0; i < kActFetch; ++i) {
+    const int chunk = tid + i * 256;
+    const int t = chunk / (BK * 4);
+    const int sub = chunk % (BK * 4);
+    int src = -1;
+    if (chunk < kActChunks && t < nrows) src = tokidx ? tokidx[slot0 + t] : slot0 + t;
+    a_src[i] = src >= 0 ? x + (size_t)src * k + sub * 8 : nullptr;
+    a_slot[i] = chunk < kActChunks ? sub * kActStride + t : -1;
+  }
+
+  const auto swizzle = [](int row, int c) { return row * BK + (c ^ ((row >> 2) & 1)); };
+
+  const auto fetch_stage = [&](int kb0) {
+    const int kb = kb0 + f_c;
+    f_codes = *reinterpret_cast<const uint4*>(f_ptr + (size_t)kb * 16);
+    // one fp16 scale per 128 elements = per 2 stages: fetch once, keep in reg
+    if ((kb0 & 3) == 0) f_s = *reinterpret_cast<const uint16_t*>(f_sp + (size_t)(kb0 >> 2) * 2);
+#pragma unroll
+    for (int i = 0; i < kActFetch; ++i)
+      a_data[i] = a_src[i] ? *reinterpret_cast<const uint4*>(a_src[i] + kb0 * 32)
+                           : make_uint4(0u, 0u, 0u, 0u);
+  };
+
+  const auto commit_stage = [&]() {
+    const int row = tid >> 1;
+    s_codes[swizzle(row, f_c)] = f_codes;
+    s_scale[row] = f_live ? (f_s | (f_s << 16)) : 0U;
+#pragma unroll
+    for (int i = 0; i < kActFetch; ++i)
+      if (a_slot[i] >= 0) s_act[a_slot[i]] = a_data[i];
+  };
+
+  v8f acc[kTokTiles];
+
+  const auto compute_stage = [&]() {
+    const int row = wave_id * 16 + sub_lane;
+    uint4 raw[BK];
+#pragma unroll
+    for (int c = 0; c < BK; ++c) raw[c] = s_codes[swizzle(row, c)];
+#pragma unroll
+    for (int kb = 0; kb < BK; ++kb) {
+      const __half2 scale2 = __builtin_bit_cast(__half2, s_scale[row]);
+      const uint32_t words[4] = {raw[kb].x, raw[kb].y, raw[kb].z, raw[kb].w};
+      __half2 h[16];
+      // Arithmetic decode, verbatim from k_moe_lut's kI4R path.
+      const __half2 bias = __builtin_bit_cast(__half2, 0x64086408U);
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        const uint32_t w = words[i];
+        const uint32_t lo = w & 0x0F0F0F0FU;
+        const uint32_t hi = (w >> 4) & 0x0F0F0F0FU;
+        const uint32_t p0 = __builtin_amdgcn_perm(hi, lo, 0x05040100U);  // [l0,l1,h0,h1]
+        const uint32_t p1 = __builtin_amdgcn_perm(hi, lo, 0x07060302U);  // [l2,l3,h2,h3]
+        const uint32_t q[4] = {p0, p0 >> 8, p1, p1 >> 8};
+#pragma unroll
+        for (int j = 0; j < 4; ++j)
+          h[4 * i + j] =
+              __hmul2(__hsub2(__builtin_bit_cast(__half2, (q[j] & 0x00FF00FFU) | 0x64006400U), bias),
+                      scale2);
+      }
+      v16h a_lo, a_hi;
+      __builtin_memcpy(&a_lo, &h[0], 32);
+      __builtin_memcpy(&a_hi, &h[8], 32);
+#pragma unroll
+      for (int j = 0; j < kTokTiles; ++j) {
+        asm volatile("" ::: "memory");  // keep one token tile's fragments live
+        if (j >= live_tok_tiles) continue;
+        const uint4* frag = s_act + (kb * 4) * kActStride + j * 16 + sub_lane;
+        uint4 b[4];
+#pragma unroll
+        for (int q = 0; q < 4; ++q) b[q] = frag[q * kActStride];
+        v16h b_lo, b_hi;
+        __builtin_memcpy(&b_lo, &b[0], 32);
+        __builtin_memcpy(&b_hi, &b[2], 32);
+        acc[j] = wmma(a_lo, b_lo, acc[j]);
+        acc[j] = wmma(a_hi, b_hi, acc[j]);
+      }
+    }
+  };
+
+#pragma unroll
+  for (int j = 0; j < kTokTiles; ++j) acc[j] = v8f{0, 0, 0, 0, 0, 0, 0, 0};
+  fetch_stage(0);
+  for (int kb0 = 0; kb0 < num_kb; kb0 += BK) {
+    commit_stage();
+    __syncthreads();
+    if (kb0 + BK < num_kb) fetch_stage(kb0 + BK);
+    compute_stage();
+    __syncthreads();
+  }
+
+  if constexpr (kPair) {
+    // kRaw epilogue, verbatim from k_moe_lut: waves 0-3 gate, 4-7 up.
+    constexpr unsigned stride = 18;
+    constexpr unsigned plane = 16 * stride;
+    static_assert(8 * plane * sizeof(float) <= kLdsBytes, "pair epilogue LDS");
+    float* base = reinterpret_cast<float*>(lds);
+    float* scratch = base + wave_id * plane;
+#pragma unroll
+    for (int j = 0; j < kTokTiles; ++j) {
+      if (j >= live_tok_tiles) break;  // uniform across the block
+#pragma unroll
+      for (int l = 0; l < 8; ++l) scratch[sub_lane * stride + 2 * l + half_id] = acc[j][l];
+      __syncthreads();
+#pragma unroll
+      for (int unit = 0; unit < 2; ++unit) {
+        const int flat = (unit * 256 + tid) * 2;
+        const int t = j * 16 + flat / kRows;
+        const int r = flat % kRows;
+        if (t < nrows && r_block + r < m) {
+          const int idx = (r / 16) * plane + (flat / kRows) * stride + r % 16;
+          const size_t o = (size_t)(slot0 + t) * 2 * m + r_block + r;
+          *reinterpret_cast<__half2*>(out_half + o) = __floats2half2_rn(base[idx], base[idx + 1]);
+          *reinterpret_cast<__half2*>(out_half + o + m) =
+              __floats2half2_rn(base[idx + 4 * plane], base[idx + 1 + 4 * plane]);
+        }
+      }
+      __syncthreads();
+    }
+    return;
+  }
+
+  // Down f32 epilogue, verbatim from k_moe_lut's !kF16Pairs branch.
+  float* tile_scratch = reinterpret_cast<float*>(lds) + wave_id * 256;
+  const int r0 = r_block + wave_id * 16;
+#pragma unroll
+  for (int j = 0; j < kTokTiles; ++j) {
+    if (j >= live_tok_tiles) break;
+#pragma unroll
+    for (int l = 0; l < 8; ++l) tile_scratch[sub_lane * 16 + 2 * l + half_id] = acc[j][l];
+    __builtin_amdgcn_wave_barrier();
+#pragma unroll
+    for (int s = 0; s < 8; ++s) {
+      const int flat = s * 32 + lane_id;
+      const int t = j * 16 + (flat >> 4);
+      const int r = r0 + (flat & 15);
+      if (t < nrows && r < m) out[(size_t)(slot0 + t) * m + r] = tile_scratch[flat];
+    }
+    __builtin_amdgcn_wave_barrier();
+  }
+}
+
+static bool moe_lut_up_mt(int share, const moelut::LutW& p, const __half* x, const int* tokidx,
+                          const MoeTile* tiles, const int* ntiles, int max_tiles, __half* guv, int m,
+                          int k, hipStream_t st) {
+  if (m % 64 || !moelut::lut_ok(moelut::kI4R, p, true, k)) return false;
+  dim3 grid(m / 64, max_tiles);
+  switch (share) {
+#define UP_MT(S) \
+  case S: k_moe_lut_mt<S, true><<<grid, 256, 0, st>>>(p, x, tokidx, tiles, ntiles, nullptr, guv, m, k); break
+    UP_MT(1); UP_MT(2); UP_MT(3); UP_MT(4);
+#undef UP_MT
+    default: return false;
+  }
+  return true;
+}
+
+static bool moe_lut_down_mt(int share, const moelut::LutW& p, const __half* hid,
+                            const MoeTile* tiles, const int* ntiles, int max_tiles, float* pairs,
+                            int m, int k, hipStream_t st) {
+  if (m % 128 || !moelut::lut_ok(moelut::kI4R, p, false, k)) return false;
+  dim3 grid(m / 128, max_tiles);
+  switch (share) {
+#define DN_MT(S) \
+  case S: k_moe_lut_mt<S, false><<<grid, 256, 0, st>>>(p, hid, nullptr, tiles, ntiles, pairs, nullptr, m, k); break
+    DN_MT(1); DN_MT(2); DN_MT(3); DN_MT(4);
+#undef DN_MT
+    default: return false;
+  }
+  return true;
+}
+
 
 static float h2f(__half h) { return __half2float(h); }
 static uint8_t* upload(const void* src, size_t n);
@@ -687,6 +934,7 @@ int main(int argc, char** argv) {
   int opt = -1;     // >= 0 (v2 only): prototype kernel with this OPT bitmask
   int fuse_mid = 0; // v2 only: fused up+mid (moe_lut_up_mid) writing hid
   int q4perm = 0;   // hgn only: register-perm codebook decode (A1), A/B bit-compared
+  int share = 0;    // v2 only: multi-tile shared-decode prototype (§11.5), A/B bit-compared
   unsigned seed = 1;
   double tol = 1e-2;
   for (int i = 1; i + 1 < argc; i += 2) {
@@ -699,6 +947,7 @@ int main(int argc, char** argv) {
     else if (a == "--opt") opt = atoi(argv[i + 1]);
     else if (a == "--mid") fuse_mid = atoi(argv[i + 1]);
     else if (a == "--q4perm") q4perm = atoi(argv[i + 1]);
+    else if (a == "--share") share = atoi(argv[i + 1]);
     else if (a == "--layer") layer = atoi(argv[i + 1]);
     else if (a == "--P") P = atoi(argv[i + 1]);
     else if (a == "--E") E_synth = atoi(argv[i + 1]);
@@ -726,6 +975,10 @@ int main(int argc, char** argv) {
   }
   if (q4perm && (hgn_path.empty() || opt >= 0)) {
     fprintf(stderr, "--q4perm requires --hgn and no --opt\n");
+    return 2;
+  }
+  if (share && (v2_path.empty() || opt >= 0 || share > 4)) {
+    fprintf(stderr, "--share N (1..4) requires --v2 and no --opt\n");
     return 2;
   }
   std::mt19937 rng(seed);
@@ -873,6 +1126,22 @@ int main(int argc, char** argv) {
   const int ntiles = (int)tiles.size();
   const int max_tiles = (npairs + 63) / 64 + E;  // engine's grid bound
 
+  // --share: merge consecutive same-expert tiles into super-tiles of up to
+  // share*64 slots (the tile list is expert-major and slot-contiguous, so
+  // merging just extends count; per-slot math is unchanged).
+  std::vector<MoeTile> mtiles;
+  if (share) {
+    for (int i = 0; i < ntiles;) {
+      MoeTile t = tiles[i];
+      int j = i + 1;
+      while (j < ntiles && j < i + share && tiles[j].expert == t.expert) t.count += tiles[j++].count;
+      mtiles.push_back(t);
+      i = j;
+    }
+    printf("share%d: %d tiles -> %zu super-tiles\n", share, ntiles, mtiles.size());
+  }
+  const int nmtiles = (int)mtiles.size();
+
   std::normal_distribution<float> nd(0.f, 1.f);
   std::vector<__half> xh((size_t)P * D);
   for (auto& v : xh) v = __float2half(nd(rng));
@@ -951,6 +1220,129 @@ int main(int argc, char** argv) {
   run_dn(q4perm != 0);
   CK(hipGetLastError());
   CK(hipDeviceSynchronize());
+
+  // --share: device A/B of the multi-tile shared-decode prototype against the
+  // production up_raw / down on the same routing (the initial runs above left
+  // the baseline outputs in d_guv / d_pairs; with --mid the baseline up output
+  // is d_hidmid instead, and the prototype up A/B is replaced by the
+  // production up_mid / down-f16 A/B below). The per-(slot, row) math is the
+  // baseline's, so outputs must be bit-identical.
+  __half* d_guv_mt = nullptr;
+  float* d_pairs_mt = nullptr;
+  int* d_nmt = nullptr;
+  MoeTile* d_mtiles = nullptr;
+  __half* d_hidmid_mt = nullptr;
+  __half* d_p16 = nullptr;
+  __half* d_p16_mt = nullptr;
+  if (share) {
+    CK(hipMalloc(&d_guv_mt, (size_t)npairs * 2 * MID * 2));
+    CK(hipMalloc(&d_pairs_mt, (size_t)npairs * D * 4));
+    CK(hipMalloc(&d_nmt, 4));
+    CK(hipMalloc(&d_mtiles, (size_t)nmtiles * sizeof(MoeTile)));
+    CK(hipMemset(d_guv_mt, 0xFF, (size_t)npairs * 2 * MID * 2));
+    CK(hipMemset(d_pairs_mt, 0xFF, (size_t)npairs * D * 4));
+    CK(hipMemcpy(d_nmt, &nmtiles, 4, hipMemcpyHostToDevice));
+    CK(hipMemcpy(d_mtiles, mtiles.data(), (size_t)nmtiles * sizeof(MoeTile), hipMemcpyHostToDevice));
+    if (!moe_lut_up_mt(share, pgu, d_x, d_tok, d_mtiles, d_nmt, nmtiles, d_guv_mt, MID, D, 0) ||
+        !moe_lut_down_mt(share, pdn, d_hid, d_mtiles, d_nmt, nmtiles, d_pairs_mt, D, MID, 0)) {
+      fprintf(stderr, "share: unsupported\n");
+      return 2;
+    }
+    CK(hipGetLastError());
+    CK(hipDeviceSynchronize());
+    bool ok_bits = true;
+    if (!fuse_mid) {
+      std::vector<__half> gref((size_t)npairs * 2 * MID), gmt((size_t)npairs * 2 * MID);
+      CK(hipMemcpy(gref.data(), d_guv, gref.size() * 2, hipMemcpyDeviceToHost));
+      CK(hipMemcpy(gmt.data(), d_guv_mt, gmt.size() * 2, hipMemcpyDeviceToHost));
+      size_t bad = 0, first = SIZE_MAX;
+      for (size_t i = 0; i < gref.size(); i++)
+        if (__builtin_bit_cast(uint16_t, gref[i]) != __builtin_bit_cast(uint16_t, gmt[i])) {
+          if (first == SIZE_MAX) first = i;
+          bad++;
+        }
+      printf("share%d vs base guv  : %zu / %zu mismatch", share, bad, gref.size());
+      if (bad)
+        printf(" (first at slot %zu row %zu: mt %g ref %g)", first / (2 * MID), first % (2 * MID),
+               h2f(gmt[first]), h2f(gref[first]));
+      printf("\n");
+      ok_bits = bad == 0;
+    }
+    {
+      std::vector<float> pref((size_t)npairs * D), pmt((size_t)npairs * D);
+      CK(hipMemcpy(pref.data(), d_pairs, pref.size() * 4, hipMemcpyDeviceToHost));
+      CK(hipMemcpy(pmt.data(), d_pairs_mt, pmt.size() * 4, hipMemcpyDeviceToHost));
+      size_t bad = 0, first = SIZE_MAX;
+      for (size_t i = 0; i < pref.size(); i++)
+        if (__builtin_bit_cast(uint32_t, pref[i]) != __builtin_bit_cast(uint32_t, pmt[i])) {
+          if (first == SIZE_MAX) first = i;
+          bad++;
+        }
+      printf("share%d vs base pairs: %zu / %zu mismatch", share, bad, pref.size());
+      if (bad)
+        printf(" (first at slot %zu row %zu: mt %g ref %g)", first / D, first % D, pmt[first],
+               pref[first]);
+      printf("\n");
+      if (bad) ok_bits = false;
+    }
+    // Production-path A/B (--mid): the engine's own up_mid + down-f16 kernels
+    // on plain 64-slot tiles vs the BN=128 mt variants on merged super-tiles.
+    if (fuse_mid) {
+      CK(hipMalloc(&d_hidmid_mt, (size_t)npairs * MID * 2));
+      CK(hipMalloc(&d_p16, (size_t)npairs * D * 2));
+      CK(hipMalloc(&d_p16_mt, (size_t)npairs * D * 2));
+      CK(hipMemset(d_hidmid_mt, 0xFF, (size_t)npairs * MID * 2));
+      CK(hipMemset(d_p16, 0xFF, (size_t)npairs * D * 2));
+      CK(hipMemset(d_p16_mt, 0xFF, (size_t)npairs * D * 2));
+      const bool launched =
+          moe_lut_down(moelut::kI4R, pdn, d_hid, d_tiles, d_nt, max_tiles, (float*)d_p16, D, MID,
+                       0, true) &&
+          moe_lut_up_mid_mt(pgu, d_x, d_tok, d_mtiles, d_nmt, nmtiles, d_hidmid_mt, d_svh, d_suh,
+                            MID, D, 0) &&
+          moe_lut_down_mt(pdn, d_hid, d_mtiles, d_nmt, nmtiles, (float*)d_p16_mt, D, MID, 0, true);
+      if (!launched) {
+        fprintf(stderr, "share+mid: unsupported\n");
+        return 2;
+      }
+      CK(hipGetLastError());
+      CK(hipDeviceSynchronize());
+      std::vector<__half> href((size_t)npairs * MID), hmt((size_t)npairs * MID);
+      std::vector<__half> pref((size_t)npairs * D), pmt((size_t)npairs * D);
+      CK(hipMemcpy(href.data(), d_hidmid, href.size() * 2, hipMemcpyDeviceToHost));
+      CK(hipMemcpy(hmt.data(), d_hidmid_mt, hmt.size() * 2, hipMemcpyDeviceToHost));
+      CK(hipMemcpy(pref.data(), d_p16, pref.size() * 2, hipMemcpyDeviceToHost));
+      CK(hipMemcpy(pmt.data(), d_p16_mt, pmt.size() * 2, hipMemcpyDeviceToHost));
+      size_t bad = 0, first = SIZE_MAX;
+      for (size_t i = 0; i < href.size(); i++)
+        if (__builtin_bit_cast(uint16_t, href[i]) != __builtin_bit_cast(uint16_t, hmt[i])) {
+          if (first == SIZE_MAX) first = i;
+          bad++;
+        }
+      printf("share%d up_mid_mt vs up_mid hid: %zu / %zu mismatch", share, bad, href.size());
+      if (bad)
+        printf(" (first at slot %zu row %zu: mt %g ref %g)", first / MID, first % MID,
+               h2f(hmt[first]), h2f(href[first]));
+      printf("\n");
+      if (bad) ok_bits = false;
+      bad = 0;
+      first = SIZE_MAX;
+      for (size_t i = 0; i < pref.size(); i++)
+        if (__builtin_bit_cast(uint16_t, pref[i]) != __builtin_bit_cast(uint16_t, pmt[i])) {
+          if (first == SIZE_MAX) first = i;
+          bad++;
+        }
+      printf("share%d down_mt(f16) vs down(f16) pairs: %zu / %zu mismatch", share, bad, pref.size());
+      if (bad)
+        printf(" (first at slot %zu row %zu: mt %g ref %g)", first / D, first % D, h2f(pmt[first]),
+               h2f(pref[first]));
+      printf("\n");
+      if (bad) ok_bits = false;
+    }
+    if (!ok_bits) {
+      printf("RESULT FAIL\n");
+      return 1;
+    }
+  }
 
   // --q4perm: device A/B of the register-perm decode against the s_cbp table
   // path. Independent chains (baseline down is fed the baseline hid); both hid
@@ -1207,6 +1599,64 @@ int main(int argc, char** argv) {
     printf("perm gain : up %+.2f%%  down %+.2f%%  total %+.2f%%\n",
            100.0 * (b_up - p_up) / b_up, 100.0 * (b_dn - p_dn) / b_dn,
            100.0 * (b_up + b_dn - p_up - p_dn) / (b_up + b_dn));
+  } else if (share) {
+    // With --mid both sides are the production kernels (up_mid / down-f16 on
+    // plain tiles vs the BN=128 mt variants on merged tiles) — the exact
+    // engine configuration. Otherwise the prototype kernels (up_raw / f32).
+    auto bench_side = [&](bool mt, float& t_up, float& t_dn) {
+      t_up = 0;
+      t_dn = 0;
+      for (int it = 0; it < iters; it++) {
+        CK(hipEventRecord(e0, 0));
+        if (mt) {
+          if (fuse_mid)
+            moe_lut_up_mid_mt(pgu, d_x, d_tok, d_mtiles, d_nmt, nmtiles, d_hidmid_mt, d_svh, d_suh,
+                              MID, D, 0);
+          else
+            moe_lut_up_mt(share, pgu, d_x, d_tok, d_mtiles, d_nmt, nmtiles, d_guv_mt, MID, D, 0);
+        } else {
+          if (fuse_mid)
+            moe_lut_up_mid(pgu, d_x, d_tok, d_tiles, d_nt, max_tiles, d_hidmid, d_svh, d_suh, MID,
+                           D, 0);
+          else
+            moe_lut_up_raw(pgu, d_x, d_tok, d_tiles, d_nt, max_tiles, d_guv, MID, D, 0);
+        }
+        CK(hipEventRecord(e1, 0));
+        if (mt) {
+          if (fuse_mid)
+            moe_lut_down_mt(pdn, d_hid, d_mtiles, d_nmt, nmtiles, (float*)d_p16_mt, D, MID, 0,
+                            true);
+          else
+            moe_lut_down_mt(share, pdn, d_hid, d_mtiles, d_nmt, nmtiles, d_pairs_mt, D, MID, 0);
+        } else {
+          if (fuse_mid)
+            moe_lut_down(moelut::kI4R, pdn, d_hid, d_tiles, d_nt, max_tiles, (float*)d_p16, D, MID,
+                         0, true);
+          else
+            moe_lut_down(moelut::kI4R, pdn, d_hid, d_tiles, d_nt, max_tiles, d_pairs, D, MID, 0);
+        }
+        CK(hipEventRecord(e2, 0));
+        CK(hipEventSynchronize(e2));
+        float a, b;
+        CK(hipEventElapsedTime(&a, e0, e1));
+        CK(hipEventElapsedTime(&b, e1, e2));
+        if (it > 0 || iters == 1) { t_up += a; t_dn += b; }
+      }
+      int nt = iters > 1 ? iters - 1 : 1;
+      t_up /= nt;
+      t_dn /= nt;
+    };
+    float b_up, b_dn, m_up, m_dn;
+    bench_side(false, b_up, b_dn);
+    bench_side(true, m_up, m_dn);
+    printf("time base  : up %.3f ms (%.1f TFLOPS)  down %.3f ms (%.1f TFLOPS)  total %.3f ms/layer = %.4f ms/tok over 48 layers\n",
+           b_up, fl_up / b_up / 1e9, b_dn, fl_dn / b_dn / 1e9, b_up + b_dn, (b_up + b_dn) * 48 / P);
+    printf("time share%d: up %.3f ms (%.1f TFLOPS)  down %.3f ms (%.1f TFLOPS)  total %.3f ms/layer = %.4f ms/tok over 48 layers\n",
+           share, m_up, fl_up / m_up / 1e9, m_dn, fl_dn / m_dn / 1e9, m_up + m_dn,
+           (m_up + m_dn) * 48 / P);
+    printf("share gain : up %+.2f%%  down %+.2f%%  total %+.2f%%\n",
+           100.0 * (b_up - m_up) / b_up, 100.0 * (b_dn - m_dn) / b_dn,
+           100.0 * (b_up + b_dn - m_up - m_dn) / (b_up + b_dn));
   } else {
     float t_up, t_dn;
     bench(false, t_up, t_dn);

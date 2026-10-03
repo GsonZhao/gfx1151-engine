@@ -793,16 +793,16 @@ __global__ void k_moe_route_unpack(const int* keys, const int* values,
 
 struct MoeTile { int expert, first, count; };
 
-__global__ void k_moe_tiles(const int* eoff, MoeTile* tiles, int* total, int experts) {
+__global__ void k_moe_tiles(const int* eoff, MoeTile* tiles, int* total, int experts, int cap) {
   using Scan = rocprim::block_scan<int, 512>;
   __shared__ Scan::storage_type storage;
   int e = threadIdx.x;
   int first = e < experts ? eoff[e] : 0;
   int ne = e < experts ? eoff[e + 1] - first : 0;
-  int count = (ne + 63) / 64, begin;
+  int count = (ne + cap - 1) / cap, begin;
   Scan().exclusive_scan(count, begin, 0, storage);
   if (e == 511) *total = begin + count;
-  for (int j = 0; j < count; j++) tiles[begin + j] = {e, first + j * 64, min(64, ne - j * 64)};
+  for (int j = 0; j < count; j++) tiles[begin + j] = {e, first + j * cap, min(cap, ne - j * cap)};
 }
 
 struct GpuMoeRouting {
