@@ -19,6 +19,7 @@ PREFILL.md §10–11、GUFO-GAP.md（09-25）、KV 前缀复用遗留（09-26）
 | 8K prompt，chunk 2048 | w4b Linux ~1195（fdf805a，09-25） | gufo d0 1628 | **~36%** |
 | 32K prompt，chunk 2048 | GGUF Linux 1152（09-25） | gufo d32K 1422 | **~20%+** |
 | 64K | w4b/v2 ~1495（chunk 16384） | gufo d64K 1304（chunk 2048） | 我们领先 |
+| 小 P TTFT（M1b 口径，P=2048 单 chunk） | v2 Win **1212**（F1 后；F1 前 1066） | gufo pp2048@d0 1628 | **25.6%**（F1 前 34.5%） |
 
 结论：大 chunk / 长上下文只差 3–5%，剩下的都是 1–3% 一项的细活。**真正的大缺口在小 P**：
 gufo 在 2048 chunk 就能跑到 1400–1600，我们要靠 16K chunk（多占 ~7.5 GiB workspace）才追平。
@@ -687,3 +688,262 @@ TokenCache 只在 API 进程内存里（4M token / 64 条）。服务重启或�
    - **w4b gdn 段 +3% 现象**（§4 B1 w4b 状态段）：B1-w4b f16 pairs 后 gdn 段 +147 ms/16K
      （4874 vs 4727），方向在两次独立测量中一致，疑为 moe 段省时后的频率/功耗重分配。净账
      已为正（segsum −1.4%），排查属锦上添花；方向：同 run 内 KPROF 段间时钟/功耗采样。
+
+---
+
+## 11. 复核（10-03 晚，基于 logs/m1_m2_report.md 二读）
+
+本节在 §10 之后补充，**优先级以 §11.6 为准**。
+
+结论有四条：
+
+- M1 的数据里藏着一个当时被当成噪声的异常，它是目前短 prompt 场景最大的单项（F1）。
+- M1 剔除了第 1 个 chunk，恰好漏掉了短 prompt 的真实场景，需要补测（M1b）。
+- A3 的"不做"判定依据有误，应按 P 分流重新在引擎里 A/B。
+- 在 P=2048 下，路由 MoE 已与 gufo 持平。剩下的差距分散在 dense/HC、注意力和 reduce，没有单一大头。
+
+§8 与 §10 里其余的否决和结论不受影响：差距都在 3% 以上，降级态也推翻不了。
+
+### 11.1 F1：前 2051 个位置的注意力改走 WMMA（新，短 prompt 头号项）
+
+**现象。** M1 两套权重的 `qsa:flash` 都出现 P=1024 比 P=2048 还慢的反常。M1 报告写的是"选块/SSD 噪声，未追"，但它在两套权重上逐档复现：
+
+| P | v2 qsa:flash | w4b qsa:flash |
+|---|---|---|
+| 512 | 81 ms | 79 ms |
+| 1024 | 151 ms | 148 ms |
+| 2048 | 108 ms | 106 ms |
+
+**原因。** `qsa_flash_b`（40_model.inc ~2585）把每个 batch 拆成两段：
+
+- **稠密前缀**：`dense_P = min(P, 2051 - base)` 行，走 `k_qsa_flash<false, false, KVT>`（22_kernels_prefill.inc:796）。
+  - 这是 fp32 标量实现，每个 block 处理 16 行 q 乘 1 个 q head，grid 为 (dense_P/16, 24)。
+  - GQA 是 12:1，同一份 K/V 被 12 个 q head 各读一遍，也不用 WMMA。
+- **稀疏尾段**：绝对位置 ≥2051 的行，走 `k_qsa_wmma`。一个 block 负责一个 (token, kvh)，12 个 q head 拼成 WMMA 的 M 维，K/V 只读一次。
+
+**代价模型。** 按"每对 (q token, key)，12 个 QSA 层、24 个 head 合计"折算 w4b 的 M1 数据：
+
+| 路径 | 依据 | 每对开销 |
+|---|---|---|
+| 稠密 | P=512：第 2、3 个 chunk 的位置 512–1535 全在稠密段，平均 524K 对 / 79 ms | ~151 ns |
+| 稀疏 WMMA | P=2048：4.2M 对 / 106 ms | ~25 ns |
+
+稠密路径大约慢 6 倍。用这两个系数回推另外两档：
+
+- P=1024：第 2 个 chunk 全稠密，238 ms；第 3 个 chunk 基本是稀疏，53 ms；平均 145 ms，实测 148 ms。
+- P=256：20 ms，实测 21 ms。
+
+模型自洽。
+
+**影响。** 每个对话的前 2051 个 token 共 2.1M 对，按标量路径要付 ~318 ms，改走 WMMA 后约 53 ms。下表把 prompt 视为从 base 0 起的单个 chunk，墙钟按 M1 稳态换算，属于估算：
+
+| prompt 长度 | 现在（估） | F1 后（估） | 收益 |
+|---|---|---|---|
+| 1K | ~946 ms | ~880 ms | ~7% |
+| 2K | ~1840 ms（≈1110 tok/s） | ~1575 ms（≈1300 tok/s） | ~17% |
+| 3K | ~2490 ms | ~2225 ms | ~12% |
+| 8K | ~5.9 s | ~5.6 s | ~4.5% |
+
+几点补充：
+
+- 对 gufo 的 pp2048@d0（1628）而言，我们真实的 d0 只有 ~1110 tok/s，差距约 32%，比 M1 表里的 21% 更大，因为 M1 剔除了这一段。F1 能收回其中约一半。
+- 多轮增量（base > 2051）不受影响。
+- 16K chunk 稳态只受第一个 chunk 影响，摊到长 prompt 后不足 1%。
+
+**做法（推荐：给 `k_qsa_wmma` 加一个 `Dense` 模板参数，不新写 kernel）。**
+
+kernel 内只有三处要改：
+
+- `ntok = token + 1`，原来是 `2048 + (token+1)%4`。
+- 源位置恒等：`src = gkey`。TransposedV 分支取 `vs = vk`，`vk` 已按 4 对齐。不再读 `blocks[]` / `tail0`。
+- 迭代数改为 `(ntok + QW_KITER - 1) / QW_KITER`。原来固定为 `QW_NITER = 17`，稠密段一定 ≤17，循环上界改成运行时值即可。注意 `#pragma unroll 1` 已存在，不会多出寄存器。
+
+调用侧在 `qsa_flash_b` 里改：
+
+- `dense_P > 0` 且 KVT 为 bf16、`qsa_wmma` 开时，launch `k_qsa_wmma<TV, Paged, /*Dense=*/true>`，`grid = (dense_P, 2)`，`first = base`。
+- 其余配置（fp32 KV、`GDEC_QSA_DENSE`、`qsa_global_v`）保持原路径。
+- 要覆盖全部实例化：`TransposedV` true/false × `Paged` true/false。
+- 调用点：3142 与 3214（主干），以及 4817 一带的 MTP 层 bf16 分支（`d_mkcb`）；fp32 分支 `d_mkcf` 不动。
+
+为什么可以复用：
+
+- 稠密前缀与稀疏尾段的 Q 布局、KV 布局、softmax 和输出写法完全相同。区别只在"看哪些 key"。
+- 4-slot 组尾的问题已由 `k_f32_to_bf16_v4_bt` 把 batch 尾部写成 0 解决（22_kernels_prefill.inc:185 注释）。
+- 组内大于 token 的 slot 是本 chunk 内的有效行，由 `gkey >= ntok` 屏蔽。这一点与稀疏 tail 现有行为相同，chunk 切分相关的 LSB 性质也一样，不引入新问题。
+
+预期 kernel 性能：
+
+- 稠密段的 key 是连续的，没有 `blocks[]` 间接寻址。每对开销应 ≤ 稀疏的 25 ns。
+- 小 token（t < 128）的 block 只跑 1 次迭代，Q staging 的固定开销占比大，但总量很小（≤128×2 个 block）。
+
+**验证。**
+
+1. **microbench / 设备端对拍**：在稠密段对照旧 fp32 `k_qsa_flash<false>` 的输出。误差口径沿用 k_qsa_wmma 注释里的"maxabs ~1.6e-4 vs bf16-P fp32 参考"，门槛按同量级设。另加 P=1、P=17、base 非 0 且 base+P 跨 2051 的边界用例。
+2. **c512 KLD**：64×512 的上下文整段落在稠密段，所以这正是测 F1 最准的口径。门槛：v2 0.10699+0.002；w4b 以同机改前值 +0.002。需在机器恢复后跑，或背靠背跑。
+3. **needle**：用 YARN-512K-RESULTS 的方法跑短档（needle 位于 <2K 处）。
+4. **pp**：用 M1b（§11.2）测 1K/2K/3K 的 TTFT。
+
+**风险。**
+
+- 非逐 bit：fp32 改为 bf16 Q/P 加 WMMA 累加。不过 ≥2051 的行早已是这种数值，质量先例在。
+- kvsnap/rckpt 里旧二进制存的快照与新数值会有微小差异，不影响正确性。如果指纹含数值版本，按惯例 bump。
+- decode（k_qsa_flash Split）不变。
+
+工作量：半天到一天（模板改动 ~30 行，加对拍和验证）。
+
+**状态（10-03 晚，已实现并默认开，验证过线）**：`k_qsa_wmma` 加第三模板参
+`bool Dense=false`（22_kernels_prefill.inc），kernel 内三处按规格改动：`ntok=token+1`、
+QK 与两个 V 分支的源位置恒等（`src=gkey`/`vs=vk`，Paged 的 `kv_row`/`ik_blk` 保留）、
+迭代数改运行时上界 `(ntok+QW_KITER-1)/QW_KITER`，`blocks`/`tail0` 在 Dense 下不读。
+调用侧 `qsa_flash_b`（40_model.inc:2780）：`dense_P>0 && bf16 KV && qsa_wmma &&
+!qsa_dense` 时 launch `<TransposedV,Paged,Dense>` 四实例化（`grid=(dense_P,2)`，
+`first=kbase=base`，`selected=nullptr`）；fp32 KV / `GDEC_QSA_DENSE` 保持原 fp32 标量
+路径。MTP bf16 分支（`d_mkcb`）共用 `qsa_flash_b`，自动覆盖。**默认开、无独立
+opt-out**（回退 = `GDEC_QSA_WMMA=0` 全退 WMMA）。验证：
+
+- 编译 + ktest ALL PASS（稀疏路径 `Dense=false` 默认，零变化）。
+- **c512 KLD**（64×512 全落稠密段，含 base=2048 跨 2051 的 dense_P=3 边界）：v2
+  **0.107066** ≤ 0.10699+0.002 ✓；w4b **0.163505** ≤ 同机改前 0.163530+0.002 ✓
+  （logs/kld_f1_{v2,w4b}_c512.log）。
+- 边界 smoke：P=1、P=17 均 rc=0、decode 出正常 id、无 error/NaN（logs/f1_edge_p{1,17}.log）。
+- **M1b TTFT 前后**（v2，健康机器，PLE 暖、中位数；qsa:flash 为 KPROF 段值）：
+
+  | P（实际 tokens） | 前 tok/s | 后 tok/s | Δ | qsa:flash 前→后 |
+  |---|---|---|---|---|
+  | 512（~640） | 760 | **791** | **+4.1%** | 33→6 ms |
+  | 1024（~1220） | 986 | **1086** | **+10.1%** | 112→18 ms |
+  | 2048（~2350） | 1066 | **1212** | **+13.7%** | 339→64 ms |
+  | 3000（~3350） | 1161 | **1273** | **+9.6%** | 388→114 ms |
+  | 8192（~9170） | 1283 | **1329** | **+3.6%** | 709→440 ms |
+
+  稠密段 qsa:flash **−81%**（2K 档 339→64 ms，每对开销 151→~29 ns，代价模型兑现）。
+  与上文估算（+7/+17/+12/+4.5%）同量级略低（实际 tokens 偏多、其它段占比）。
+  **对 gufo pp2048@d0 的差距 34.5% → 25.6%**（1212 vs 1628），收回约一半中的大头。
+- **16K 稳态不退**：128k@16384 抽跑 1452.7 vs 1457.7（−0.3% 噪声）；chunk 1
+  1304→1333、warmup dummy 1420→1456（首 chunk/dummy 含稠密前缀，直接受益）。
+
+遗留：ktest 级 maxabs 设备对拍（vs fp32 稠密参考，本轮以引擎 KLD + 边界 smoke 代替）、
+needle 短档（<2K）、独立 opt-out env（如 `GDEC_QSA_DENSE_WMMA=0`）。
+
+### 11.2 M1b：首 chunk / 单 chunk 补测口径
+
+M1 取第 2、3 个 chunk 是为了避开 PLE 冷读，但代价是测不到下面两种情况：
+
+- 生产 `PREFILL_CHUNK=16384` 时，**≤16K 的 prompt 就是一个 P=prompt 长度、base=0 的 chunk**。
+- 多轮增量是一个 P=新增 token 数、base=已有上下文的 chunk。
+
+前者的大头恰好是 F1 的稠密段。补测口径：
+
+- **单 chunk TTFT**：
+  - prompt 长度 ∈ {512, 1024, 2048, 3000, 8192}，`PREFILL_CHUNK=16384`。
+  - 同一进程里先发一个 64 token 的 dummy 请求暖热 PLE，再发正式请求，只计正式请求的 prefill 墙钟。
+  - 每档 3 次取中位数。
+  - 同时开 KPROF，报 qsa:flash 和 dense 各段。
+- **增量**：base≈32K 时续 P ∈ {256, 1024, 4096}，走 API 两次请求（§2 M1 第 1 条的做法），看 A3 和 dense 段。
+- 脚本可以在 `tools/pp_psweep_win.sh` 上加 `MODE=ttft`。结尾打印表格，并与 gufo pp2048@d0 1628 / d4K 1523 并列。
+
+M1b 先于 F1 跑一遍作为基线，F1 之后再跑一遍。这一档数字比 16K 稳态更接近用户体感。
+
+**状态（10-03 晚，基线已测，F1 后复测见 §11.1 状态段）**：`tools/pp_psweep_win.sh`
+加了 `MODE=ttft`——`--serve` + gdec-api 同进程多请求：每档每 rep 先发 64 token
+dummy 暖 PLE（一次性表加载，不计时），再发正式 prompt（yarn_ladder filler，rung
+唯一化防 TokenCache 前缀命中，`max_tokens=1`）只计正式请求墙钟，3 次取中位数；
+引擎开 KPROF，按 kprof 行的 `P=` 匹配正式请求报分段。PREFILL_CHUNK=16384，
+`--maxctx 17408`。用法：`MODE=ttft MODEL_FILE=…v2.hgn NGRAM_FILE=…ngram.hgn bash
+tools/pp_psweep_win.sh`。F1 前基线（v2，健康机器）：
+
+| P | 实际 tokens | TTFT ms | tok/s | qsa:flash ms |
+|---|---|---|---|---|
+| 512 | 633 | 833 | 760 | 33 |
+| 1024 | 1201 | 1218 | 986 | 112 |
+| 2048 | 2321 | 2178 | 1066 | 339 |
+| 3000 | 3301 | 2842 | 1161 | 388 |
+| 8192 | 9041 | 7049 | 1283 | 709 |
+
+对 gufo pp2048@d0=1628 的差距 34.5%（§11.1 估 32%，吻合）。遗留：增量档（base≈32K
+两次 API 请求）、w4b 基线。
+
+### 11.3 A3 重新评估：按 P 分流在引擎里 A/B，不再用"生产 16K 稳态"否决
+
+§3 A3 状态段的判定依据有两条：
+
+1. 生产 chunk 16384 时 0.78–0.96× 稳输；
+2. P<1024 时引擎实际走 hipBLASLt，按 Lt 口径只是打平。
+
+第 1 条混淆了 chunk 上限和实际 P。如 §11.2 所述，16K chunk 下所有 ≤16K 的 prompt 和所有多轮增量都以小 P 运行。分流后 16K 稳态仍走原路径，零影响，所以它不构成否决理由。
+
+第 2 条只对 P<1024 成立。**P∈[1024, 交叉点) 时引擎走的正是 `k_gemm_wmma`**（40_model.inc:2013 `P >= 1024`），ratio 表的对照对象就是引擎实际路径：
+
+| 形状 | P=1024 | P=2048 | 交叉点 |
+|---|---|---|---|
+| d3 (2560,6144) | 1.25 | 1.13 | ~4000 |
+| d9 (10240,2560) | 1.11 | — | ~1500 |
+
+这一窗口里 LUT 是实打实地赢。另外，表里的 deq 是 L2 热的下界；引擎里每个 chunk 都要冷读一遍，只会更偏向 LUT。
+
+做法：
+
+- 加一个 `GDEC_DENSE_LUT_MAXP` 开关（d3 / d9 分开，默认值取交叉点的 80% 左右）。仅限 q4cp（dtype 5）dense。
+- `gemm()` 里在 `gemv_multi_q4cp` 之后、`gemm_wbf16` 之前分流到 `moe_lut_down` 单专家，复用 `tools/moe_lut_test.cu dense_mode` 的调用方式。
+- P<1024 先只做 A/B，不默认开：Lt 口径打平，要以 M1b 的引擎墙钟为准。
+- 其余形状（N=12288/6144、HC 的 q8 系）先用同一 harness 补测 ratio，再决定是否纳入。
+
+验证：
+
+- 非逐 bit（f16 激活 vs bf16），过 c512 KLD 门槛（同机改前值 +0.002）。
+- pp 看 M1b 的 1K/2K/3K TTFT 与增量 P=1024。
+
+预期：w4b 在 P=1024–2048 时 dense 段快 10–20%，整体 3–6%；P=512 待 A/B。v2 的 ht 不适用，仍按 §10 第 2 条推 `gemv_multi` 的 P 上限。
+
+### 11.4 P=2048 稳态下与 gufo 的逐段对照（修正此前"MoE 是追 gufo 的大头"）
+
+口径：w4b，M1-w4b 的 P=2048 一档（第 2、3 个 chunk，深度 2–6K），单位 µs/token；gufo 取 GUFO-GAP.md 的 d0 profile，注意力按 d4K 略上调。
+
+| 段 | 我们 | gufo | 差 |
+|---|---|---|---|
+| 路由 MoE（up+down） | 237 | 233（整段，含 router/reduce） | ≈ |
+| MoE reduce + route | 33 | 0（gufo 把带权求和并进 HC combine） | +33 |
+| dense + HC + shared（含 q4cp 反量化） | ~377 | ~310 | +67 |
+| 注意力 + indexer | 74 | ~37–45 | +30 |
+| GDN 核心（scan/conv/norm） | 73 | 63 | +10 |
+| 合计 | 796 | ~657 | ~140 |
+
+解读：
+
+- 在 P=2048 下，我们的 MoE up+down 约 20 TF，与 gufo 的 MoE（~20 TF）持平。09-25 那次占差距 78% 的 MoE 问题已被 LUT kernel 解决。
+- 剩余差距分散，没有单一大头。dense/HC 这一项 A3 能吃掉一部分；reduce 并入 HC 已由 B2-1 以 −5% 否决，不重提。
+- P ≤ 1024 时，MoE 已在权重带宽的物理下限（M1 报告的 A2 判定成立），小 P 只剩 dense 和 F1 可压。
+
+### 11.5 MoE kernel 结构项：只对大 P 有效，排后
+
+`k_moe_lut` 的一个 CTA 负责 128 行权重乘一个 ≤64 行的 token tile（`MoeTile`，BN≤64 由 static_assert 限定）。同一个专家的多个 tile 由不同 CTA 处理，各自把同一批权重重新解码一遍。A1 的结果（加 VALU 就退步）说明解码 VALU 在关键路径上。因此：
+
+- **只在单个专家行数超过 64 时才有可摊薄的重复解码**，也就是平均每专家 >64 行，约 P ≥ 3.3K。16K 时平均 320 行（5 个 tile），重复解码 5 次。
+- P ≤ 2048 时平均只有 ≤40 行，没有重复。此前估计的"2048 下 ~8%"不成立，这里更正为 ≈0。
+- 方向：一个 CTA 连续处理同一专家的 2–4 个 tile。把解码后的 f16 A 片段写进 LDS（128 行 × 32 K × BK2 ≈ 16 KB），多个 token tile 从 LDS 读 A。A1 已证明 LDS 读能藏在 WMMA 之后，这样就把 VALU 解码换成了 LDS 读。
+- 不要再走"A 片段留在寄存器"那条路：BK=4 和 2 个 A 片段都已因 VGPR 否决。
+- 预期：16K 时 up+down 2889 ms 中解码部分减半，整体 ~4–6%。这只是推算，先在 `moe_lut_test` 里做原型，数天工作量。
+- 适用于 128K/16K 长 prompt。短 prompt 和多轮增量都不受益。
+
+### 11.6 修订后的优先级（覆盖 §10 的顺序，§10 各条内容仍有效）
+
+| 序 | 项 | 场景 | 预期 | 工作量 | 前置 |
+|---|---|---|---|---|---|
+| 0 | 机器降级排查（§10-4）+ 整栈"新默认全开 vs 全关"复测 | 全部 | 绝对值 +17% 量级；确认 10-03 各项收益 | 用户侧 | — |
+
+序 0 已闭环（10-03 晚）：机器重启后恢复健康（128k 探针 1469.7、256K YaRN 1397.0；
+老二进制 v0.0.5 复跑 1126.5 vs 其健康基线 1443.7 = −22%，确认真降级非代码）。健康
+机器全开 vs 全关（v2 128k@16384 同链相邻）= **1457.7 vs 1443.1（+1.0%）**；降级态口径
+曾 +6%，机制：健康态不再带宽受限，f16 pairs / index f16 的绝对收益缩小。
+| 1 | M1b 基线（§11.2） | 短 prompt / 增量 | 无直接收益，给 F1/A3 定基线 | 1–2 小时 | — |
+| 2 | **F1 稠密前缀 WMMA**（§11.1） | 所有对话的前 2K token | 1K +7%、2K +17%、3K +12% | 半天–1 天 | M1b |
+| 3 | **A3 按 P 分流**（§11.3） | w4b / GGUF，P 1K–4K | 整体 3–6% | 1 天 | M1b |
+| 4 | D1 rckpt（§10-1） | agent 多轮 | 每回合省整段重 prefill | 中 | — |
+| 5 | v2 `gemv_multi` P 上限（§10-2） | v2 小 P | ht_deq 10–20% 中的大头 | 小 | M1b |
+| 6 | MoE 多 tile 共享解码（§11.5） | P ≥ 4K、长 prompt | 16K ~4–6% | 数天 | 机器恢复 |
+| 7 | C2、select f16 向量化、w4b gdn +3%（§10-3、§10-5） | 长上下文 | ≤3.5% / 0.2 ms / — | — | — |
+
+测量纪律补充：
+
+- F1 与 A3 的验收以 M1b 的 TTFT 为主，16K 稳态为辅（只需确认不退）。
+- 机器恢复前，只做背靠背的相对比较，不跨日比较绝对值（§9）。
