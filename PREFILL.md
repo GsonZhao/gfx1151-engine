@@ -210,11 +210,17 @@ kernel 链演进（头注释 gdec.cpp:6-15）：
 | `GDEC_INDEX_OLDSEL=1` | top-512 回退 rocPRIM 排序版 |
 | `GDEC_INDEX_SCORE64=0` | fused 打分回退旧 `k_index_scores_tiled`（16q×32k；新版默认开，逐 bit 一致） |
 | `GDEC_INDEX_SEL2P=0` | n>8192 选块回退旧 stream / rocPRIM 版（两遍精确 `k_index_select_2p` 默认开，逐 bit 一致） |
+| `GDEC_INDEX_F16=0` | indexer 打分/选块回退 fp32（f16 WMMA 打分 + f16 score 默认开：重合率 mean ≥0.99886 过 0.995 门，KLD v2 −0.0008 / w4b −0.0001，pp 128k +1.4%，needle 64K 3/3；详见 HANDOFF-PREFILL-ALL §5 C1 f16 段） |
 | `GDEC_HC_FUSE=0` | HC mix-up GEMM 回退“GEMM 写 fp32 G + `k_gr_combine_b_hc_bf16`”两 kernel（融合版 `hc_up_fused` 默认开，需 `GDEC_GEMM_WMMA=1` + `GDEC_GR_BF16=1`，逐 bit 一致） |
 | `GDEC_GDN_CONVL2=0` | GDN conv+silu 与 q/k L2 norm 回退 `k_gdn_conv_b` + `k_l2norm_qk_b` 两 kernel（融合版 `k_gdn_conv_l2n_b` 默认开，逐 bit 一致） |
 | `GDEC_MOE_SG_FUSE=0` | 共享专家加法回退路由 reduce 之后单独的 `k_axpy_sg`（融合版先算共享专家，再由 `k_moe_reduce_pw_sg` 一并加上；只在 q4cp LUT 路由路径生效，逐 bit 一致） |
 | `GDEC_QSA_GATE_BF16=0` | QSA 输出门控回退 `k_sigmoid_gate` 就地写 fp32 + o_proj 自行转 bf16（融合版 `k_sigmoid_gate_bf16_v4` 直接读 d_qgb 的 gate 半边，qsplit 不再拷 gs；P>8 生效，逐 bit 一致） |
 | `GDEC_HC_INJ_FUSE=0` | HC inject 回退独立的 N=4 inject GEMM（融合版 `k_gr_scatter_norm_inj_bf16` 在写 Rhat 时顺带算出下一处 inject 的 4 路部分和，`k_inj_psum` 收尾；需 `GDEC_GR_BF16=1`，默认开。R/Rhat 逐 bit 一致，w4 求和顺序不同 → **非逐 bit**，KLD +0.0001） |
+| `GDEC_HC_FUSE_WRITE=1` | HC 写回并进 MoE reduce 的实验（`k_v2_reduce_rot_hc` / `k_moe_reduce_pw_sg_hc` 尾部 4 分支 bf16 RMW + scatter `Write=false` 模式；逐 bit 一致但 KPROF/pp 实测净回退，**已否决，勿开**——机制见 HANDOFF-PREFILL-ALL §4 B2 子项1 的流量模型修正） |
+| `GDEC_V2_PAIRS_F16=0` | v2 down pairs 回退 f32（f16 版默认开：KLD 0.107705 ≤ 0.10699+0.002 过线，pp +1~1.5%；仅 v2 kI4R 路径） |
+| `GDEC_W4B_PAIRS_F16=0` | w4b down pairs 回退 f32（f16 版默认开：KLD 0.162452 ≤ 0.163530+0.002 过线，严格空闲 pp +0.3%、moe:reduce −36%、devarena −0.78 GiB；仅 w4b q4cp LUT 路径，d_guvb 同步减半） |
+| `GDEC_HC_NORHAT=1` | HC 免 Rhat 落盘实验（scatter 只写 P×4 inv scales，mix-down Epi=2 staging 现场归一化 + hc_up Epi=1 现场乘 Sc/Hw；KLD 全过但 pp −3.3%、hc+hc2 +293 ms/chunk，**已否决，勿开**——见 HANDOFF-PREFILL-ALL §4 B2 子项2） |
+| `GDEC_GEMM_SPLITK=0` | 关闭 k1 (2560,6144) 的 split-2（X 经 `k_splitk_repack2` 重排成 2 个连续 K=3072 切片，slice0 写 Y + slice1 Epi=3 原子加，W 原布局 strided 读；P≥8192 生效，默认开：KLD +0.001 过线，pp +1.3~1.8%） |
 | `GDEC_MROPE_DUMP=<file>` | dump RoPE 表（调试用，会同步流） |
 | `GDEC_PREFILL_TAIL_SLACK=<n>` | 尾包合并上限（默认 Linux 1024 / Windows 0；0 禁用） |
 | `GDEC_GR_SCAT4=1` | GR scatter+norm 单 block/token 实验（实测 -0.8%，勿开） |
