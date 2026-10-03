@@ -1287,7 +1287,13 @@ __device__ __forceinline__ void tr16x16_bf16(unsigned a[8]) {
 // Paged (A1c): KV rows / vct blocks go through the page table ptab
 // (kv_row / ik_blk). Compile-time switch so the unpaged production
 // instantiations keep their exact codegen (this kernel is VGPR-sensitive).
-template <bool TransposedV = false, bool Paged = false>
+// Dense (F1, §11.1): the dense prefix [0, 2051) reuses this kernel instead of
+// the fp32 scalar k_qsa_flash<false>. Keys are logically contiguous:
+// ntok = token + 1, src = gkey / vs = vk (identity, no blocks[]/tail0), and the
+// iteration count is the runtime ceil(ntok / QW_KITER) (<= 17 here). Q/KV
+// layouts, softmax and the output write are identical to the sparse tail; the
+// launcher uses grid = (dense_P, 2), first = kbase = base, selected = nullptr.
+template <bool TransposedV = false, bool Paged = false, bool Dense = false>
 __global__ void __launch_bounds__(256)
     k_qsa_wmma(const float* __restrict__ q, const uint16_t* __restrict__ kc,
                const uint16_t* __restrict__ vc, const uint16_t* __restrict__ vct,
@@ -1321,9 +1327,10 @@ __global__ void __launch_bounds__(256)
     }
   }
   __syncthreads();
-  const int* blocks = selected + (size_t)blockIdx.x * 512;
-  const int ntok = 2048 + (token + 1) % 4;
-  const long tail0 = ((token + 1) / 4) * 4L;   // dense tail (visible = token+1)
+  const int* blocks = Dense ? nullptr : selected + (size_t)blockIdx.x * 512;
+  const int ntok = Dense ? token + 1 : 2048 + (token + 1) % 4;
+  const long tail0 = Dense ? 0 : ((token + 1) / 4) * 4L;  // dense tail (visible = token+1)
+  const int qw_niter = Dense ? (ntok + QW_KITER - 1) / QW_KITER : QW_NITER;
   float m_run[8], l_run[8];   // per-elem qrow state (row = lane<16 ? e : 8+e)
 #pragma unroll
   for (int e = 0; e < 8; ++e) { m_run[e] = -1e30f; l_run[e] = 0.f; }
@@ -1339,14 +1346,17 @@ __global__ void __launch_bounds__(256)
   else if (lane >= 17 && (lane & 1)) qrowA = 8 + (lane - 17) / 2;
   const int keylane = lane & 15;
 #pragma unroll 1
-  for (int it = 0; it < QW_NITER; ++it) {
+  for (int it = 0; it < qw_niter; ++it) {
     const int kbase = it * QW_KITER + w * QW_KTILE;
     // ---------------- QK: S = Q·Kᵀ ----------------
     qw_floatx8 s0 = {0, 0, 0, 0, 0, 0, 0, 0}, s1 = s0;
     int gkey = kbase + keylane;
-    long src = gkey < ntok ? (gkey < 2048 ? 4L * blocks[gkey / 4] + gkey % 4
-                                          : tail0 + gkey - 2048)
-                           : 0;
+    long src = 0;
+    if (gkey < ntok) {
+      if constexpr (Dense) src = gkey;
+      else src = gkey < 2048 ? 4L * blocks[gkey / 4] + gkey % 4
+                             : tail0 + gkey - 2048;
+    }
     if constexpr (Paged) src = kv_row(ptab, (int)src);
     const uint16_t* kp = kc + ((size_t)src * hkv + kvh) * dh;
 #pragma unroll
@@ -1441,9 +1451,12 @@ __global__ void __launch_bounds__(256)
 #pragma unroll
         for (int blk = 0; blk < 4; ++blk) {
           int vk = it * QW_KITER + ks * QW_KTILE + blk * 4;
-          long vs = vk < ntok ? (vk < 2048 ? 4L * blocks[vk / 4] + vk % 4
-                                           : tail0 + vk - 2048)
-                              : 0;
+          long vs = 0;
+          if (vk < ntok) {
+            if constexpr (Dense) vs = vk;
+            else vs = vk < 2048 ? 4L * blocks[vk / 4] + vk % 4
+                                : tail0 + vk - 2048;
+          }
           // vs is 4-aligned here (blk*4 steps, 4-aligned tail0)
           if constexpr (Paged) vs = (long)ik_blk(ptab, (int)(vs / 4)) * 4;
           vb[blk] = vct + ((((size_t)vs / 4) * hkv + kvh) * dh + w * 32) * 4;
@@ -1476,9 +1489,12 @@ __global__ void __launch_bounds__(256)
       } else {
         // lane&15 = key, lane>>4 = d-tile: 2 x uint4 = 16 dims per lane.
         int vk = it * QW_KITER + ks * QW_KTILE + (lane & 15);
-        long vs = vk < ntok ? (vk < 2048 ? 4L * blocks[vk / 4] + vk % 4
-                                         : tail0 + vk - 2048)
-                            : 0;
+        long vs = 0;
+        if (vk < ntok) {
+          if constexpr (Dense) vs = vk;
+          else vs = vk < 2048 ? 4L * blocks[vk / 4] + vk % 4
+                              : tail0 + vk - 2048;
+        }
         if constexpr (Paged) vs = kv_row(ptab, (int)vs);
         const uint16_t* vp =
             vc + ((size_t)vs * hkv + kvh) * dh + w * 32 + (lane >> 4) * 16;

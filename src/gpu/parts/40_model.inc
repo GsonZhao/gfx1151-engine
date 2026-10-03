@@ -2777,10 +2777,40 @@ struct GpuModel {
     // BF16 cache, by k_qsa_wmma<*, true> (A1c). The union / wmma6 /
     // k_qsa_flash_bf16 paths are not paged: the constructor refuses paging
     // for those configurations.
-    if (dense_P > 0)
-      k_qsa_flash<false, false, KVT><<<dim3((dense_P + 15) / 16, 24), 128, 0, g_str>>>(
-          d_qsb, kc, vc, d_attnb, dense_P, 256, 2, 24, nullptr, 0, nullptr, nullptr,
-          nullptr, base, ptab);
+    if (dense_P > 0) {
+      // F1 (§11.1)：bf16 KV + qsa_wmma 时稠密前缀也走 k_qsa_wmma 的 Dense 变体
+      // （grid=(dense_P,2)，first=kbase=base，selected 不用）。fp32 KV、
+      // GDEC_QSA_DENSE（dense_P=P 全稠密）保持原 fp32 标量路径。
+      bool dense_launched = false;
+      if constexpr (sizeof(KVT) == 2) {
+        if (qsa_wmma && !qsa_dense) {
+          dense_launched = true;
+          if (vc_transposed) {
+            if (ptab)
+              k_qsa_wmma<true, true, true><<<dim3(dense_P, 2), 256, 0, g_str>>>(
+                  d_qsb, kc, vc, vc_transposed, d_attnb, dense_P, 256, 2, 24,
+                  nullptr, base, base, ptab);
+            else
+              k_qsa_wmma<true, false, true><<<dim3(dense_P, 2), 256, 0, g_str>>>(
+                  d_qsb, kc, vc, vc_transposed, d_attnb, dense_P, 256, 2, 24,
+                  nullptr, base, base);
+          } else {
+            if (ptab)
+              k_qsa_wmma<false, true, true><<<dim3(dense_P, 2), 256, 0, g_str>>>(
+                  d_qsb, kc, vc, nullptr, d_attnb, dense_P, 256, 2, 24, nullptr,
+                  base, base, ptab);
+            else
+              k_qsa_wmma<false, false, true><<<dim3(dense_P, 2), 256, 0, g_str>>>(
+                  d_qsb, kc, vc, nullptr, d_attnb, dense_P, 256, 2, 24, nullptr,
+                  base, base);
+          }
+        }
+      }
+      if (!dense_launched)
+        k_qsa_flash<false, false, KVT><<<dim3((dense_P + 15) / 16, 24), 128, 0, g_str>>>(
+            d_qsb, kc, vc, d_attnb, dense_P, 256, 2, 24, nullptr, 0, nullptr, nullptr,
+            nullptr, base, ptab);
+    }
     int first_abs = std::max(base, 2051), nsparse = base + P - first_abs;
     if (!qsa_dense && nsparse > 0) {
       // d_iselected rows are batch-local (row = abs - base; A1b)
