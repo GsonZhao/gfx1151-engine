@@ -32,6 +32,37 @@ __device__ __forceinline__ unsigned isel_bits(__half h) {
   return __float_as_uint(__half2float(h));
 }
 
+// select f16 向量化（§10-5 小项）：uint4 一次 8 个 f16 + 对齐 peel，替代
+// ST=__half 行的 2B 散读。仅对 __half 启用（uint16_t 是 bf16，位义不同）。
+// 纯读法改动：每元素仍走 __half2float 精确转换，只用于顺序无关的消费点
+// （直方图计数 / atomic 位置发射），输出逐 bit 不变。
+template <class T> struct isel_is_h16 { enum { value = false }; };
+template <> struct isel_is_h16<__half> { enum { value = true }; };
+struct IselH16Row {
+  const __half* rp;
+  int lead, nv, n;
+  __device__ __forceinline__ void init(const __half* r, int n_) {
+    rp = r;
+    n = n_;
+    lead = min((int)(((16 - ((uintptr_t)rp & 15)) & 15) >> 1), n);
+    nv = (n - lead) >> 3;
+  }
+  __device__ __forceinline__ const uint4* vec() const {
+    return reinterpret_cast<const uint4*>(rp + lead);
+  }
+  __device__ __forceinline__ int tail0() const { return lead + (nv << 3); }
+};
+__device__ __forceinline__ void isel_h16x8_bits(uint4 u, unsigned bits[8]) {
+  const unsigned w[4] = {u.x, u.y, u.z, u.w};
+#pragma unroll
+  for (int k = 0; k < 4; ++k) {
+    bits[2 * k] = __float_as_uint(
+        __half2float(__ushort_as_half((unsigned short)(w[k] & 0xffffu))));
+    bits[2 * k + 1] = __float_as_uint(
+        __half2float(__ushort_as_half((unsigned short)(w[k] >> 16))));
+  }
+}
+
 // Exact top-512 selection, bit-identical output to k_index_select (same
 // combined-score formula and the same total order: score desc, then smaller
 // block id), but sort-free. Four MSD radix passes over the fp32 bit pattern
@@ -61,6 +92,32 @@ __global__ void k_index_select_rs(const ST* __restrict__ scores, int stride,
   hist[tid] = 0;
   __syncthreads();
   const ST* qb = scores + (size_t)q * 4 * stride;
+  if constexpr (Combined && isel_is_h16<ST>::value) {
+    // f16 向量化读（顺序无关：sbuf 按位写 + 直方图计数）
+    IselH16Row R;
+    R.init(reinterpret_cast<const __half*>(scores + (size_t)q * stride), n);
+    for (int b = tid; b < R.lead; b += 256) {
+      float s = isel_ldf(R.rp[b]);
+      sbuf[b] = s;
+      atomicAdd(&hist[__float_as_uint(s) >> 24], 1u);
+    }
+    const uint4* rv = R.vec();
+    for (int c = tid; c < R.nv; c += 256) {
+      unsigned bits[8];
+      isel_h16x8_bits(rv[c], bits);
+      const int b0 = R.lead + (c << 3);
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        sbuf[b0 + j] = __uint_as_float(bits[j]);
+        atomicAdd(&hist[bits[j] >> 24], 1u);
+      }
+    }
+    for (int b = R.tail0() + tid; b < n; b += 256) {
+      float s = isel_ldf(R.rp[b]);
+      sbuf[b] = s;
+      atomicAdd(&hist[__float_as_uint(s) >> 24], 1u);
+    }
+  } else
   for (int b = tid; b < n; b += 256) {
     float s = 0.f;
     if constexpr (Combined) {
@@ -700,6 +757,28 @@ k_index_select_2p(const ST* __restrict__ scores, int stride,
   if (tid == 0) s_nsel = s_ncand = s_eq = 0;
   __syncthreads();
   // ---- pass 1: top-13-bit histogram (bit 31 is 0 -> 8192 bins)
+  if constexpr (isel_is_h16<ST>::value) {
+    // f16 向量化读（顺序无关的直方图计数）
+    IselH16Row R;
+    R.init(reinterpret_cast<const __half*>(row), n);
+    for (int b = tid; b < R.lead; b += 256)
+      atomicAdd(&big[isel_bin(isel_bits(R.rp[b]))], 1u);
+    const uint4* rv = R.vec();
+    for (int c0 = tid; c0 < R.nv; c0 += 256 * 2) {
+      unsigned bits[16];
+#pragma unroll
+      for (int k = 0; k < 2; ++k)
+        if (c0 + 256 * k < R.nv) isel_h16x8_bits(rv[c0 + 256 * k], bits + 8 * k);
+#pragma unroll
+      for (int k = 0; k < 2; ++k)
+        if (c0 + 256 * k < R.nv)
+#pragma unroll
+          for (int j = 0; j < 8; ++j)
+            atomicAdd(&big[isel_bin(bits[8 * k + j])], 1u);
+    }
+    for (int b = R.tail0() + tid; b < n; b += 256)
+      atomicAdd(&big[isel_bin(isel_bits(R.rp[b]))], 1u);
+  } else {
   // 8 loads in flight per thread before the LDS atomics (latency bound)
   for (int b0 = tid; b0 < n; b0 += 256 * 8) {
     unsigned v[8];
@@ -708,6 +787,7 @@ k_index_select_2p(const ST* __restrict__ scores, int stride,
 #pragma unroll
     for (int k = 0; k < 8; k++)
       if (b0 + 256 * k < n) atomicAdd(&big[isel_bin(v[k])], 1u);
+  }
   }
   __syncthreads();
   isel_find_desc<ISEL_BINS / 256>(big, 512, sh, wsum);
@@ -778,6 +858,31 @@ k_index_select_2p(const ST* __restrict__ scores, int stride,
   // ---- pass 2: definite ids (bin > T) + candidates (bin == T)
   unsigned* cbits = big;
   int* cid = reinterpret_cast<int*>(big + ISEL_CAP);
+  if constexpr (isel_is_h16<ST>::value) {
+    // f16 向量化读（atomic 位置发射，顺序无关；最终 bitonic sort 定序）
+    IselH16Row R;
+    R.init(reinterpret_cast<const __half*>(row), n);
+    auto emit = [&](int b, unsigned v) {
+      const unsigned bin = isel_bin(v);
+      if (bin > T) {
+        sel[atomicAdd(&s_nsel, 1)] = b;
+      } else if (bin == T) {
+        const int i = atomicAdd(&s_ncand, 1);
+        cbits[i] = v;
+        cid[i] = b;
+      }
+    };
+    for (int b = tid; b < R.lead; b += 256) emit(b, isel_bits(R.rp[b]));
+    const uint4* rv = R.vec();
+    for (int c = tid; c < R.nv; c += 256) {
+      unsigned bits[8];
+      isel_h16x8_bits(rv[c], bits);
+      const int b0 = R.lead + (c << 3);
+#pragma unroll
+      for (int j = 0; j < 8; ++j) emit(b0 + j, bits[j]);
+    }
+    for (int b = R.tail0() + tid; b < n; b += 256) emit(b, isel_bits(R.rp[b]));
+  } else
   for (int b0 = tid; b0 < n; b0 += 256 * 8) {
     unsigned v[8];
 #pragma unroll
