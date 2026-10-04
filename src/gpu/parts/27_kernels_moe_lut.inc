@@ -117,8 +117,17 @@ __launch_bounds__(256) __global__
   using namespace moegg;
   using namespace moelut;
   constexpr int BM = 128, BK = 2;
+#ifdef MOE_LUT_SHARE34_PROTO
+  // tools/moe_lut_test.cu 专用原型口（该文件 include 本 inc 前定义此宏）：
+  // SHARE 3/4 已在 §13.7 否决（0 spill 但 occupancy 塌缩 −120%），仅留复测能力。
+  static_assert(BN == 64 || BN == 128 || ((BN == 192 || BN == 256) && kLut == kQ4CP),
+                "BN = MoeTile slots: 64, or 128 for the merged super-tiles (mt); "
+                "192/256 (SHARE 3/4) are q4cp-only prototypes");
+  static_assert(BN == 64 || kLut == kI4R || kLut == kQ4CP, "BN>64 is validated for kI4R / kQ4CP only");
+#else
   static_assert(BN == 64 || BN == 128, "BN = MoeTile slots: 64, or 128 for the merged super-tiles (mt)");
   static_assert(BN == 64 || kLut == kI4R || kLut == kQ4CP, "BN=128 is validated for kI4R / kQ4CP only");
+#endif
   static_assert(kLut == kQ4CP || kLut == kIQ4NL || kLut == kIQ4XS || kLut == kI4R, "LUT type");
   static_assert(!kRaw || kPair, "kRaw is a gate/up epilogue");
   static_assert(!kMid || (kLut == kI4R && !kPair && !kF16Pairs), "kMid is the i4r fused up+mid");

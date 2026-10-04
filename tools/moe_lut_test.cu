@@ -19,8 +19,9 @@
 //                         kernels, both timed. v2: prototype kernel, N = 1..4;
 //                         with --mid 1: production-path A/B (up_mid / down-f16
 //                         vs the BN=128 mt variants on merged tiles).
-//                         hgn (q4cp): production mt wrappers only, N = 2
-//                         (BN=128; SHARE 3/4 are VGPR dead ends).
+//                         hgn (q4cp): production kernel template, N = 2..4
+//                         (BN = 64*N super-tiles; SHARE 3/4 under evaluation,
+//                         §13.4 candidate 3).
 //
 // Routing: random top-10 (distinct experts per token, mildly skewed), like
 // tools/moe_gguf_test.cu. Correctness: outputs are pre-filled with NaN and
@@ -50,7 +51,51 @@
 
 struct MoeTile { int expert, first, count; };
 #include "../src/gpu/parts/26_kernels_moe_gguf.inc"
+#define MOE_LUT_SHARE34_PROTO 1  // 放开 BN=192/256 static_assert（§13.7 否决原型的复测口）
 #include "../src/gpu/parts/27_kernels_moe_lut.inc"
+
+// q4cp mt SHARE dispatch (§13.4 candidate 3): BN = 64*share super-tiles via the
+// production kernel template. Grids match the engine wrappers (independent of
+// BN): up m/64 (kRows = BM/2), down m/128 (kRows = BM).
+static bool moe_lut_up_mt_q4cp_share(int share, const moelut::LutW& p, const __half* x,
+                                     const int* tokidx, const MoeTile* tiles, const int* ntiles,
+                                     int max_tiles, __half* hid, int m, int k, hipStream_t st) {
+  if (m % 64 || !moelut::lut_ok(moelut::kQ4CP, p, true, k)) return false;
+  dim3 grid(m / 64, max_tiles);
+  switch (share) {
+#define Q4UP(S)                                        \
+  case S:                                              \
+    k_moe_lut<moelut::kQ4CP, true, 64 * S><<<grid, 256, 0, st>>>(p, x, tokidx, tiles, ntiles, \
+                                                                 nullptr, hid, m, k);          \
+    break
+    Q4UP(1); Q4UP(2); Q4UP(3); Q4UP(4);
+#undef Q4UP
+    default: return false;
+  }
+  return true;
+}
+static bool moe_lut_down_mt_q4cp_share(int share, const moelut::LutW& p, const __half* hid,
+                                       const MoeTile* tiles, const int* ntiles, int max_tiles,
+                                       float* pairs, int m, int k, hipStream_t st, bool f16) {
+  if (m % 128 || !moelut::lut_ok(moelut::kQ4CP, p, false, k)) return false;
+  dim3 grid(m / 128, max_tiles);
+  switch (share) {
+#define Q4DN(S)                                                                             \
+  case S:                                                                                   \
+    if (f16)                                                                                \
+      k_moe_lut<moelut::kQ4CP, false, 64 * S, false, true><<<grid, 256, 0, st>>>(           \
+          p, hid, nullptr, tiles, ntiles, pairs, nullptr, m, k);                            \
+    else                                                                                    \
+      k_moe_lut<moelut::kQ4CP, false, 64 * S><<<grid, 256, 0, st>>>(p, hid, nullptr, tiles, \
+                                                                    ntiles, pairs, nullptr, \
+                                                                    m, k);                  \
+    break
+    Q4DN(1); Q4DN(2); Q4DN(3); Q4DN(4);
+#undef Q4DN
+    default: return false;
+  }
+  return true;
+}
 
 static uint16_t bf16_bits_host(float f) {  // RNE bit pattern, same as f2bf
   uint32_t u;
@@ -980,9 +1025,8 @@ int main(int argc, char** argv) {
     fprintf(stderr, "--q4perm requires --hgn and no --opt\n");
     return 2;
   }
-  if (share && ((v2_path.empty() && hgn_path.empty()) || opt >= 0 || share > 4 ||
-                (!hgn_path.empty() && share != 2))) {
-    fprintf(stderr, "--share N (1..4) requires --v2 and no --opt; with --hgn only N=2 (BN=128)\n");
+  if (share && ((v2_path.empty() && hgn_path.empty()) || opt >= 0 || share > 4)) {
+    fprintf(stderr, "--share N (1..4) requires --v2 or --hgn and no --opt\n");
     return 2;
   }
   std::mt19937 rng(seed);
@@ -1257,13 +1301,14 @@ int main(int argc, char** argv) {
     CK(hipMemcpy(d_nmt, &nmtiles, 4, hipMemcpyHostToDevice));
     CK(hipMemcpy(d_mtiles, mtiles.data(), (size_t)nmtiles * sizeof(MoeTile), hipMemcpyHostToDevice));
     const bool launched =
-        moe_lut_up_mt_q4cp(pgu, d_x, d_tok, d_mtiles, d_nmt, nmtiles, d_hid_mt, MID, D, 0) &&
-        moe_lut_down_mt_q4cp(pdn, d_hid_mt, d_mtiles, d_nmt, nmtiles, d_pairs_mt, D, MID, 0,
-                             false) &&
+        moe_lut_up_mt_q4cp_share(share, pgu, d_x, d_tok, d_mtiles, d_nmt, nmtiles, d_hid_mt, MID,
+                                 D, 0) &&
+        moe_lut_down_mt_q4cp_share(share, pdn, d_hid_mt, d_mtiles, d_nmt, nmtiles, d_pairs_mt, D,
+                                   MID, 0, false) &&
         moe_lut_down(moelut::kQ4CP, pdn, d_hid, d_tiles, d_nt, max_tiles, (float*)d_p16, D, MID, 0,
                      true) &&
-        moe_lut_down_mt_q4cp(pdn, d_hid_mt, d_mtiles, d_nmt, nmtiles, (float*)d_p16_mt, D, MID, 0,
-                             true);
+        moe_lut_down_mt_q4cp_share(share, pdn, d_hid_mt, d_mtiles, d_nmt, nmtiles,
+                                   (float*)d_p16_mt, D, MID, 0, true);
     if (!launched) {
       fprintf(stderr, "share q4cp: unsupported\n");
       return 2;
@@ -1703,7 +1748,8 @@ int main(int argc, char** argv) {
         CK(hipEventRecord(e0, 0));
         if (mt) {
           if (!v2)
-            moe_lut_up_mt_q4cp(pgu, d_x, d_tok, d_mtiles, d_nmt, nmtiles, d_hid_mt, MID, D, 0);
+            moe_lut_up_mt_q4cp_share(share, pgu, d_x, d_tok, d_mtiles, d_nmt, nmtiles, d_hid_mt,
+                                     MID, D, 0);
           else if (fuse_mid)
             moe_lut_up_mid_mt(pgu, d_x, d_tok, d_mtiles, d_nmt, nmtiles, d_hidmid_mt, d_svh, d_suh,
                               MID, D, 0);
@@ -1721,8 +1767,8 @@ int main(int argc, char** argv) {
         CK(hipEventRecord(e1, 0));
         if (mt) {
           if (!v2)
-            moe_lut_down_mt_q4cp(pdn, d_hid_mt, d_mtiles, d_nmt, nmtiles, (float*)d_p16_mt, D, MID,
-                                 0, true);
+            moe_lut_down_mt_q4cp_share(share, pdn, d_hid_mt, d_mtiles, d_nmt, nmtiles,
+                                       (float*)d_p16_mt, D, MID, 0, true);
           else if (fuse_mid)
             moe_lut_down_mt(pdn, d_hid, d_mtiles, d_nmt, nmtiles, (float*)d_p16_mt, D, MID, 0,
                             true);
