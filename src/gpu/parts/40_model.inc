@@ -260,6 +260,10 @@ struct GpuModel {
   // Non-cacheable gemm inputs (d_hidb, d_t320b, attn/conv outs) convert here so
   // they don't evict the d_xb/d_Rhatb cache entries in d_xbf16.
   uint16_t* d_xbf16b = nullptr;  // [maxctx, 6144] bf16
+  // A3 dense-LUT dispatch (§11.3): single-"expert" 64-slot tiles scratch for
+  // the q4cp dense d3/d9 diversion in gemm() (tiny; (BP/64+2) tiles).
+  MoeTile* d_dlut_tiles = nullptr;
+  int* d_dlut_nt = nullptr;
   // B3 split-K: [BP, 6144] bf16，k1 (2560,6144) 的 X 重排成 2 个连续 K=3072
   // 切片。层边界即死（仅单次 gemm 内活跃），与 d_wbf16 同理性不入 WS 小拷贝。
   uint16_t* d_skx = nullptr;
@@ -717,6 +721,8 @@ struct GpuModel {
       DALLOC(&d_wbf16, (size_t)64 << 20);  // fits q_proj 12288x2560 bf16
       DALLOC(&d_xbf16, BP * 10240 * 2);
       DALLOC(&d_xbf16b, BP * 6144 * 2);  // largest non-cacheable K = 6144
+      DALLOC(&d_dlut_tiles, (BP / 64 + 2) * sizeof(MoeTile));
+      DALLOC(&d_dlut_nt, sizeof(int));
       if (gemm_splitk_on()) DALLOC(&d_skx, BP * 6144 * 2);
       if (prefill_fused) DALLOC(&d_Rhatbf16, BP * 10240 * 2);
       if (prefill_fused) DALLOC(&d_hcsc, BP * 4 * 4);
@@ -2023,6 +2029,93 @@ struct GpuModel {
                       std::chrono::steady_clock::now() - pt0)
                       .count();
       return;
+    }
+    // A3 (§11.3): dense q4cp direct-read LUT for the d3/d9/dz/dq projection
+    // shapes at P in [MINP, MAXP]. Harness ratios (deq+gemm_wmma)/lut with the
+    // L2-hot dequant lower bound: d3 (2560,6144) 1.25/1.13 at P=1024/2048,
+    // crossover ~4000; d9 (10240,2560) 1.11 at P=1024, crossover ~1500
+    // (logs/a3_dense_lut.md); dz (6144,2560) 1.18@1024 crossover ~2000, dq
+    // (12288,2560) 1.12@1024 crossover ~1800. In-engine (32k@1024 KPROF):
+    // ht_deq -24 ms/chunk, gdn:proj -15, qsa:proj -4, qsa:oproj ~0 — the
+    // engine's k1 WMMA config for (2560,6144) is ~1.3x faster than the
+    // harness's old-d3 reference, so the true d3 ratio vs the OFF path is
+    // ~1.0, not 1.25; end-to-end +1.8% < the 3% default-on bar, so MAXP
+    // defaults are 0 (off). Opt in with GDEC_DENSE_LUT_MAXP_{D3,D9,DZ,DQ}
+    // (80%-of-crossover values 3200/1200/1600/1400). The weight runs as a
+    // single-"expert" moe_lut_down with plain 64-slot tiles — the MoE-mt
+    // BN=128 path (v2 MoE station) is not involved; the activation enters as
+    // f16 (xbf calls: exact bf16->f16 of the live gated/normed input — the
+    // f32 x there is the stale pre-gate/norm pre-image; f32 calls:
+    // k_f32_to_f16_v4 rounding as in the MoE LUT station) — NOT bit-identical
+    // vs the bf16 path, non-bit-exact by design, KLD-gated (c8192@4096:
+    // mean 0.121637 vs off 0.121246, +0.0004 << 0.002). P<1024 keeps the Lt
+    // fallback (MINP); =0 disables.
+    static const int dlut_minp = [] {
+      const char* s = getenv("GDEC_DENSE_LUT_MINP");
+      return s && *s ? atoi(s) : 1024;
+    }();
+    static const int dlut_d3 = [] {
+      const char* s = getenv("GDEC_DENSE_LUT_MAXP_D3");
+      return s && *s ? atoi(s) : 0;
+    }();
+    static const int dlut_d9 = [] {
+      const char* s = getenv("GDEC_DENSE_LUT_MAXP_D9");
+      return s && *s ? atoi(s) : 0;
+    }();
+    static const int dlut_dz = [] {
+      const char* s = getenv("GDEC_DENSE_LUT_MAXP_DZ");
+      return s && *s ? atoi(s) : 0;
+    }();
+    static const int dlut_dq = [] {
+      const char* s = getenv("GDEC_DENSE_LUT_MAXP_DQ");
+      return s && *s ? atoi(s) : 0;
+    }();
+    if (w.dtype == 5 && P >= dlut_minp && P <= maxbatch_cap && !(N % 128) &&
+        K % 4 == 0 && xstride % 4 == 0 && (((uintptr_t)x & 15) == 0) &&
+        (!xbf || ((((uintptr_t)xbf & 15) == 0) && K % 8 == 0))) {
+      const int dlut_maxp = (N == 2560 && K == 6144) ? dlut_d3
+                          : (N == 10240 && K == 2560) ? dlut_d9
+                          : (N == 6144 && K == 2560) ? dlut_dz
+                          : (N == 12288 && K == 2560) ? dlut_dq : 0;
+      const moelut::LutW pdn =
+          lut_q4cp_view(w.data, N, K, w.scale_stride, (int)N, 0);
+      if (dlut_maxp && P <= dlut_maxp &&
+          moelut::lut_ok(moelut::kQ4CP, pdn, false, (int)K)) {
+        static bool dllog = false;
+        if (!dllog) {
+          dllog = true;
+          fprintf(stderr,
+                  "dense lut: q4cp d3<=%d d9<=%d dz<=%d dq<=%d minp=%d "
+                  "(GDEC_DENSE_LUT_MAXP_D3/D9/DZ/DQ, GDEC_DENSE_LUT_MINP)\n",
+                  dlut_d3, dlut_d9, dlut_dz, dlut_dq, dlut_minp);
+        }
+        const int nt = (P + 63) / 64;
+        k_dense_tiles<<<1, 1024, 0, g_str>>>(d_dlut_tiles, d_dlut_nt, P);
+        // x16 借用 d_xbf16b。xbf 调用点（qsa:oproj、fused gdn:oproj）的 f32 x
+        // 是 gate/norm 前的旧值——活输入是 xbf（bf16, packed [P][K]），原地
+        // bf16→f16（值精确）；非 xbf 调用点 x 即活 f32 输入，直接转。
+        __half* x16 = (__half*)d_xbf16b;
+        if (xbf) {
+          const size_t n8 = (size_t)P * K / 8;
+          k_bf16_to_f16_v8<<<(unsigned)((n8 + 255) / 256), 256, 0, g_str>>>(
+              xbf, x16, n8);
+        } else if (xstride == (uint64_t)K) {
+          const size_t n4 = (size_t)P * K / 4;
+          k_f32_to_f16_v4<<<(unsigned)((n4 + 255) / 256), 256, 0, g_str>>>(
+              x, x16, n4);
+        } else {
+          const size_t n4 = (size_t)P * (K / 4);
+          k_f32_to_f16_v4s<<<(unsigned)((n4 + 255) / 256), 256, 0, g_str>>>(
+              x, x16, xstride, P, (int)K);
+        }
+        moe_lut_down(moelut::kQ4CP, pdn, x16, d_dlut_tiles, d_dlut_nt, nt, y,
+                     (int)N, (int)K, g_str);
+        if (prof)
+          p_gemm += std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - pt0)
+                        .count();
+        return;
+      }
     }
     static const bool gemm_dbg = getenv("GDEC_GEMM_DBG") != nullptr;
     if (gemm_dbg)

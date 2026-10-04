@@ -261,6 +261,11 @@ v2 ht 侧：M1 实测 ht_deq 占比 P=256/512/1024/2048 = 19.5/13.3/10.7/4.4%
 方向是把 `gemv_multi` 的 P 上限上推（P≤32 时 gemv 直读仍划算，只调常数）。列为
 后续方向，本次不实现。
 
+**A3 翻案（§11.3，10-04）**：按 P 分流已实现并验证（KLD +0.0004、v2 逐位、ktest
+全过），但引擎实测整体仅 +1.8~2.7%（harness 的 d3 对照是旧配置，引擎 OFF 走更快
+的 k1，真实 d3 ratio ≈1.0），低于 3% 默认开门槛 → **默认关，`GDEC_DENSE_LUT_MAXP_
+{D3,D9,DZ,DQ}` 留存可 opt-in**。详见 §11.3 结果段。
+
 ---
 
 ## 4. B 轨：所有 P 都受益的 kernel 项
@@ -908,6 +913,33 @@ tools/pp_psweep_win.sh`。F1 前基线（v2，健康机器）：
 
 预期：w4b 在 P=1024–2048 时 dense 段快 10–20%，整体 3–6%；P=512 待 A/B。v2 的 ht 不适用，仍按 §10 第 2 条推 `gemv_multi` 的 P 上限。
 
+**结果（10-04）：已实现进引擎，实测整体 +1.8~2.7% < 3% 门槛 → 默认关，env 留存。**
+分流在 `gemm()`（gemv_multi 之后、gemm_wbf16 之前），q4cp(dtype 5) 且形状命中
+(2560,6144)/(10240,2560)/(6144,2560)/(12288,2560) 时走单"专家" `moe_lut_down`
++ `k_dense_tiles`（cap 64，与 mt 的 BN=128 无关）；开关
+`GDEC_DENSE_LUT_MAXP_{D3,D9,DZ,DQ}`（默认全 0=关，opt-in 建议 3200/1200/1600/1400
+= 交叉点 80%）+ `GDEC_DENSE_LUT_MINP`（1024）。新形状 harness 补测（同口径
+RESULT PASS）：dz (6144,2560) 1.18/0.99 @1024/2048（交叉 ~2000）、dq (12288,2560)
+1.12/0.96（交叉 ~1800）。
+**关键坑**：xbf 调用点（qsa:oproj、fused gdn:oproj）的 f32 x 是 gate/norm **前**的
+旧值，活输入是 xbf——首版按 x 转换产出全错（KLD mean 12.7，+11.7% 的 A/B 幻象是
+垃圾 logits 把 MoE 路由打偏）；修复为 xbf 时原地 bf16→f16（`k_bf16_to_f16_v8`，
+m7→m10 精确），非 xbf 仍 f32→f16（`k_f32_to_f16_v4`/`v4s`）。
+验证（修复后同机串行）：KLD w4b c8192@4096（MAXP 强制 4096 触发，逐行数值与 P
+无关）ON 0.121637 vs OFF 0.121246 = **+0.0004 << +0.002** ✓；v2 c512 逐位复现
+0.107066 ✓（v2 无 dtype 5 dense 不触发）；ktest 205 PASS ✓；128k@16384 稳态
+1281.8（默认关不触发，不低于盘上 w4b 历史 ~1140）✓。
+A/B（w4b+overlay，串行）：32k@1024 chunk2+ 稳态 **1135.5 vs 1115.7 = +1.8%**；
+M1b TTFT 中位 P=1024/2048/3000 = **+1.1% / +2.2% / −1.6%**（1024 四形状全触发、
+2048/3000 仅 d3）。KPROF 归因（32k@1024，ms/chunk）：ht_deq 31.4→7.0（−24），
+gdn:proj −15，qsa:proj −4，qsa:oproj ≈0，segsum −19~26（−2.0~2.7%）。
+**不及预期的机制**：harness 的 d3 对照是旧 d3 配置（<64,128,…>），引擎 OFF 路径在
+(2560,6144) 走 k1 配置（BM=64 BP=128，大 P 快 1.3×），真实 d3 ratio ≈1.0 而非
+1.25——qsa:oproj 段实测 ≈0 印证；d9/dz/dq 与 harness 一致（−11% 段级）。
+按 §11.3 门槛（窗口 ≥3% 才默认开）判定**默认关**；代码留存可 opt-in。日志：
+logs/dlut3_{on,off}_32k_c1024.log、dlut3_kp_{on,off}.log、kld_dlut3_on_c4096.log、
+kld_dlut4_v2_c512.log、ttft_dlut{off,on}_run.log、dlut4_128k.log。
+
 ### 11.4 P=2048 稳态下与 gufo 的逐段对照（修正此前"MoE 是追 gufo 的大头"）
 
 口径：w4b，M1-w4b 的 P=2048 一档（第 2、3 个 chunk，深度 2–6K），单位 µs/token；gufo 取 GUFO-GAP.md 的 d0 profile，注意力按 d4K 略上调。
@@ -991,6 +1023,17 @@ tools/pp_psweep_win.sh`。F1 前基线（v2，健康机器）：
 序 6、序 7 的 select f16 向量化已完成（10-03 深夜）：MoE mt 进引擎默认开
 （kernel 段 up −3.9%/down −8.7%，端到端中性，见 §11.5 状态段）；select f16
 向量化 x1.91/x2.22、pp 128k +2.1%（见 §5-C1 末状态段）。
+
+序 3 已闭环（10-04）：A3 按 P 分流实现 + 全验证通过，实测整体 +1.8~2.7% < 3%
+门槛 → 默认关、env 留存（§11.3 结果段）。
+
+序 5 已闭环（10-04）：v2 gemv_multi 分块上推，默认 MAXP=24（P=16 −21~24%、P=24
+−6.4%、P=32 翻负；KLD −0.0012 ✓、w4b 不变）—— §10-2 状态段。
+
+序 4 已闭环（10-04）：D1 复核发现 977ac66 已完整落地（CKPT 协议 + 四 decode 路径
+ckpt_pause + rckpt LRU + API 默认 <tool_call>/</think>）；本轮补 agent 两轮工具
+调用场景（tcache_verify.py run_agent + Windows 驱动），toolcall/agent 全 PASS、
+api_regression 90/90（§6 D1 状态段）。
 
 测量纪律补充：
 

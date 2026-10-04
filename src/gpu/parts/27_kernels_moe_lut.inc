@@ -751,3 +751,14 @@ static moelut::LutW lut_i4r_view(const uint8_t* data, uint64_t rows, uint64_t co
   p.up_off = up_off;
   return p;
 }
+
+// Single-"expert" 64-slot tiles for the dense-LUT dispatch (A3/§11.3):
+// tiles[i] = {0, i*64, min(64, P-i*64)}, *ntiles = ceil(P/64). cap 64 always —
+// the MoE-mt BN=128 variant (moe_lut_down_mt) is the v2 MoE station's, not
+// this path's.
+__global__ void k_dense_tiles(MoeTile* __restrict__ tiles, int* __restrict__ ntiles, int P) {
+  const int i = threadIdx.x;
+  const int n = (P + 63) / 64;
+  if (i == 0) *ntiles = n;
+  if (i < n) tiles[i] = {0, i * 64, min(64, P - i * 64)};
+}

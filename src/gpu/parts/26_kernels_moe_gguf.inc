@@ -395,6 +395,44 @@ __global__ void k_f32_to_f16_v4(const float* __restrict__ x, __half* __restrict_
   o[1] = __floats2half2_rn(v.z, v.w);
 }
 
+// Strided-row variant for the dense-LUT dispatch (A3/§11.3): F32 [P][n] with
+// row stride xs -> packed F16 [P][n] (n % 4 == 0). Same per-element
+// __floats2half2_rn rounding as k_f32_to_f16_v4.
+__global__ void k_f32_to_f16_v4s(const float* __restrict__ x,
+                                 __half* __restrict__ out, uint64_t xs, int P,
+                                 int n) {
+  uint64_t n4 = (uint64_t)n / 4;
+  uint64_t i4 = blockIdx.x * (uint64_t)blockDim.x + threadIdx.x;
+  if (i4 >= (uint64_t)P * n4) return;
+  uint64_t t = i4 / n4;
+  uint64_t c = (i4 - t * n4) * 4;
+  float4 v = *(const float4*)(x + t * xs + c);
+  __half2* o = reinterpret_cast<__half2*>(out + t * n + c);
+  o[0] = __floats2half2_rn(v.x, v.y);
+  o[1] = __floats2half2_rn(v.z, v.w);
+}
+
+// bf16 [n] -> f16 [n] (8 elems/thread; requires n % 8 == 0 and 16B-aligned
+// pointers). bf16 values are exactly representable in f16 within f16's range
+// (m7 -> m10, no rounding). The dense-LUT dispatch converts xbf inputs with
+// this when the f32 pre-image is stale (pre-gate/norm); safe in place
+// (src == dst): each thread reads its own 16B before writing it.
+__global__ void k_bf16_to_f16_v8(const uint16_t* __restrict__ src,
+                                 __half* __restrict__ dst, size_t n8) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n8) return;
+  const uint4 v = reinterpret_cast<const uint4*>(src)[i];
+  __half2* o = reinterpret_cast<__half2*>(dst) + 4 * i;
+  o[0] = __floats2half2_rn(__uint_as_float(v.x << 16),
+                           __uint_as_float(v.x & 0xffff0000u));
+  o[1] = __floats2half2_rn(__uint_as_float(v.y << 16),
+                           __uint_as_float(v.y & 0xffff0000u));
+  o[2] = __floats2half2_rn(__uint_as_float(v.z << 16),
+                           __uint_as_float(v.z & 0xffff0000u));
+  o[3] = __floats2half2_rn(__uint_as_float(v.w << 16),
+                           __uint_as_float(v.w & 0xffff0000u));
+}
+
 // Sort-free routing for tiny P (decode, graph-capturable): one single-slot
 // tile per (token, top-k slot) pair in token-major order, so pairids is the
 // identity and the weighted reduce sums in expert-rank order. Only sensible
