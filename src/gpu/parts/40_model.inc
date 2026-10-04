@@ -545,8 +545,6 @@ struct GpuModel {
       DALLOC(&d_wbf16, (size_t)64 << 20);  // fits q_proj 12288x2560 bf16
       DALLOC(&d_xbf16, BP * 10240 * 2);
       DALLOC(&d_xbf16b, BP * 6144 * 2);  // largest non-cacheable K = 6144
-      DALLOC(&d_dlut_tiles, (BP / 64 + 2) * sizeof(MoeTile));
-      DALLOC(&d_dlut_nt, sizeof(int));
       if (gemm_splitk_on()) DALLOC(&d_skx, BP * 6144 * 2);
       if (prefill_fused) DALLOC(&d_Rhatbf16, BP * 10240 * 2);
       if (prefill_fused) DALLOC(&d_hcsc, BP * 4 * 4);
@@ -606,6 +604,10 @@ struct GpuModel {
         exit(1);
       }
       DALLOC(&d_ltws, lt_ws_bytes);
+      // dlut 小分配一律放 WS 末尾：插在中间会把其后所有缓冲推开（256 B 对齐后
+      // 768 B），gdn/gr 工作区地址敏感（§13.8：P=2048 hc +20 µs/tok 的成因）。
+      DALLOC(&d_dlut_tiles, (BP / 64 + 2) * sizeof(MoeTile));
+      DALLOC(&d_dlut_nt, sizeof(int));
     }
     int nqsa = g_cfg.layers / 4;  // 12
     kv_nl = nqsa + (mtp_kv_wanted() ? 1 : 0);
