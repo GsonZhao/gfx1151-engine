@@ -118,7 +118,7 @@ __launch_bounds__(256) __global__
   using namespace moelut;
   constexpr int BM = 128, BK = 2;
   static_assert(BN == 64 || BN == 128, "BN = MoeTile slots: 64, or 128 for the merged super-tiles (mt)");
-  static_assert(BN == 64 || kLut == kI4R, "BN=128 is validated for kI4R only");
+  static_assert(BN == 64 || kLut == kI4R || kLut == kQ4CP, "BN=128 is validated for kI4R / kQ4CP only");
   static_assert(kLut == kQ4CP || kLut == kIQ4NL || kLut == kIQ4XS || kLut == kI4R, "LUT type");
   static_assert(!kRaw || kPair, "kRaw is a gate/up epilogue");
   static_assert(!kMid || (kLut == kI4R && !kPair && !kF16Pairs), "kMid is the i4r fused up+mid");
@@ -675,6 +675,34 @@ static bool moe_lut_down_mt(const moelut::LutW& p, const __half* hid, const MoeT
   else
     k_moe_lut<moelut::kI4R, false, 128><<<grid, 256, 0, st>>>(p, hid, nullptr, tiles, ntiles, pairs,
                                                              nullptr, m, k);
+  return true;
+}
+
+// w4b q4cp 站的 mt 变体：同一 k_moe_tiles cap=128 合并契约（SHARE=2 固定；
+// 3/4 的 kActFetch 6/8 VGPR 溢出是死路）。q4cp 无 kMid，up 保持 kPair
+// epilogue（silu 融合不变），down 直接移。逐 bit 论证与 i4r 相同：每
+// (slot, row) 的 K 顺序与 wmma 序列与 BN=64 逐字一致。
+static bool moe_lut_up_mt_q4cp(const moelut::LutW& p, const __half* x, const int* tokidx,
+                               const MoeTile* tiles, const int* ntiles, int max_tiles, __half* hid,
+                               int m, int k, hipStream_t st) {
+  if (m % 64 || !moelut::lut_ok(moelut::kQ4CP, p, true, k)) return false;
+  dim3 grid(m / 64, max_tiles);
+  k_moe_lut<moelut::kQ4CP, true, 128><<<grid, 256, 0, st>>>(p, x, tokidx, tiles, ntiles, nullptr,
+                                                            hid, m, k);
+  return true;
+}
+
+static bool moe_lut_down_mt_q4cp(const moelut::LutW& p, const __half* hid, const MoeTile* tiles,
+                                 const int* ntiles, int max_tiles, float* pairs, int m, int k,
+                                 hipStream_t st, bool f16) {
+  if (m % 128 || !moelut::lut_ok(moelut::kQ4CP, p, false, k)) return false;
+  dim3 grid(m / 128, max_tiles);
+  if (f16)
+    k_moe_lut<moelut::kQ4CP, false, 128, false, true><<<grid, 256, 0, st>>>(p, hid, nullptr, tiles,
+                                                                            ntiles, pairs, nullptr, m, k);
+  else
+    k_moe_lut<moelut::kQ4CP, false, 128><<<grid, 256, 0, st>>>(p, hid, nullptr, tiles, ntiles, pairs,
+                                                               nullptr, m, k);
   return true;
 }
 

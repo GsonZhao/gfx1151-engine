@@ -14,11 +14,13 @@
 //   common: [--P N] [--iters N] [--check-experts N] [--seed S] [--tol X]
 //           [--q4perm 1]  hgn only: register-perm codebook decode (A1);
 //                         bit-compared against the s_cbp path, both timed
-//           [--share N]   v2 only: multi-tile shared-decode prototype (§11.5),
-//                         N = 1..4 same-expert tiles per CTA; bit-compared
-//                         against the production kernels, both timed.
-//                         With --mid 1: production-path A/B (up_mid / down-f16
-//                         vs the BN=128 mt variants on merged tiles)
+//           [--share N]   multi-tile shared-decode (§11.5), N same-expert
+//                         tiles per CTA; bit-compared against the production
+//                         kernels, both timed. v2: prototype kernel, N = 1..4;
+//                         with --mid 1: production-path A/B (up_mid / down-f16
+//                         vs the BN=128 mt variants on merged tiles).
+//                         hgn (q4cp): production mt wrappers only, N = 2
+//                         (BN=128; SHARE 3/4 are VGPR dead ends).
 //
 // Routing: random top-10 (distinct experts per token, mildly skewed), like
 // tools/moe_gguf_test.cu. Correctness: outputs are pre-filled with NaN and
@@ -934,7 +936,8 @@ int main(int argc, char** argv) {
   int opt = -1;     // >= 0 (v2 only): prototype kernel with this OPT bitmask
   int fuse_mid = 0; // v2 only: fused up+mid (moe_lut_up_mid) writing hid
   int q4perm = 0;   // hgn only: register-perm codebook decode (A1), A/B bit-compared
-  int share = 0;    // v2 only: multi-tile shared-decode prototype (§11.5), A/B bit-compared
+  int share = 0;    // multi-tile shared-decode (§11.5), A/B bit-compared:
+                    // v2: prototype kernel 1..4; hgn: production mt wrappers, 2 only
   unsigned seed = 1;
   double tol = 1e-2;
   for (int i = 1; i + 1 < argc; i += 2) {
@@ -977,8 +980,9 @@ int main(int argc, char** argv) {
     fprintf(stderr, "--q4perm requires --hgn and no --opt\n");
     return 2;
   }
-  if (share && (v2_path.empty() || opt >= 0 || share > 4)) {
-    fprintf(stderr, "--share N (1..4) requires --v2 and no --opt\n");
+  if (share && ((v2_path.empty() && hgn_path.empty()) || opt >= 0 || share > 4 ||
+                (!hgn_path.empty() && share != 2))) {
+    fprintf(stderr, "--share N (1..4) requires --v2 and no --opt; with --hgn only N=2 (BN=128)\n");
     return 2;
   }
   std::mt19937 rng(seed);
@@ -1234,7 +1238,96 @@ int main(int argc, char** argv) {
   __half* d_hidmid_mt = nullptr;
   __half* d_p16 = nullptr;
   __half* d_p16_mt = nullptr;
-  if (share) {
+  __half* d_hid_mt = nullptr;
+  if (share && !v2) {
+    // q4cp: production mt wrappers (BN=128, engine 27_kernels_moe_lut.inc) on
+    // host-merged super-tiles vs the BN=64 baseline (d_hid / d_pairs were
+    // filled by the initial run above). Independent chains; hid and pairs
+    // (f32 and f16 variants) must all be bit-identical.
+    CK(hipMalloc(&d_hid_mt, (size_t)npairs * MID * 2));
+    CK(hipMalloc(&d_pairs_mt, (size_t)npairs * D * 4));
+    CK(hipMalloc(&d_p16, (size_t)npairs * D * 2));
+    CK(hipMalloc(&d_p16_mt, (size_t)npairs * D * 2));
+    CK(hipMalloc(&d_nmt, 4));
+    CK(hipMalloc(&d_mtiles, (size_t)nmtiles * sizeof(MoeTile)));
+    CK(hipMemset(d_hid_mt, 0xFF, (size_t)npairs * MID * 2));
+    CK(hipMemset(d_pairs_mt, 0xFF, (size_t)npairs * D * 4));
+    CK(hipMemset(d_p16, 0xFF, (size_t)npairs * D * 2));
+    CK(hipMemset(d_p16_mt, 0xFF, (size_t)npairs * D * 2));
+    CK(hipMemcpy(d_nmt, &nmtiles, 4, hipMemcpyHostToDevice));
+    CK(hipMemcpy(d_mtiles, mtiles.data(), (size_t)nmtiles * sizeof(MoeTile), hipMemcpyHostToDevice));
+    const bool launched =
+        moe_lut_up_mt_q4cp(pgu, d_x, d_tok, d_mtiles, d_nmt, nmtiles, d_hid_mt, MID, D, 0) &&
+        moe_lut_down_mt_q4cp(pdn, d_hid_mt, d_mtiles, d_nmt, nmtiles, d_pairs_mt, D, MID, 0,
+                             false) &&
+        moe_lut_down(moelut::kQ4CP, pdn, d_hid, d_tiles, d_nt, max_tiles, (float*)d_p16, D, MID, 0,
+                     true) &&
+        moe_lut_down_mt_q4cp(pdn, d_hid_mt, d_mtiles, d_nmt, nmtiles, (float*)d_p16_mt, D, MID, 0,
+                             true);
+    if (!launched) {
+      fprintf(stderr, "share q4cp: unsupported\n");
+      return 2;
+    }
+    CK(hipGetLastError());
+    CK(hipDeviceSynchronize());
+    bool ok_bits = true;
+    {
+      std::vector<__half> href((size_t)npairs * MID), hmt((size_t)npairs * MID);
+      CK(hipMemcpy(href.data(), d_hid, href.size() * 2, hipMemcpyDeviceToHost));
+      CK(hipMemcpy(hmt.data(), d_hid_mt, hmt.size() * 2, hipMemcpyDeviceToHost));
+      size_t bad = 0, first = SIZE_MAX;
+      for (size_t i = 0; i < href.size(); i++)
+        if (__builtin_bit_cast(uint16_t, href[i]) != __builtin_bit_cast(uint16_t, hmt[i])) {
+          if (first == SIZE_MAX) first = i;
+          bad++;
+        }
+      printf("share%d vs base hid  : %zu / %zu mismatch", share, bad, href.size());
+      if (bad)
+        printf(" (first at slot %zu row %zu: mt %g ref %g)", first / MID, first % MID,
+               h2f(hmt[first]), h2f(href[first]));
+      printf("\n");
+      ok_bits = bad == 0;
+    }
+    {
+      std::vector<float> pref((size_t)npairs * D), pmt((size_t)npairs * D);
+      CK(hipMemcpy(pref.data(), d_pairs, pref.size() * 4, hipMemcpyDeviceToHost));
+      CK(hipMemcpy(pmt.data(), d_pairs_mt, pmt.size() * 4, hipMemcpyDeviceToHost));
+      size_t bad = 0, first = SIZE_MAX;
+      for (size_t i = 0; i < pref.size(); i++)
+        if (__builtin_bit_cast(uint32_t, pref[i]) != __builtin_bit_cast(uint32_t, pmt[i])) {
+          if (first == SIZE_MAX) first = i;
+          bad++;
+        }
+      printf("share%d vs base pairs: %zu / %zu mismatch", share, bad, pref.size());
+      if (bad)
+        printf(" (first at slot %zu row %zu: mt %g ref %g)", first / D, first % D, pmt[first],
+               pref[first]);
+      printf("\n");
+      if (bad) ok_bits = false;
+    }
+    {
+      std::vector<__half> pref((size_t)npairs * D), pmt((size_t)npairs * D);
+      CK(hipMemcpy(pref.data(), d_p16, pref.size() * 2, hipMemcpyDeviceToHost));
+      CK(hipMemcpy(pmt.data(), d_p16_mt, pmt.size() * 2, hipMemcpyDeviceToHost));
+      size_t bad = 0, first = SIZE_MAX;
+      for (size_t i = 0; i < pref.size(); i++)
+        if (__builtin_bit_cast(uint16_t, pref[i]) != __builtin_bit_cast(uint16_t, pmt[i])) {
+          if (first == SIZE_MAX) first = i;
+          bad++;
+        }
+      printf("share%d vs base pairs(f16): %zu / %zu mismatch", share, bad, pref.size());
+      if (bad)
+        printf(" (first at slot %zu row %zu: mt %g ref %g)", first / D, first % D,
+               h2f(pmt[first]), h2f(pref[first]));
+      printf("\n");
+      if (bad) ok_bits = false;
+    }
+    if (!ok_bits) {
+      printf("RESULT FAIL\n");
+      return 1;
+    }
+  }
+  if (share && v2) {
     CK(hipMalloc(&d_guv_mt, (size_t)npairs * 2 * MID * 2));
     CK(hipMalloc(&d_pairs_mt, (size_t)npairs * D * 4));
     CK(hipMalloc(&d_nmt, 4));
@@ -1609,13 +1702,17 @@ int main(int argc, char** argv) {
       for (int it = 0; it < iters; it++) {
         CK(hipEventRecord(e0, 0));
         if (mt) {
-          if (fuse_mid)
+          if (!v2)
+            moe_lut_up_mt_q4cp(pgu, d_x, d_tok, d_mtiles, d_nmt, nmtiles, d_hid_mt, MID, D, 0);
+          else if (fuse_mid)
             moe_lut_up_mid_mt(pgu, d_x, d_tok, d_mtiles, d_nmt, nmtiles, d_hidmid_mt, d_svh, d_suh,
                               MID, D, 0);
           else
             moe_lut_up_mt(share, pgu, d_x, d_tok, d_mtiles, d_nmt, nmtiles, d_guv_mt, MID, D, 0);
         } else {
-          if (fuse_mid)
+          if (!v2)
+            moe_lut_up(t_gu, pgu, d_x, d_tok, d_tiles, d_nt, max_tiles, d_hid, MID, D, 0);
+          else if (fuse_mid)
             moe_lut_up_mid(pgu, d_x, d_tok, d_tiles, d_nt, max_tiles, d_hidmid, d_svh, d_suh, MID,
                            D, 0);
           else
@@ -1623,13 +1720,19 @@ int main(int argc, char** argv) {
         }
         CK(hipEventRecord(e1, 0));
         if (mt) {
-          if (fuse_mid)
+          if (!v2)
+            moe_lut_down_mt_q4cp(pdn, d_hid_mt, d_mtiles, d_nmt, nmtiles, (float*)d_p16_mt, D, MID,
+                                 0, true);
+          else if (fuse_mid)
             moe_lut_down_mt(pdn, d_hid, d_mtiles, d_nmt, nmtiles, (float*)d_p16_mt, D, MID, 0,
                             true);
           else
             moe_lut_down_mt(share, pdn, d_hid, d_mtiles, d_nmt, nmtiles, d_pairs_mt, D, MID, 0);
         } else {
-          if (fuse_mid)
+          if (!v2)
+            moe_lut_down(t_dn_type, pdn, d_hid, d_tiles, d_nt, max_tiles, (float*)d_p16, D, MID, 0,
+                         true);
+          else if (fuse_mid)
             moe_lut_down(moelut::kI4R, pdn, d_hid, d_tiles, d_nt, max_tiles, (float*)d_p16, D, MID,
                          0, true);
           else

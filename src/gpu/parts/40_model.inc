@@ -1651,23 +1651,37 @@ struct GpuModel {
     }
     KP("moe:route");
     moe_routing.run(topids, topw, d_tokidx, d_pweight, d_eoff, d_pairids, P, k, E);
-    k_moe_tiles<<<1, 512, 0, g_str>>>(d_eoff, d_moetiles, d_moentiles, E, 64);
-    const int max_tiles = (P * k + 63) / 64 + E;
+    // §11.5 mt（q4cp 站）：同专家双 64-tile 合并 BN=128，每个 K stage 的权重
+    // 解码一次供两个 tile 半用，逐 bit 不变；默认开，GDEC_MOE_MT=0 回退。
+    // 门槛同 v2：平均每专家 slot >= 80（P=2048 档 v2 实测 −5.2%，小 P 走原
+    // 路径）。w4b 与 v2 不同：moe 在关键路径上（segsum==wall，见 §11.5）。
+    static const bool moe_mt_env = !env_zero("GDEC_MOE_MT");
+    const bool mt = moe_mt_env && (int64_t)P * k >= 80 * E;
+    k_moe_tiles<<<1, 512, 0, g_str>>>(d_eoff, d_moetiles, d_moentiles, E, mt ? 128 : 64);
+    const int max_tiles = mt ? (P * k + 127) / 128 + E : (P * k + 63) / 64 + E;
     __half* x16 = (__half*)d_xbf16b;
     __half* hid = (__half*)d_hidb;
     const size_t n4 = (size_t)P * d / 4;
     k_f32_to_f16_v4<<<(unsigned)((n4 + 255) / 256), 256, 0, g_str>>>(x, x16, n4);
     KP("moe:up");
-    moe_lut_up(moelut::kQ4CP, pgu, x16, d_tokidx, d_moetiles, d_moentiles, max_tiles, hid, mid, d,
-               g_str);
+    if (mt)
+      moe_lut_up_mt_q4cp(pgu, x16, d_tokidx, d_moetiles, d_moentiles, max_tiles, hid, mid, d,
+                         g_str);
+    else
+      moe_lut_up(moelut::kQ4CP, pgu, x16, d_tokidx, d_moetiles, d_moentiles, max_tiles, hid, mid, d,
+                 g_str);
     KP("moe:down");
     // B1 w4b f16 pairs（与 v2 GDEC_V2_PAIRS_F16 同款）：down 写 f16、reduce 读
     // f16（__half2float 精确拓宽，fp32 累加不变），reduce 读流量减半。默认开
     // （KLD 过线后翻转，=0 回退）。w4b_pairs_f16_env 与分配门控
     // guvb_f16_env 语义同步。
     static const bool pairs_f16 = w4b_pairs_f16_env();
-    moe_lut_down(moelut::kQ4CP, pdn, hid, d_moetiles, d_moentiles, max_tiles, d_guvb, d, mid,
-                 g_str, pairs_f16);
+    if (mt)
+      moe_lut_down_mt_q4cp(pdn, hid, d_moetiles, d_moentiles, max_tiles, d_guvb, d, mid, g_str,
+                           pairs_f16);
+    else
+      moe_lut_down(moelut::kQ4CP, pdn, hid, d_moetiles, d_moentiles, max_tiles, d_guvb, d, mid,
+                   g_str, pairs_f16);
     KP("moe:reduce");
     if (ey)
       if (Rhc)

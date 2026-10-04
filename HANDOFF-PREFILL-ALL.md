@@ -14,7 +14,7 @@ PREFILL.md §10–11、GUFO-GAP.md（09-25）、KV 前缀复用遗留（09-26）
 
 | 场景 | 我们 | 参照 | 差距 |
 |---|---|---|---|
-| 128K，chunk 16384 | v2 Win **1484.7**（10-03 深夜，C1-f16 select 向量化 + §11.5 MoE mt 后） / w4b Linux 1446 / GGUF Linux 1451 | halogen 1517 | **~2%** |
+| 128K，chunk 16384 | v2 Win **1484.7**（10-03 深夜，C1-f16 select 向量化 + §11.5 MoE mt 后） / w4b Win **1464.5**（10-04，§11.5 q4cp mt 后） / w4b Linux 1446 / GGUF Linux 1451 | halogen 1517 | **~2%** |
 | 32K，chunk 16384 | v2 Win ~1521 / w4b Linux 1512 | halogen 1567 | ~3% |
 | 8K prompt，chunk 2048 | w4b Linux ~1195（fdf805a，09-25） | gufo d0 1628 | **~36%** |
 | 32K prompt，chunk 2048 | GGUF Linux 1152（09-25） | gufo d32K 1422 | **~20%+** |
@@ -1038,6 +1038,41 @@ kld_dlut4_v2_c512.log、ttft_dlut{off,on}_run.log、dlut4_128k.log。
     kld_v2_mt_selfab.log、mt_{base,on,final}128k.log、mt_kprof_{base,on}.log、
     mt_off32k.log、mt_w4b_smoke.log、kld_mt_w4b_c512.log。
   - **遗留**：q4cp（w4b）的 mt 迁移。
+  - **遗留判定（10-04,w4b 关键路径实测，建议做）**：健康机器 128k@16384 KPROF
+    （logs/m1_moe_w4b_128k.log，生产配方含 GDN_STREAM=1，稳态 7 chunk）：wall
+    11574 ms/16K,segsum 11572 ms,**gap 0.0%**——段间无空转、无流水重叠富余，
+    与 v2"省 147 ms 被流水吸收"的情形本质不同。moeΣ(up+down+reduce+shared)
+    =3471 ms,**占 segsum 30.0%**(gdn 30%、qsa ~22%、hc ~8%)。零吸收空间
+    意味着 moe kernel 省时 1:1 兑现为 pp 省时。按 v2 mt 的相对幅度
+    (up −3.9%/down −8.7%）折算 w4b up+down ~3.2–3.3 s/16K，预期 −150~250
+    ms/16K ≈ **稳态 pp +1.5~2.5%**;A1 结论（解码 VALU 在关键路径）同样支持
+    LDS 摊薄方向。约半天工作量（v2 已有 k_moe_tiles cap / BN=128 机制，只移
+    q4cp 分支），可 A/B、可加开关，风险低。建议做，排当前优化批前列。
+  - **q4cp mt 已完成（10-04，w4b 站，默认开，`GDEC_MOE_MT=0` 回退）**：
+    只动三处——`k_moe_lut` static_assert 放宽 BN=128 到 kQ4CP（kernel 主体
+    本就 BN 泛型，q4cp 无 kMid 平面布局问题）；新 wrapper
+    `moe_lut_up_mt_q4cp`（kPair epilogue 不变）/ `moe_lut_down_mt_q4cp`
+    （f32/f16 pairs 两版）；`moe_q4w_run` 加分流，门槛与 v2 同
+    （`P*k >= 80*E`，P=4096 起）。IQ/GGUF 分支未动。
+    **验证（健康机器，全过）**：microbench（`moe_lut_test --hgn --share 2`，
+    生产 kernel 直调，hid + pairs f32/f16 三缓冲全 0 mismatch）：
+    P=16384 **+13.7%**（up +14.2/down +12.8）、8192 +13.2%、4096 +8.3%、
+    2048 +1.2%（q4cp 的 LUT 解码摊薄收益远大于 v2 的算术解码，2048 不亏，
+    门槛保留 80*E 偏保守）。KLD：c512 对改前存档（logs/kld_w4b_mt_pre.kld）
+    **mean=-0.000000、p999=0.000052、same_top=100.000**（该 P 不激活 mt，
+    验整体无漂移）；c8192 mt-on vs 同二进制 `GDEC_MOE_MT=0`（mt 激活）
+    **mean=0.000000、p999=0.000049、same_top=100.000、ppl 逐位同**
+    ——tile 合并逐 bit 等价坐实。pp 128k@16384 同二进制 A/B（n=7 稳态）：
+    off 1422.0 → on **1464.5（+3.0%）**；KPROF 稳态 chunk：moe:up
+    1807.7→1557.2（**−13.9%**）、moe:down 1060.5→938.5（**−11.5%**），省
+    372 ms/16K，wall 11527→11193（−334 ms，~90% 兑现，segsum==wall 仍成立）。
+    v2 回归 c512 **0.107066 逐位复现**（v2 代码未动）；2k（默认 chunk 8192）
+    1194.2 与历史 1195.7/1197.5 一致（门槛以下走原路径无回归）；ktest ALL
+    PASS。w4b 128k 稳态因此站上 1464.5，对 v2 的 1484.7 只差 1.4%。
+  - 日志：kld_w4b_mt_pre.{kld,log}（改前基线 8.1GB）、kld_w4b_mt_c512.log、
+    kld_w4b_mt_{off,on}_c8192.{kld,log}、w4b_mt_{off,on}128k.log、
+    w4b_mt_2k_d8192.log、kld_mt_v2_c512.log、build_mt_w4b.log、
+    ktest_mt_w4b.log。
 
 ### 11.6 修订后的优先级（覆盖 §10 的顺序，§10 各条内容仍有效）
 
