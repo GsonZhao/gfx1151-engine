@@ -579,6 +579,21 @@ checkpoint。于是回退到上一次 prompt 结尾（rckpt 最小 4096、最多
 验证：在 `tools/tcache_verify.sh` 里加一个 agent 回放场景（两轮工具调用），要求第二轮的
 `cached` 覆盖到 `<tool_call>` 处。
 
+**状态（10-04 复核：功能已在 977ac66 落地，本轮补 agent 覆盖与 Windows 验证）**：
+引擎侧 CKPT 协议（GEN 行 `CKPT <n> <ids>`，51_host_cfg.inc:1714 解析）+ 全部四条
+decode 路径的 ckpt_pause（串行/MTP-greedy/MTP-采样/ngram-chain：emit 在发送前暂停、
+spec 轮回滚、MTP 边界配对后存点，51:2507-2538）+ rckpt LRU 上限（GDEC_RCKPT_MAX=8，
+池压淘汰，49_rckpt.inc）；API 侧 `default_ckpt_tokens()` = `<tool_call>`(248058) /
+`</think>`(248069)（GDEC_CKPT_TOKENS=0 关）。本轮新增：`tools/tcache_verify.py`
+`run_agent`（两轮工具调用，第三轮 `cached` 须 ≥ 第二轮 prompt+100，即命中第二个
+`<tool_call>` 检查点）+ Windows 驱动 `tools/agent_tcache_verify_win.sh`（Linux 版
+tcache_verify.sh 依赖 ss/start_hgn.sh --check，Windows 不可用）。
+Windows 实测（w4b，GDEC_RCKPT_MIN=200）：toolcall PASS（cached 2258 ≥ 744+100）、
+agent r1 PASS（1713 ≥ 843+100）、agent r2 PASS（2782 ≥ 1801+100），引擎日志
+`ckpt: saved ... (before token 248058/248069)` 三轮六次齐；api_regression_test
+**90/90 PASS**（fake engine + gdec-api-win，logs/api_regression.log）。
+引擎/API 源码零改动（不需要）；runner 日志 logs/agent_verify_run.log。
+
 ### D2. TokenCache 落盘
 
 TokenCache 只在 API 进程内存里（4M token / 64 条）。服务重启或条目被淘汰后，老的长对话会按

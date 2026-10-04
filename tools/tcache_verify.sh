@@ -8,6 +8,8 @@
 # 文本：采样生成长回复后追问，要求整段复用；视觉：文本历史后发图、再加第二张图都要复用，
 # 换掉图 1 的像素则不能复用图片 KV。toolcall：float 参数的工具调用回填后追问，
 # 要求命中 <tool_call> 处的 mid-decode 检查点而非退回上轮 prompt 末尾。
+# agent：两轮工具调用（温度+气压），第三轮 cached 须越过第二轮 prompt 末尾、
+# 命中 <tool_call> #2 检查点（验证连续两轮的 mid-decode 检查点都生效）。
 # persist：种子轮后重启缓存 ON 的 API（同一 GDEC_API_TOKCACHE_FILE），追问仍须整段复用。
 # 耗时约 5–10 分钟（加载 ~1 分钟 + 长回复解码）。
 # 最后一行：TCACHE VERIFY: PASS 或 FAIL。

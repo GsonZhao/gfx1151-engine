@@ -229,6 +229,104 @@ def run_toolcall(a):
     return ok
 
 
+def run_agent(a):
+    # Agent replay: TWO tool-call rounds. Round 2 emits a second <tool_call>
+    # (own mid-decode ckpt); round 3's cached must reach past the round-2
+    # prompt end (the second ckpt), not stop at round 1's.
+    ok = True
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "log_temperatures",
+            "description": "把一组温度读数写入监控系统",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "readings": {"type": "array",
+                                 "items": {"type": "number"},
+                                 "description": "温度读数列表"},
+                    "unit": {"type": "string", "description": "单位，如 celsius"},
+                },
+                "required": ["readings", "unit"],
+            },
+        },
+    }, {
+        "type": "function",
+        "function": {
+            "name": "log_pressures",
+            "description": "把一组气压读数写入监控系统",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "readings": {"type": "array",
+                                 "items": {"type": "number"},
+                                 "description": "气压读数列表"},
+                    "unit": {"type": "string", "description": "单位，如 kpa"},
+                },
+                "required": ["readings", "unit"],
+            },
+        },
+    }]
+    system = ("你是严谨的运维数据助手，调用工具前必须逐步分析读数的合理性。" * 20)
+    user1 = ("上午的温度读数是 3.50、2.800、11.0 摄氏度。请先详细分析这组读数"
+             "（逐项说明是否合理、波动意味着什么），然后用 log_temperatures "
+             "工具把原始数值原样记录进去。")
+    msgs = [{"role": "system", "content": system}, {"role": "user", "content": user1}]
+    print("[agent] 第 1 轮：诱导长 thinking + <tool_call> #1 ...", flush=True)
+    o1 = post(a.on, {"messages": msgs, "tools": tools,
+                     "max_tokens": a.max_tokens, "temperature": 0})
+    p1, c1, _ = usage(o1)
+    tcs1 = o1["choices"][0]["message"].get("tool_calls") or []
+    print(f"[agent]   prompt {p1}，生成 {c1} token，tool_calls={len(tcs1)}，"
+          f"{o1['_secs']:.0f}s", flush=True)
+    if not tcs1:
+        print("INFO 第 1 轮没有工具调用，agent 场景跳过（不算失败）")
+        return ok
+
+    user2 = ("同一设备的气压读数是 101.325、98.70、100.1250 千帕。请同样逐项详细"
+             "分析（哪些偏离标准大气压、可能什么原因），然后用 log_pressures "
+             "工具把原始数值原样记录进去。")
+    msgs2 = msgs + [assistant_msg(o1),
+                    {"role": "tool", "tool_call_id": tcs1[0]["id"],
+                     "content": "{\"ok\": true}"},
+                    {"role": "user", "content": user2}]
+    print("[agent] 第 2 轮（结果 #1 回填）：诱导长 thinking + <tool_call> #2 ...",
+          flush=True)
+    o2 = post(a.on, {"messages": msgs2, "tools": tools,
+                     "max_tokens": a.max_tokens, "temperature": 0})
+    p2, c2, k2 = usage(o2)
+    tcs2 = o2["choices"][0]["message"].get("tool_calls") or []
+    print(f"[agent]   prompt {p2}，cached {k2}，生成 {c2} token，"
+          f"tool_calls={len(tcs2)}，{o2['_secs']:.0f}s", flush=True)
+    ok &= check(k2 >= p1 + 100, "agent-ckpt-reuse-r1",
+                f"第 2 轮 cached {k2} >= 第 1 轮 prompt {p1}+100"
+                if k2 >= p1 + 100 else
+                f"第 2 轮 cached {k2} 只到第 1 轮 prompt 附近（{p1}）")
+    if not tcs2:
+        print("INFO 第 2 轮没有工具调用，agent 场景第 3 轮跳过（不算失败）")
+        return ok
+
+    msgs3 = msgs2 + [assistant_msg(o2),
+                     {"role": "tool", "tool_call_id": tcs2[0]["id"],
+                      "content": "{\"ok\": true}"},
+                     {"role": "user", "content": "两条都记好了吗？一句话回答。"}]
+    o3 = post(a.on, {"messages": msgs3, "tools": tools,
+                     "max_tokens": 16, "temperature": 0})
+    p3, _, k3 = usage(o3)
+    print(f"[agent] 第 3 轮（结果 #2 回填）：prompt {p3}，cached {k3}，"
+          f"{o3['_secs']:.1f}s", flush=True)
+    # The round-2 float arguments re-serialize differently on the text round
+    # trip; without the SECOND <tool_call> checkpoint the splice falls back to
+    # the round-2 prompt end (or round 1's ckpt), both < p2.
+    ok &= check(k3 >= p2 + 100, "agent-ckpt-reuse-r2",
+                f"第 3 轮 cached {k3} >= 第 2 轮 prompt {p2}+100（越过第二轮 "
+                "thinking，命中 <tool_call> #2 检查点或整段复用）"
+                if k3 >= p2 + 100 else
+                f"第 3 轮 cached {k3} 只到第 2 轮 prompt 附近（{p2}），"
+                "<tool_call> #2 检查点没生效")
+    return ok
+
+
 def run_persist_seed(a):
     system = ("你是资深 Linux 运维工程师。" * 30)
     user1 = "详细解释 ext4 的日志模式（ordered/writeback/journal），各给一个适用场景。"
@@ -265,7 +363,8 @@ def main():
     ap.add_argument("--max-tokens", type=int, default=6000)
     ap.add_argument("--state", default=None, help="persist scenario transcript file")
     ap.add_argument("--only",
-                    choices=["text", "vision", "toolcall", "persist1", "persist2"])
+                    choices=["text", "vision", "toolcall", "agent", "persist1",
+                             "persist2"])
     a = ap.parse_args()
     ok = True
     if a.only in (None, "text"):
@@ -274,6 +373,8 @@ def main():
         ok &= run_vision(a)
     if a.only in (None, "toolcall"):
         ok &= run_toolcall(a)
+    if a.only in (None, "agent"):
+        ok &= run_agent(a)
     if a.only == "persist1":
         ok &= run_persist_seed(a)
     if a.only == "persist2":
