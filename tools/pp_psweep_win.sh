@@ -28,6 +28,109 @@ elif [[ -n "${NGRAM_FILE:-}" ]]; then
     MODEL_ARGS+=("$NGRAM_FILE")
 fi
 
+# ---- MODE=incr：M1b 增量档（§11.2）：base≈32K 多轮续写 ----
+# 真实多轮形态：请求 1 = user(base≈32K) max_tokens=1，取回生成文本 r1；
+# 请求 2 = [user(base), assistant(r1), user(新增 P)] —— 请求 1 的完整 prompt+生成
+# 是请求 2 的严格前缀 → 引擎 live-mcp cont 路径命中，只 prefill 新增段。
+# 每档 rep0 在 base 后紧跟（live 路径），rep1 同 prompt 重发（快照路径参照）。
+# 记录请求 2 的 wall / usage.cached_tokens。--maxctx 49152。
+# 用法: MODE=incr TAG=w4b INCR_SIZES="256 1024 4096" bash tools/pp_psweep_win.sh
+if [[ "${MODE:-}" == "incr" ]]; then
+  TTAG="${TAG:-w4b}"
+  SIZES="${INCR_SIZES:-256 1024 4096}"
+  IBASE="${INCR_BASE:-32768}"
+  IMAXCTX=49152
+  ENGINE_LOG="logs/incr_engine_${TTAG}.log"
+  API_LOG="logs/incr_api_${TTAG}.log"
+  mkdir -p logs
+  env GDEC_KPROF=1 GDEC_PROF=1 \
+      GDEC_QSA_KV_BF16=1 GDEC_QSA_WMMA=1 GDEC_QSA_WMMA_BTV=1 \
+      GDEC_MOE_LT=1 GDEC_MOE_LT_BF16=1 GDEC_GR_BF16=1 \
+      GDEC_GDN_STREAM=1 GDEC_GDN_WAVE=1 \
+      GDEC_PREFILL_CHUNK=16384 GDEC_GEMM_WMMA=1 GDEC_GDN_FUSED=1 \
+      GDEC_INDEX_FUSED2=1 GDEC_PP_MOE_OUT=1 GDEC_INDEX_STREAM_SELECT=1 \
+      build/gdec-win "${MODEL_ARGS[@]}" \
+      --serve --host 127.0.0.1 --port 8730 --maxctx $IMAXCTX >"$ENGINE_LOG" 2>&1 &
+  EPID=$!
+  incr_cleanup() {
+    kill $APID $EPID 2>/dev/null
+    taskkill //PID $APID //F //T >/dev/null 2>&1
+    taskkill //PID $EPID //F //T >/dev/null 2>&1
+  }
+  APID=''
+  trap incr_cleanup EXIT
+  begin=$SECONDS
+  until grep -q 'serve: listening' "$ENGINE_LOG" 2>/dev/null; do
+    kill -0 $EPID 2>/dev/null || { tail -n 15 "$ENGINE_LOG" >&2; exit 1; }
+    (( SECONDS - begin < 300 )) || { echo "引擎启动超时" >&2; exit 1; }
+    sleep 2
+  done
+  build/gdec-api-win.exe --tokenizer models/tokenizer \
+      --engine 127.0.0.1:8730 --host 127.0.0.1 \
+      --port 8731 --context $IMAXCTX >"$API_LOG" 2>&1 &
+  APID=$!
+  begin=$SECONDS
+  until netstat -an | grep -E '[:.]8731\s+.*LISTENING' >/dev/null 2>&1; do
+    kill -0 $APID 2>/dev/null || { tail -n 15 "$API_LOG" >&2; exit 1; }
+    (( SECONDS - begin < 30 )) || { echo "API 启动超时" >&2; exit 1; }
+    sleep 1
+  done
+  SIZES="$SIZES" IBASE="$IBASE" TTAG="$TTAG" python - <<'EOF'
+import json, os, statistics, sys, time, urllib.request
+sys.path.insert(0, "tools")
+from yarn_ladder import build_prompt, chat
+
+base = "http://127.0.0.1:8731"
+sizes = [int(x) for x in os.environ["SIZES"].split()]
+ibase = int(os.environ["IBASE"])
+tag = os.environ["TTAG"]
+
+def chat_msgs(msgs, max_tokens):
+    body = {"model": "gdec", "messages": msgs, "temperature": 0.0,
+            "max_tokens": max_tokens, "stream": False}
+    req = urllib.request.Request(
+        base + "/v1/chat/completions", data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"}, method="POST")
+    t0 = time.time()
+    with urllib.request.urlopen(req, timeout=7200) as resp:
+        out = json.loads(resp.read())
+    return out, time.time() - t0
+
+def usage_of(out):
+    u = out.get("usage") or {}
+    return (u.get("prompt_tokens") or 0,
+            (u.get("prompt_tokens_details") or {}).get("cached_tokens") or 0)
+
+warm, _ = build_prompt(f"warm-incr-{tag}", 64, [], "w")
+chat(base, warm, 1)
+
+btext, _ = build_prompt(f"incrbase-{tag}", ibase, [], "i")
+print("\n==== M1b 增量档（多轮: base≈32K + 新增 P, max_tokens=1）====")
+print("\t".join(["P", "rep", "tokens", "cached", "new", "TTFT ms", "new-tok/s"]))
+for p in sizes:
+    dtext, _ = build_prompt(f"incrdelta-{tag}-{p}", p, [], "d")
+    for r in range(2):
+        # 请求 1：base（重建 live 前缀），max_tokens=1 拿生成文本
+        out1, dt1 = chat_msgs([{"role": "user", "content": btext}], 1)
+        pt1, ct1 = usage_of(out1)
+        r1 = ((out1.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+        if r == 0:
+            print(f"base: tokens={pt1} cached={ct1} wall={dt1*1000:.0f} ms "
+                  f"({pt1/dt1:.0f} tok/s) reply={r1!r:.20}", flush=True)
+        # 请求 2：多轮续写，新增 P
+        msgs = [{"role": "user", "content": btext},
+                {"role": "assistant", "content": r1},
+                {"role": "user", "content": dtext}]
+        out2, dt2 = chat_msgs(msgs, 1)
+        pt2, ct2 = usage_of(out2)
+        new = pt2 - ct2
+        print("\t".join([str(p), str(r), str(pt2), str(ct2), str(new),
+                         f"{dt2*1000:.0f}", f"{new/dt2:.0f}"]), flush=True)
+EOF
+  rc=$?
+  exit $rc
+fi
+
 # ---- MODE=ttft：M1b 单 chunk TTFT（§11.2）----
 if [[ "${MODE:-}" == "ttft" ]]; then
   TTAG="${TAG:-v2}"
