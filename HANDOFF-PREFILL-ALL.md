@@ -645,6 +645,7 @@ TokenCache 只在 API 进程内存里（4M token / 64 条）。服务重启或�
 | select_2p 调参、fused FEAT=8 | 已在流率上 / 整体 0.3% | V2-PREFILL |
 | idx hist 融进打分 | 128K 1.3%，估算误差 ±2×，可能净负 | V2-PREFILL |
 | k_moe_lut BK=4、每 wave 2 个 A 片段 | VGPR 169/156，occupancy 回退 | V2-PREFILL §4 |
+| q4cp mt SHARE=3/4（BN=192/256） | 逐 bit 全过但 −123%/−120%（VGPR 0 spill 不是死因；occupancy 9→7→5 waves/SIMD，CTA 驻留塌缩） | 本文 §13.7；logs/share34_build.log |
 | kMid 原方案 BM=256 | VGPR 101→156，up +8.5% | V2-PREFILL §3 |
 | 旧 MoE WMMA 原型（09-21） | 已被 LUT kernel 取代 | PREFILL §11.2 |
 | MoE f16 输入（取自 hc_up_fused） | buffer 冲突，~17 ms | PREFILL-NEXT |
@@ -1181,3 +1182,258 @@ logs/kprof_batchfirst_u262144_32k.log（32k 快检：稳态 1507、gdn:proj 1417
 256K paged +13.0%、bench 默认 +19.6%、四口径收敛。按 maxctx 条件化摆放顺序（小 maxctx
 用旧顺序拿回 1464.5）**不做**：交叉点约 maxctx ≈ 150k（旧布局批缓冲每 +1 GiB 掉 ~10%，
 +5.21 GiB 对应 +122880 ctx），全部基于经验抽签、机理未解，过于脆弱。
+
+---
+
+## 13. mt + 布局修复后的段级预算（10-04 晚，HEAD 2f49635）
+
+口径：pp_win maxctx 139264、n=7 剔前 2（c8k 档 n=15）、KPROF=1、机器健康（v2 探针
+1479.3 vs 旧布局 1484.7 = −0.4% 噪声，布局修复对 v2 中性）。脚本 logs/kprof2_analyze.py。
+
+### 13.1 128k@16384 稳态预算（ms/16K chunk，n=7）
+
+| 段 | w4b | w4b % | v2 | v2 % |
+|---|---|---|---|---|
+| gdn | 3394.7 | 28.9 | 3431.8 | 30.8 |
+| qsa | **3130.3** | **26.6** | 2479.0 | 22.2 |
+| moeΣ（up+down+reduce+shared+route+misc） | 3336.9 | 28.4 | 3286.5 | 29.5 |
+| hcΣ（hc+hc2+hc3） | 1887.7 | 16.1 | 1878.6 | 16.9 |
+| segsum | 11761.2 | | 11148.4 | |
+
+子段大头（w4b）：**qsa:flash 1803.7（15.3%）**、hc+hc2 1780.6、moe:up 1546.7、
+gdn:proj 1435.5、moe:down 925.3、gdn:oproj 779.2、gdn:scan 743.6、qsa:idx 517.9。
+mt 后 moeΣ 占比 30.0%→28.4%；qsa 22%→26.6%（flash 被布局抬高，见 13.2）。
+**segsum ≈ wall（gap ≤0.2%，v2 同）**——两权重都无流水空转，hipGraph 维持否决。
+
+### 13.2 qsa:flash 的地址剂量响应（本次最重要的发现）
+
+128k 稳态 qsa:flash（同一 kernel，µs/tok）随 KV 在 arena 内的绝对地址：
+
+| 配置 | KV 地址区间 | flash µs/tok |
+|---|---|---|
+| w4b 旧布局（m1_moe_w4b_128k） | 68.1–73.9 GiB | 72.3 |
+| v2 新布局（权重 62.1 GiB） | 75.1–80.2 GiB | 73.6 |
+| w4b 新布局 **chunk 8192** | ~74.1–80.0 GiB | 72.7 |
+| w4b 新布局 chunk 16384 | 81.0–86.1 GiB | **110.1** |
+| w4b paged 270336 chunk 8192（128k 只填半池） | ~74.1–85.4，触及 ≤~80.2 | 78.4 |
+
+拐点在 **80.2–81.0 GiB 之间**，非常锐利。moe/gdn/hc 在 62–80 GiB 区间不敏感（gdn:proj
+两布局均 ~1435/16K；hc 的 P=2048 异常见 13.3 已排除地址）。纯读带宽探针全程平坦
+（§12）——是 kernel 级地址敏感（L2 散列/内存分区，未定论），不是带宽慢区。
+这解释了 §12 的 139264 回归构成：chunk2 相同、晚 chunk 衰减更快 = flash 随 base 增大
+读更多高地址 KV。也解释了 v2 为什么不受影响（KV 顶点 80.2 GiB，恰好在拐点下）。
+
+**chunk 8192 把批缓冲减半（11.9→~6 GiB），KV 整体落回拐点以下**（devarena estimate
+90.68→83.81 GiB）。128k 稳态（无 KPROF）：
+
+| 口径 | chunk 16384 | chunk 8192 | Δ |
+|---|---|---|---|
+| unpaged 139264 | 1415.3 | **1440.3** | **+1.8%** |
+| paged 270336（生产 256K） | 1412.2 | **1426.7** | **+1.0%** |
+
+c8k 的代价（KPROF µs/tok）：moe:up +6.0、moe:down +2.6、hc×2 +10.2、gdn:proj +3.5，
+被 flash −37.4、idx −4.8 覆盖。注意：c8k 数字是 128k 负载；**全量 262144 prefill 的
+尾段 KV 仍会越过 80 GiB**（c8k 只能把起点压低），bench 的 262144 档可能部分回吐——
+生产切换 chunk 前须复测 bench 默认。
+
+### 13.3 P=2048 稳态对 gufo（§11.4 表重做，µs/tok，chunk 2-3 均值）
+
+wall 1675.0 / segsum 1674.1 / gap 0.1%，tok/s **1222.8**（M1 口径；F1 后 M1b TTFT
+口径 1220 一致）。
+
+| 段 | §11.4 旧 | 新 | gufo | 新差 |
+|---|---|---|---|---|
+| 路由 MoE（up+down） | 237 | 234 | 233（整段） | ≈ |
+| MoE reduce + route | 33 | **22** | 0 | +22（B1 后缩小） |
+| dense + HC + shared（含反量化） | 377 | **414** | ~310 | **+104** |
+| 注意力 + indexer | 74 | 74 | ~37–45 | +30~37 |
+| GDN 核心（scan/conv/norm） | 73 | 73 | 63 | +10 |
+| 合计 | 796 | 817 | ~657 | +160（+24%） |
+
+缺口结构变化：moe 已平、reduce+route 减半（B1）；**dense+HC+shared 反而扩大**——
+其中 hc+hc2 从 131 涨到 **163 µs/tok（+32）**，dense gemm 212 与 shared/misc 39 不变。
+hc 异常已做两次排除：GDEC_PAD_BATCH=3GiB（批缓冲 68.1→71.1 GiB）hc 不变
+（158.3 vs 160.6）→ **不是地址**；GDEC_W4B_PAIRS_F16=0 hc 不变（160.6）→ **不是 B1**
+（B1 该档真实净收益仍在：reduce 28→17、down −6，on 比 off +1.7%）。未定位，嫌疑是
+M1 之后其它改动或跨日机器态（M1 跑在 10-03 晨，降级开始前）。
+注意 pad 实验的 wall 被 PLE 污染（统一内存，+3 GiB 设备分配挤压页缓存，ple_wait
+3872 ms、hc3 吸收），只有段级对照有效。
+
+### 13.4 下一步候选（按预期收益/工作量）
+
+1. **chunk 8192 作为长上下文工作点**（配置级，零代码）：128k 稳态 +1.0~1.8%（13.2 表）。
+   前置：复测 bench 默认（262144 档尾段 KV 越界可能回吐）与 M1b TTFT 两档；
+   顺带省 ~7 GiB arena。生产 serve 切换 = service.conf 一行。（→ 13.5 已验证：**不建议切换**）
+2. **80 GiB 拐点根因**（研究项）：若可解，128k +4~5%，256K 生产更多（KV 尾在 91 GiB，
+   flash 惩罚随 base 增长）。第一步：k_qsa_wmma 固定形状对 GDEC_PAD_BATCH 0/1.5/3 GiB
+   微扫确认拐点位置 + 查 Strix Halo 内存拓扑（通道交织/分区）。风险：可能是硬件/驱动
+   不可控，届时 c8k（候选 1）就是兜底。（→ 13.6 已查：边界坐实但单机探针复现不了，
+   机理未定位；BIOS 调 frame buffer 是下一步）
+3. **q4cp mt share=3/4**（§11.5 延续）：moe:up+down 2472 ms/16K；v2 proto SHARE=1..4
+   已逐 bit，q4cp 只落了 share=2。预期 −100~200 ms/16K ≈ +1~1.5%，小工作量。
+   （→ 13.7 已验证：**否决**，逐 bit 全过但 −120%）
+4. **P=2048 hc +32 µs/tok 排查**：先同机复测 M1 档排除漂移，再二分 M1 后的改动。
+   占 P=2048 对 gufo 新增缺口的 ~1/3。小-中工作量。
+   （→ 13.8 已定位+修复：06fb1d7 的两个 dlut DALLOC 位移 WS 768 B，arena 地址摆放敏感，
+   与代码路径无关；已挪到 WS 末尾，hc 158.5→150.9，128k 侧 −1.2% 抽签折中见 13.8）
+5. qsa:idx 底（iproj ~130 + select ~140 + norm/gather，128k 占 4.4%）：f16 已做，
+   剩余空间有限；gdn:scan 已被 C2 原型否决；hc 链 B2-1/B2-2 已否决，无新抓手。
+
+日志：logs/kprof2_w4b_128k.log、kprof2_v2_128k.log、pp2_v2_128k.log（1479.3）、
+kprof2_w4b_128k_c8k.log、pp2_w4b_128k_c8k.log（1440.3）、
+kprof2_w4b_128k_paged256k_c8k.log、pp2_w4b_128k_paged256k_c8k.log（1426.7）、
+m1_w4b_mt2_p2048.log（1222.8）、m1_w4b_mt2pad3g_p2048.log（pad 排除）、
+m1_w4b_mt2nof16_p2048.log（B1 排除）、adbg2_{w4b,v2}_139264.log（地址地图）、
+logs/kprof2_analyze.py（段级汇总脚本）。
+
+### 13.5 候选 1 验证：chunk 8192 前置复测（10-04 深夜，结论：不建议切换）
+
+bench 默认口径（paged 262144 全行程，与 §12 的 1409.7 同机相邻，logs/bench_c8k_default.log）：
+
+| 档 | @16384 | @8192 | Δ |
+|---|---|---|---|
+| 2048 / 2051 / 2052（TTFT 类） | 1226.1 / 1216.9 / 1206.7 | 1212.4 / 1227.9 / 1209.2 | ±1%，平 |
+| 8192 | 1349.7 | 1344.4 | −0.4% |
+| 32768 | 1403.6 | 1430.1 | **+1.9%** |
+| 65536 | 1459.6 | 1443.3 | −1.1% |
+| 131072 | 1433.1 | 1416.3 | −1.2% |
+| 262144（KV 尾越界档） | 1394.4 | 1375.2 | −1.4% |
+| **加权 avg** | **1409.7** | **1395.0** | **−1.0%** |
+
+- 2K 短 prompt 无回归 ✓（±1% 噪声内；结构上 ≤8192 的 prompt 在两种 chunk 下都是单 chunk）。
+- 128k 档两口径矛盾：直连 270336 paged +1.0%（1426.7 vs 1412.2）vs bench 262144 档 −1.2%。
+  未逐项排除 env 差异（KVSNAP/MTP/NOWARMUP/token 源），量级都在 ±1.2% 内。
+- 64K 档 c8k −1.1% 是纯 chunk 效率损失（该档 KV 本来就在拐点下，flash 无收益可抵）。
+- **结论：默认 PREFILL_CHUNK 保持 16384。** c8k 的收益只在"KV 整体压到拐点下"的负载成立，
+  全口径加权反而 −1.0%。等拐点机理（13.6）有解后再重新评估。
+
+### 13.6 候选 2 调查：80 GiB 拐点（边界坐实，单机探针复现失败，机理未定位）
+
+证据链（全部健康机器、背靠背）：
+
+1. **系统拓扑**：gpu-info-x64 报 Dedicated VRAM **74.43 GB** + Shared RAM 37.22 GB
+   （合计 111.65 GiB；host 物理 63.65 GB）。dedicated + arena 外设备分配（Lt/rocblas
+   工作区等 ~6 GiB）≈ 80.4 GiB —— 与实测拐点位置（79.6–80.6）吻合。
+2. **引擎细扫**（32k@c8k，KV 块 ~1.7 GiB，GDEC_PAD_BATCH 4–12 GiB 逐档，n=3 稳态）：
+   - flash：KV 块 78.1–79.6 GiB 时 57.2 µs/tok；79.1–80.6 时跳到 65.9（**+15% 阶跃**），
+     之后到 86.1 平台。拐点在 79.6–80.6 之间。
+   - gdn:proj：批缓冲 ≤81.1 顶时 90–92 µs/tok 不变；顶到 82.1 起 **+48% 渐变劣化**，
+     顶到 86.1 时 +74%（随越界比例爬升）。
+   - 两类 kernel 都在 ~80 GiB 处劣化（flash 阶跃、gemm 渐变）→ 是内存系统级边界，
+     不是单 kernel 怪癖。日志 logs/sweep32_g{4,5,5.5,6,6.5,7,8,10,12}.log
+     （pad5.5/pad8 两档 segsum 有离群，flash/gdn:proj 读数不受影响）。
+3. **单机探针否决"地址区域本身慢"**：arenaoffprobe（92 与 95 GiB 单分配）流读模式
+   0–94 GiB 平坦 224–237 GB/s；新增**散射模式**（4 KiB 页序按质数步长打散，模拟
+   TLB 压力）同样全程平坦（~440–450 等效 GB/s，tools/winprobe/arenaoffprobe.cpp
+   加了 mode 参数）。**单独分配没有慢区** → 拐点只在引擎真实形态（多重分配竞争 /
+   访问老化 / 驱动映射策略）下出现，微观机理未定位。日志
+   logs/arenaoff2_{stream92,scatter92,scatter95}.log。
+
+**经验规则**（5 个独立配置点支持，可依赖）：热数据（批缓冲 + 活跃 KV）压到 arena
+offset **≤ ~79.5 GiB**。v2 天然满足（KV 顶 80.2），所以布局修复对它中性。
+
+**可试的系统性规避**：
+- **BIOS 提高 UMA frame buffer**（需用户操作、重启）：当前 dedicated 74.43 GB；
+  Strix Halo BIOS 一般有更高档。若拐点随之上移，分区理论坐实，且 256K 的 KV 可整体
+  落入快区（预计 128k +4~5%，256K 更多）。代价：host RAM 从 63.65 缩到 ~32 GB，
+  PLE 表（47.7 GiB）页缓存变挤、冷读 ple_wait 变大——需要一起评估。
+- 引擎软件侧：maxctx 262144 时 KV 11.3 GiB 必然越界（68 + 6 + 11.3 = 85.4 GiB），
+  摆放策略无法全避；若根因是驱动页类型/TLB 策略，软件无解。
+
+### 13.7 候选 3 验证：q4cp mt SHARE=3/4（10-05，结论：否决）
+
+原型先行（`build/moe_lut_test.exe --hgn models/qwen38-flash-next-w4b.hgn --share N --P 16384`，
+w4b layer 0 真实专家，GPU 独占；harness 加了 share 分派 helper，27_kernels_moe_lut.inc 的
+static_assert 放开 BN=192/256 为 q4cp 原型专用，引擎 wrapper 不动）：
+
+| N | BN | 逐 bit（hid/pairs/pairs_f16） | VGPR（spill） | occupancy | up ms | down ms | total vs base |
+|---|---|---|---|---|---|---|---|
+| 2（现产线） | 128 | 0 mismatch | 152 (0) | 9 waves/SIMD | 33.29 | 18.33 | **+15.31%** |
+| 3 | 192 | 0 mismatch | 197 (0) | 7 | 90.63 | 45.38 | **−123.27%** |
+| 4 | 256 | 0 mismatch | 243 (0) | 5 | 89.46 | 44.43 | **−120.29%** |
+
+（base = BN=64 单 tile：up 39.5 / down 21.4 ms；share2 复现 +15.3%，与 §11.5 的 +13.7% 同档。）
+
+- **v2 侧的"VGPR 死路"预判对 q4cp 不成立**：q4cp 寄存器压力确实不同，BN=192/256 全部
+  0 spill 编译通过（kActFetch 6/8 组 uint4 被编译器排开了）。但实测照样是死路——死因换成
+  occupancy：LDS 21632→29824→38016 B 把 CTA/CU 从 3 压到 2 再到 1，VGPR 152→197→243 同步
+  压 waves/SIMD 9→7→5，权重预取延迟再也藏不住（TFLOPS 32→12）。
+- 逐 bit 正确性反而再次坐实了 mt 的合并语义（BN 任意倍数下每 (slot,row) 的 K 顺序不变）。
+- **引擎侧不动**，SHARE=2 维持。否决记录见 §8。
+
+### 13.8 候选 4 定位+修复：P=2048 hc +32 µs/tok = 06fb1d7 的 WS 位移（arena 地址敏感）
+
+**结论：回归提交是 06fb1d7（A3 dense LUT 按 P 分流，默认关），机制不是代码路径而是
+arena 摆放**——该提交在 WS 区 `d_xbf16b` 之后新增 `DALLOC(&d_dlut_tiles, 408B)` +
+`DALLOC(&d_dlut_nt, 4B)`，256 B 对齐后其后的所有 WS 缓冲整体位移 **768 B**
+（d_skx/d_Rhatbf16/d_tokidx/d_convb/d_keysb/d_qnb/d_Ub/d_Unb/d_convoutb 等，含多块
+~32 MB 的 gdn/gr 工作区），hc/hc2 段内核零改动却 +20 µs/tok。与 §13.6 的 80 GiB 拐点、
+2f49635 的批缓冲前移同属"arena 地址摆放敏感"。
+
+同机同日背靠背源码级二分（P=2048，psweep env，取 base=4096 稳态 chunk，hc/hc2 µs/tok）：
+
+| 源码点 | hc | hc2 | wall tok/s | 备注 |
+|---|---|---|---|---|
+| b7998c9（KPROF 前） | — | — | 1287.7/1301.8 | 无 kprof 埋点，全场最快 |
+| 830c6dc（KPROF 基础设施） | — | — | 1284.9/1299.4 | 埋点自述"随下一提交入库"，wall 无回归 |
+| deeb7e8（F1） | 147.4 | 146.9 | 1245.6/1254.1 | ≈ premt 旧二进制 146.8 |
+| 95f1261（mt v2） | **141.9** | 141.5 | 1289.2/1298.2 | |
+| **06fb1d7（A3 dense LUT）** | **161.6** | 162.6 | 1222.7/1224.1 | **跳变点 +19.7** |
+| 99679ed（q4cp mt w4b） | 160.1 | 161.2 | 1230.5 | 与 06fb1d7 同平台（mt 门 P=2048 不触发） |
+| HEAD 2f49635 | 159.2 | ~160 | — | 布局修复未覆盖此敏感性 |
+
+单因子双向确认（同源码只改 2 行分配）：
+
+| 变体 | hc | hc2 | wall tok/s |
+|---|---|---|---|
+| 95f1261 + 仅 2 行 DALLOC（复刻位移，无分支无新 kernel） | **162.9** | 163.5 | 1215.7/1219.1 |
+| 06fb1d7 − 2 行 DALLOC（分支/kernel 全保留） | **147.2** | 149.0 | 1234.1/1244.1 |
+
+正向实验完整复现 +21（162.9 ≈ 06fb1d7 的 161.6 ≈ HEAD 的 159.2）；反向回收 −14.4
+（残留 ~5 为构建间摆动，同源 ±5~8 有先例：mt.exe 旧二进制 151.6 vs 同源码重建 160.1）。
+dlut 分支默认 MAXP=0 全关、新增 kernel（k_dense_tiles 等）从不启动、P=2048 时
+gemm() 只多几次比较——代码路径解释不了 +20，位移单因子可以。
+
+已排除：批缓冲位置（GDEC_PAD_BATCH=8 GiB 推回 M1 时代 ~76 GiB 位，hc 159.0 不变）；
+INDEX_F16=0 + W4B_PAIRS_F16=0（153.1，非主因）；k_gemm_wmma 模板主体（只多运行时
+参数）；mt 门（P*k=16384 < 80*E=40960）；KPROF 基础设施本身（830c6dc wall 持平）。
+
+**修复（10-05，已入库）**：两个 dlut DALLOC 挪到 WS 区末尾（`d_ltws` 之后），中段布局
+恢复原状。同机同日背靠背 A/B/A（P=2048，psweep env 去 KVSNAP，hc/hc2 µs/tok）：
+
+| HEAD 变体 | hc | hc2 | wall tok/s |
+|---|---|---|---|
+| 修复前（dlut 在 d_xbf16b 后） | 158.5 | 158.3 | 1242.3/1248.1 |
+| **修复后（dlut 在 WS 末尾）** | **150.9** | 150.7 | 1259.2/1266.1 |
+| 参照：dlut 分配完全删除 | 149.4 | 149.9 | — |
+
+末尾放置 ≡ 完全删除（差 ≤1.5，噪声内），修复到位，hc 回收 **−7.6**。没到 95f1261 时代
+的 141.9：残差是 2f49635 批缓冲前移自身的摆放取舍（§12 已批准 139264 −3.4%），与
+dlut 无关。官方 psweep 口径（含 KVSNAP）：159.2 → 155.4。
+
+**128k@16384 折中（如实记录）**：修复版 pp_win 稳态 1386.6/1386.8（两次一致），修复前
+同日重建对照 1402.9（今早同源码 1415.3——同源码重建间本身有 ±1% 抽签），Δ ≈ **−1.2%**，
+方向一致但量级贴着构建噪声。撤销中段位移对 P=2048 hc 是解药、对 128k 布局是新抽签，
+与 2f49635"单一静态顺序无法兼得"同源。取舍批准与否见用户决定；若回退，P=2048 hc
+回到 158.5。
+
+验证：ktest ALL PASS；KLD w4b c512 逐位复现 **0.163505**（same_top 86.710，与 2f49635
+完全一致）；dlut opt-in smoke（GDEC_DENSE_LUT_MAXP_{D3,D9,DZ,DQ}=3200/1200/1600/1400，
+P=2048）dense lut 分流正常启动、输出 ids 与 off 逐位一致、hc 不受影响（151.3）。
+
+**WS 放置纪律（以后改 40_model.inc 的规矩）**：arena 内绝对地址决定 gemm 速度（§12、
+13.6、13.8 三连实证），任何 WS 中段插入都会把其后全部缓冲推位、重掷一次地址骰子——
+1. 敏感大缓冲（BP 尺寸的 gdn/gr/moe 工作区）位置一旦调好就不动；
+2. 新增小分配（KB 级 scratch/计数器）一律放 WS 区**末尾**（d_ltws 之后）或复用现有
+   缓冲/静态区，禁止插在中段；
+3. 必须插中段时，按本节方法做插入点前后 P=2048 hc + 128k 稳态双口径背靠背 A/B，
+   数据进 HANDOFF 再合入。
+
+**修复前调查存档**：修复方向曾判断为"把 d_dlut_tiles/d_dlut_nt 挪到 WS 区末尾（或静态化）"；
+具体是 768 B 位移后的哪个缓冲敏感未逐一分离（d_convb/d_keysb/d_qnb/d_Ub/d_Unb/d_convoutb
+候选）。二分与单因子数据见上表。
+
+日志：logs/m1_w4b_c4{head,830c6k,deeb7,95f12,06fb1,99679,06fb1nodalloc,95f12dalloc}_p2048.log、
+m1_w4b_c4head_pad8g_p2048.log、m1_w4b_c4head_nof16_p2048.log、m1_w4b_c4head_adbg_p2048.log（地址地图）；
+修复验证：m1_w4b_{dlutfix,headprefix,headnodlut,dluton}_p2048.log、kld_dlutfix_c512.log、
+pp128k_{dlutfix,dlutfix2,prefix_re}.log；二进制 build/gdec-win-c4*.exe（同名单元可复跑）。
