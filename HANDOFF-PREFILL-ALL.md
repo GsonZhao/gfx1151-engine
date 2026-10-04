@@ -685,6 +685,18 @@ TokenCache 只在 API 进程内存里（4M token / 64 条）。服务重启或�
      过 c512 KLD 门槛（同机改前值 +0.002）。
    - 收益：P≤1024 时 ht_deq 占 10.7–19.5%，上推 gemv 覆盖区间可砍掉其中大头；16K 稳态 ≈0。
 
+   **已完成（10-04，序 5）**：`gemv_multi_q4cp` 对 v2 dtype 16/24 开放 P∈(8, `GDEC_GEMVMR_MAXP`]，
+   分块 ≤8 行多 pass 直读（权重每 pass 重读；dtype 0/5/7/8 保持硬上限 8，w4b/GGUF 结构性
+   不受影响）。**默认 MAXP=24**（实测交叉点 24–32 之间）：exact-P psweep（PREFILL_CHUNK=P，
+   logs/gemvmr_ps*.log）vs MAXP=8：P=16 墙钟 **−21~−24%**、P=24 **−6.4%**、P=32 +8%、
+   P=64 +64%、P=128 +156%、P=256 +264%（重读按 P/8 线性放大；hc 段在 P≥32 先翻负）。
+   ht_deq 80~88 ms → ~0（P≤256 档）。注意 M1b TTFT 的"P"档含 ~135 token 模板底数，
+   P=16/32/64 档实际 prefill ≈151 token，小档必须走 exact-P psweep 才测得准。
+   KLD v2 c512@chunk256（ON 强制 MAXP=256 触发；gemv 逐行数值与分块无关）：
+   ON 0.106307 vs OFF 0.107488（−0.0012 ≤ +0.002）✓；M1b P=512/1024 不变（>24 不触发，
+   gemvmr 日志 0 次）✓；w4b 2k 1197.5 ≈ 基线 1190.5 ✓；ktest 205 PASS ✓。
+   收益面窄（真 P≤24：极小 prompt、prefill 尾 chunk、verify 类小批），16K 稳态零影响。
+
 3. **C2 gdn:scan 深流水**（§5 C2）：`k_gdn_fused` 受延迟与占用率限制（48 CTA/20 WGP=3 波，
    波效率 ~60%），LDS 已 57/64 KB 只能靠寄存器倒手；GDN 维度唯一没被否决的形态。
    - 前置：无；正确性 harness 复用 `tools/gdn_fused_proto.cu`。
