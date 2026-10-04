@@ -14,7 +14,7 @@ PREFILL.md §10–11、GUFO-GAP.md（09-25）、KV 前缀复用遗留（09-26）
 
 | 场景 | 我们 | 参照 | 差距 |
 |---|---|---|---|
-| 128K，chunk 16384 | v2 Win **1484.7**（10-03 深夜，C1-f16 select 向量化 + §11.5 MoE mt 后） / w4b Win **1464.5**（10-04，§11.5 q4cp mt 后） / w4b Linux 1446 / GGUF Linux 1451 | halogen 1517 | **~2%** |
+| 128K，chunk 16384 | v2 Win **1484.7**（10-03 深夜，C1-f16 select 向量化 + §11.5 MoE mt 后） / w4b Win **1415.3**（10-04，§12 布局修复后 pp_win 口径；四口径收敛 1405–1418，生产 paged 256K 1412.2） / w4b Linux 1446 / GGUF Linux 1451 | halogen 1517 | **~2%**（v2 口径） |
 | 32K，chunk 16384 | v2 Win ~1521 / w4b Linux 1512 | halogen 1567 | ~3% |
 | 8K prompt，chunk 2048 | w4b Linux ~1195（fdf805a，09-25） | gufo d0 1628 | **~36%** |
 | 32K prompt，chunk 2048 | GGUF Linux 1152（09-25） | gufo d32K 1422 | **~20%+** |
@@ -612,6 +612,8 @@ TokenCache 只在 API 进程内存里（4M token / 64 条）。服务重启或�
   `devarena_estimate` 内部调用了 `eff_maxbatch`，不能在后者里直接调（会递归），要在
   `devarena_init` 之前先算一次，写进一个全局 override。256K serve 用 16384（粗算 E≈91.7 GiB）
   还没实机验证，上线前要看 `devarena: requesting` 那一行和有没有 `fall back to hipMalloc`。
+  **（10-04 已验：262144+MTP 全部分配结束于 94.65 GiB、零 fallback，见 §12；且 §12 之后
+  布局与 maxctx 无关，256K 不再掉速。）**
 - 小 P 方向（A1–A3）做完后**重新扫一次 chunk**：如果 4096/8192 与 16384 的差距缩小到 1–2%，
   Windows 就可以用小 chunk 换回 8–12 GiB arena。这比 E1 更根本。
 - GGUF 在 Windows 上没有移植，arena 也放不下（~102 GiB），不在本轮范围。Linux 上 GGUF 能吃到
@@ -1068,7 +1070,8 @@ kld_dlut4_v2_c512.log、ttft_dlut{off,on}_run.log、dlut4_128k.log。
     372 ms/16K，wall 11527→11193（−334 ms，~90% 兑现，segsum==wall 仍成立）。
     v2 回归 c512 **0.107066 逐位复现**（v2 代码未动）；2k（默认 chunk 8192）
     1194.2 与历史 1195.7/1197.5 一致（门槛以下走原路径无回归）；ktest ALL
-    PASS。w4b 128k 稳态因此站上 1464.5，对 v2 的 1484.7 只差 1.4%。
+    PASS。w4b 128k 稳态因此站上 1464.5，对 v2 的 1484.7 只差 1.4%（该值是旧 arena
+    布局下的抽签结果；§12 布局修复后 pp_win 口径为 1415.3，四口径收敛 1405–1418）。
   - 日志：kld_w4b_mt_pre.{kld,log}（改前基线 8.1GB）、kld_w4b_mt_c512.log、
     kld_w4b_mt_{off,on}_c8192.{kld,log}、w4b_mt_{off,on}128k.log、
     w4b_mt_2k_d8192.log、kld_mt_v2_c512.log、build_mt_w4b.log、
@@ -1111,3 +1114,70 @@ api_regression 90/90（§6 D1 状态段）。
 
 - F1 与 A3 的验收以 M1b 的 TTFT 为主，16K 稳态为辅（只需确认不退）。
 - 机器恢复前，只做背靠背的相对比较，不跨日比较绝对值（§9）。
+
+---
+
+## 12. devarena 批缓冲摆放修复（10-04，maxctx 262144 的 −14.4% 闭环）
+
+**现象**：maxctx 262144（生产）128k@16384 稳态 1250 tok/s，比 139264 的 1464.5 低 14.6%。
+
+**根因（修正此前"clamp 溢出 hipMalloc"的猜测）**：262144 时 devarena clamp 到 95 GiB，但
+`GDEC_ARENA_DEBUG=1` 的分配地图证明**没有任何分配溢出**（unpaged 262144+MTP 最后一个分配
+draft lm_head 结束于 94.65 GiB，零 fallback）。真正因果是**批缓冲（d_Rb…d_ltws，按 chunk
+尺寸分配、与 maxctx 无关）在 arena 内的绝对地址**：旧布局把它排在 maxctx 尺寸的
+KV/ik/vcbt/iscores 之后，139264→262144 时被顶高 +5.21 GiB。E1 实验（139264 +
+`GDEC_PAD_BATCH=5593585408`）复现 1244 ≈ 262144 的 1253.8，坐实是"位置"而非"容量"。
+
+**机理（部分未解）**：
+
+- KPROF 对比（paged 32k base=16384，logs/kprof_paged_139264_32k.log vs
+  logs/padsweep_paged262144_0.log）：差距集中在 **gdn:proj 2160→2541 ms（+381）** 与
+  **qsa:proj 578→679（+101）**；moe、gdn:oproj、qsa:flash 不变。gdn:proj = 读 d_xb 写
+  d_qkvb 等的 4 个 gemm。
+- 旧布局 139264 `GDEC_PAD_BATCH` 1→12 GiB：稳态 1310→1240 **单调**变差、无周期
+  （logs/padperiod_u139264_g*.log）——不是"周期性好运区"，是"越高越差"。
+- `tools/winprobe/arenaoffprobe.cpp`（一次性探针，build/arenaoffprobe.exe）：92 GiB 大块
+  逐 GiB 纯读带宽 224–237 GB/s 全程平坦 → 不是原始带宽慢区，是 gemm（Lt/WMMA）对地址
+  敏感（Lt algo 启发式 / L2 散列 / 页表，未定论）。
+- 修正旧认知：此前 `GDEC_PAD_BATCH` 注释里"k1 oproj ±15-30%"的说法不对，敏感的是
+  gdn:proj / qsa:proj。
+
+**修复**：批缓冲块整体前移到权重之后、maxctx 尺寸分配之前（40_model.inc 构造函数，
+`d_gdnnorm` 之后、`nqsa` 之前）；布局从此与 maxctx 无关。30_host_util.inc 的
+`dalloc_arena` 加 name 参数 + `GDEC_ARENA_DEBUG=1` 逐分配打印（诊断设施，保留）。
+
+**四口径 + bench 实测**（128k 稳态 avg，chunk 16384；bench 为其默认加权口径）：
+
+| 口径 | 旧布局 | 新布局 | Δ |
+|---|---|---|---|
+| unpaged 270336 | 1253.8 | **1418.1** | **+13.1%** |
+| paged 270336（≈生产 256K） | 1250.4 | **1412.2** | **+13.0%** |
+| paged 139264 | 1287.0 | **1405.6** | **+9.2%** |
+| unpaged 139264（pp_win 基准） | **1464.5** | 1415.3 | **−3.4%** |
+| bench 默认（262144 paged 加权） | 1178.7 | **1409.7** | **+19.6%** |
+
+新布局四口径收敛到 1405–1418（生产=测试一致）。**方向 B（paged QSA 的 −12% 开销）闭环**：
+新布局 paged 139264 = 1405.6 vs unpaged 1415.3，差仅 **−0.7%**——旧布局下的 −12% 绝大部分
+是批缓冲被页表/页池分配顶高后的摆放伪影，paged 路径本身开销正常，无需再做。
+bench TG 35.2 vs 34.8（噪声内），MTP acceptance 57.2% 逐点不变，Benchmark PASS。
+
+**139264 回归的构成与尝试**：新旧布局 chunk2 相同（1513.9 vs 1510.3），新布局晚 chunk
+衰减更快（chunk8 1427.1 vs 1335.6）——疑为 KV 移到更高地址后 qsa 读随 base 增长变慢，
+未证实。新布局 `GDEC_PAD_BATCH` ∈ {0, 512, 1024, 1536} MiB 微扫：
+1405.7/1395.9/1405.0/1389.5，平坦无救（pad 只正移且连带推高 KV）。**单一静态顺序无法
+兼得两个 maxctx**。
+
+**回归（全过）**：ktest ALL PASS（logs/ktest_batchfirst.log）；KLD w4b c512 **逐位复现**
+0.163505 / p999 4.594741 / same_top 86.710 / ppl 3.467455
+（logs/kld_w4b_batchfirst_c512.log，纯分配重排的预期内结果）。
+
+**日志**：logs/w4b_128k_c16k_batchfirst_regr.log（139264 回归）、
+logs/padnew_u139264_m{0,512,1024,1536}.log（微扫）、
+logs/w4b_{unpaged,paged}_128k_maxctx270336_batchfirst.log、
+logs/pp_paged_batchfirst_run.log、logs/bench_batchfirst_default.log、
+logs/kprof_batchfirst_u262144_32k.log（32k 快检：稳态 1507、gdn:proj 1417.9，修复坐实）。
+
+**裁决（10-04，用户拍板：保留新布局）**：接受 unpaged 139264 口径 −3.4% 的取舍，换生产
+256K paged +13.0%、bench 默认 +19.6%、四口径收敛。按 maxctx 条件化摆放顺序（小 maxctx
+用旧顺序拿回 1464.5）**不做**：交叉点约 maxctx ≈ 150k（旧布局批缓冲每 +1 GiB 掉 ~10%，
++5.21 GiB 对应 +122880 ctx），全部基于经验抽签、机理未解，过于脆弱。

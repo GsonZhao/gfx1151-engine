@@ -488,6 +488,125 @@ struct GpuModel {
     DALLOC(&d_Alog, (size_t)ngdn * 48 * 4);
     DALLOC(&d_dtbias, (size_t)ngdn * 48 * 4);
     DALLOC(&d_gdnnorm, (size_t)ngdn * 128 * 4);
+    // ---- prefill batch buffers (Phase 3a), allocated once at maxctx ----
+    // 提到最前（紧随权重 arena）：批缓冲的 gemm 速度随 arena 内绝对地址升高
+    // 单调变差（139264 pads 1→12 GiB 实测稳态 1310→1240 tok/s、gdn:proj
+    // 2257→2639 ms，无周期）；而 maxctx 尺寸的 KV/ik/vcbt/iscores 对位置
+    // 不敏感（qsa:flash/idx 在两位形间不变）。固定低位摆放同时让布局与
+    // maxctx 无关——此前 262144 仅因这些缓冲被 maxctx 增长顶高 5.21 GiB
+    // 就掉 14%（1464.5→1253.8 tok/s @128k，E1 用 GDEC_PAD_BATCH 复现）。
+    // GDEC_PAD_BATCH (bytes)：调试开关——哑分配整体推移批缓冲的 arena 偏移。
+    {
+      const char* pbs = getenv("GDEC_PAD_BATCH");
+      if (pbs && atoll(pbs) > 0) {
+        void* pad_dummy = nullptr;
+        DALLOC(&pad_dummy, (size_t)atoll(pbs));
+      }
+    }
+    {
+      size_t BP = (size_t)maxbatch_cap;
+      DALLOC(&d_Rb, BP * 10240 * 4);
+      DALLOC(&d_Rhatb, BP * 10240 * 4);
+      DALLOC(&d_xb, BP * 2560 * 4);
+      DALLOC(&d_yb, BP * 2560 * 4);
+      DALLOC(&d_Gb, BP * 10240 * 4);
+      DALLOC(&d_t320b, BP * 320 * 4);
+      DALLOC(&d_w4b, BP * 4 * 4);
+      DALLOC(&d_injp[0], BP * 16 * 4);
+      DALLOC(&d_injp[1], BP * 16 * 4);
+      DALLOC(&d_qkvb, BP * 10240 * 4);
+      DALLOC(&d_zb, BP * 6144 * 4);
+      DALLOC(&d_g48b, BP * 48 * 4);
+      DALLOC(&d_beta48b, BP * 48 * 4);
+      DALLOC(&d_qgb, BP * 12288 * 4);
+      DALLOC(&d_qsb, BP * 6144 * 4);
+      DALLOC(&d_gsb, BP * 6144 * 4);
+      DALLOC(&d_kbb, BP * 512 * 4);
+      DALLOC(&d_vbb, BP * 512 * 4);
+      DALLOC(&d_ropecs, BP * 32 * sizeof(float2));
+      DALLOC(&d_attnb, BP * 6144 * 4);
+      DALLOC(&d_routerb, BP * 512 * 4);
+      DALLOC(&d_topidsb, BP * 16 * 4);
+      DALLOC(&d_topwb, BP * 16 * 4);
+      DALLOC(&d_slot_order, 256 * 4);  // k_moe_sort_slots 输出（P*k ≤ 256）
+      // Fused down reuses the otherwise idle gate/up workspace for pair outputs.
+      // B1：v2+w4b pairs 全 f16（guvb_f16_env，与 30_host_util 估算同步）后按
+      // f16 尺寸分配，省一半；任一回退 env 在位则保持 f32 全尺寸。
+      DALLOC(&d_guvb,
+             BP * g_cfg.topk * (moe_deterministic ? 2560 : 1280) *
+                 (guvb_f16_env() ? 2 : 4));
+      DALLOC(&d_hidb, BP * g_cfg.topk * 640 * 4);
+      DALLOC(&d_moeaccb, BP * 2560 * 4);
+      DALLOC(&d_eyb, BP * 2560 * 4);
+      DALLOC(&d_sgb, BP * 4);
+      DALLOC(&d_eb, BP * 2560 * 4);
+      CK(hipHostMalloc((void**)&ple_eb, BP * 2560 * 4, hipHostMallocDefault));
+      CK(hipHostGetDevicePointer((void**)&ple_eb_dev, ple_eb, 0));
+      DALLOC(&d_wbf16, (size_t)64 << 20);  // fits q_proj 12288x2560 bf16
+      DALLOC(&d_xbf16, BP * 10240 * 2);
+      DALLOC(&d_xbf16b, BP * 6144 * 2);  // largest non-cacheable K = 6144
+      DALLOC(&d_dlut_tiles, (BP / 64 + 2) * sizeof(MoeTile));
+      DALLOC(&d_dlut_nt, sizeof(int));
+      if (gemm_splitk_on()) DALLOC(&d_skx, BP * 6144 * 2);
+      if (prefill_fused) DALLOC(&d_Rhatbf16, BP * 10240 * 2);
+      if (prefill_fused) DALLOC(&d_hcsc, BP * 4 * 4);
+      DALLOC(&d_tokidx, BP * g_cfg.topk * 4);
+      DALLOC(&d_pweight, BP * g_cfg.topk * 4);
+      DALLOC(&d_eoff, (g_cfg.experts + 1) * 4);
+      if (moe_deterministic) DALLOC(&d_pairids, BP * g_cfg.topk * 4);
+      if (!moe_host_route && !moe_ordered) moe_routing.init(BP * g_cfg.topk, g_cfg.experts);
+      if (!moe_untiled && !moe_ordered) {
+        DALLOC(&d_moetiles, ((BP * g_cfg.topk + 63) / 64 + g_cfg.experts) * sizeof(MoeTile));
+        DALLOC(&d_moentiles, sizeof(int));
+      }
+      if (moe_lt && g_cfg.topk == 10 && moe_deterministic && !moe_host_route && !moe_ordered) {
+        // 4-expert dequant groups: scratch stays MALL-resident between dequant
+        // and its GEMMs (measured in tools/moe_lt_bench.cu). GDEC_MOE_LT_OVL
+        // doubles it for the A/B slot rotation of the overlap pipeline.
+        DALLOC(&d_moexg, (size_t)BP * g_cfg.topk * g_cfg.d * 2);
+        DALLOC(&d_moewup, (size_t)4 * 2 * g_cfg.moe_mid * g_cfg.d * 2 * (moe_lt_ovl ? 2 : 1));
+        DALLOC(&d_moewdn, (size_t)4 * g_cfg.d * g_cfg.moe_mid * 2 * (moe_lt_ovl ? 2 : 1));
+        if (moe_lt_cmp) {
+          DALLOC(&d_hidb2, (size_t)BP * g_cfg.topk * g_cfg.moe_mid * 2);
+          DALLOC(&d_pairs2, (size_t)BP * g_cfg.topk * g_cfg.d * 4);
+          DALLOC(&d_cmpi, 8);
+        }
+      }
+      DALLOC(&d_convb, BP * 10240 * 4);
+      DALLOC(&d_gdn_ws, (size_t)48 * 2 * 64 * 128 * 4);
+      if (!gdn_nosplit && !gdn_loop && !gdn_fused)  // fused needs no ws; streaming caps it at window chunks (15.05 MiB @4); pipeline double-buffers the slots
+        DALLOC(&d_gdn_split_ws,
+                     (size_t)(gdn_stream ? std::min<size_t>(gdn_window_chunks, (BP + 63) / 64)
+                                         : (BP + 63) / 64) * 48 * GDN_SPLIT_WS_FLOATS * 4 *
+                         (gdn_pipe ? 2 : 1));
+      DALLOC(&d_keysb, BP * 10240 * 4);
+      DALLOC(&d_plevb, BP * 2560 * 4);
+      DALLOC(&d_qnb, BP * 10240 * 4);
+      DALLOC(&d_Ub, BP * 10240 * 4);
+      DALLOC(&d_Unb, BP * 10240 * 4);
+      DALLOC(&d_convoutb, BP * 10240 * 4);
+      // d_posarr/d_ringarr are indexed by ABSOLUTE position (qsa_loop debug,
+      // ple_gpu_t): they stay maxctx-sized. d_tokarr only ever holds one
+      // prefill chunk.
+      DALLOC(&d_posarr, (size_t)maxctx * 4);
+      DALLOC(&d_ringarr, (size_t)maxctx * 4);
+      DALLOC(&d_tokarr, BP * 4);
+      DALLOC(&d_img_inj, BP * sizeof(int2));  // vision injection map
+      std::vector<int> h(maxctx);
+      for (int i = 0; i < maxctx; i++) h[i] = i;
+      CK(hipMemcpy(d_posarr, h.data(), (size_t)maxctx * 4, hipMemcpyHostToDevice));
+      for (int i = 0; i < maxctx; i++) h[i] = i % 9;
+      CK(hipMemcpy(d_ringarr, h.data(), (size_t)maxctx * 4, hipMemcpyHostToDevice));
+      if (rocblas_create_handle(&rbh) != rocblas_status_success) {
+        fprintf(stderr, "rocblas_create_handle failed\n");
+        exit(1);
+      }
+      if (hipblasLtCreate(&lth) != HIPBLAS_STATUS_SUCCESS) {
+        fprintf(stderr, "hipblasLtCreate failed\n");
+        exit(1);
+      }
+      DALLOC(&d_ltws, lt_ws_bytes);
+    }
     int nqsa = g_cfg.layers / 4;  // 12
     kv_nl = nqsa + (mtp_kv_wanted() ? 1 : 0);
     {
@@ -666,123 +785,6 @@ struct GpuModel {
     }
     DALLOC(&d_argmax, 4);
     DALLOC(&d_hnorm_mixer, 10240 * 4);
-
-    // GDEC_PAD_BATCH (bytes): debug knob — dummy allocation that shifts every
-    // batch-buffer arena offset. The k1 (2560,6144) oproj gemm's speed swings
-    // ~±15-30% with GB-level address placement (L2/DRAM placement luck).
-    {
-      const char* pbs = getenv("GDEC_PAD_BATCH");
-      if (pbs && atoll(pbs) > 0) {
-        void* pad_dummy = nullptr;
-        DALLOC(&pad_dummy, (size_t)atoll(pbs));
-      }
-    }
-
-    // ---- prefill batch buffers (Phase 3a), allocated once at maxctx ----
-    {
-      size_t BP = (size_t)maxbatch_cap;
-      DALLOC(&d_Rb, BP * 10240 * 4);
-      DALLOC(&d_Rhatb, BP * 10240 * 4);
-      DALLOC(&d_xb, BP * 2560 * 4);
-      DALLOC(&d_yb, BP * 2560 * 4);
-      DALLOC(&d_Gb, BP * 10240 * 4);
-      DALLOC(&d_t320b, BP * 320 * 4);
-      DALLOC(&d_w4b, BP * 4 * 4);
-      DALLOC(&d_injp[0], BP * 16 * 4);
-      DALLOC(&d_injp[1], BP * 16 * 4);
-      DALLOC(&d_qkvb, BP * 10240 * 4);
-      DALLOC(&d_zb, BP * 6144 * 4);
-      DALLOC(&d_g48b, BP * 48 * 4);
-      DALLOC(&d_beta48b, BP * 48 * 4);
-      DALLOC(&d_qgb, BP * 12288 * 4);
-      DALLOC(&d_qsb, BP * 6144 * 4);
-      DALLOC(&d_gsb, BP * 6144 * 4);
-      DALLOC(&d_kbb, BP * 512 * 4);
-      DALLOC(&d_vbb, BP * 512 * 4);
-      DALLOC(&d_ropecs, BP * 32 * sizeof(float2));
-      DALLOC(&d_attnb, BP * 6144 * 4);
-      DALLOC(&d_routerb, BP * 512 * 4);
-      DALLOC(&d_topidsb, BP * 16 * 4);
-      DALLOC(&d_topwb, BP * 16 * 4);
-      DALLOC(&d_slot_order, 256 * 4);  // k_moe_sort_slots 输出（P*k ≤ 256）
-      // Fused down reuses the otherwise idle gate/up workspace for pair outputs.
-      // B1：v2+w4b pairs 全 f16（guvb_f16_env，与 30_host_util 估算同步）后按
-      // f16 尺寸分配，省一半；任一回退 env 在位则保持 f32 全尺寸。
-      DALLOC(&d_guvb,
-             BP * g_cfg.topk * (moe_deterministic ? 2560 : 1280) *
-                 (guvb_f16_env() ? 2 : 4));
-      DALLOC(&d_hidb, BP * g_cfg.topk * 640 * 4);
-      DALLOC(&d_moeaccb, BP * 2560 * 4);
-      DALLOC(&d_eyb, BP * 2560 * 4);
-      DALLOC(&d_sgb, BP * 4);
-      DALLOC(&d_eb, BP * 2560 * 4);
-      CK(hipHostMalloc((void**)&ple_eb, BP * 2560 * 4, hipHostMallocDefault));
-      CK(hipHostGetDevicePointer((void**)&ple_eb_dev, ple_eb, 0));
-      DALLOC(&d_wbf16, (size_t)64 << 20);  // fits q_proj 12288x2560 bf16
-      DALLOC(&d_xbf16, BP * 10240 * 2);
-      DALLOC(&d_xbf16b, BP * 6144 * 2);  // largest non-cacheable K = 6144
-      DALLOC(&d_dlut_tiles, (BP / 64 + 2) * sizeof(MoeTile));
-      DALLOC(&d_dlut_nt, sizeof(int));
-      if (gemm_splitk_on()) DALLOC(&d_skx, BP * 6144 * 2);
-      if (prefill_fused) DALLOC(&d_Rhatbf16, BP * 10240 * 2);
-      if (prefill_fused) DALLOC(&d_hcsc, BP * 4 * 4);
-      DALLOC(&d_tokidx, BP * g_cfg.topk * 4);
-      DALLOC(&d_pweight, BP * g_cfg.topk * 4);
-      DALLOC(&d_eoff, (g_cfg.experts + 1) * 4);
-      if (moe_deterministic) DALLOC(&d_pairids, BP * g_cfg.topk * 4);
-      if (!moe_host_route && !moe_ordered) moe_routing.init(BP * g_cfg.topk, g_cfg.experts);
-      if (!moe_untiled && !moe_ordered) {
-        DALLOC(&d_moetiles, ((BP * g_cfg.topk + 63) / 64 + g_cfg.experts) * sizeof(MoeTile));
-        DALLOC(&d_moentiles, sizeof(int));
-      }
-      if (moe_lt && g_cfg.topk == 10 && moe_deterministic && !moe_host_route && !moe_ordered) {
-        // 4-expert dequant groups: scratch stays MALL-resident between dequant
-        // and its GEMMs (measured in tools/moe_lt_bench.cu). GDEC_MOE_LT_OVL
-        // doubles it for the A/B slot rotation of the overlap pipeline.
-        DALLOC(&d_moexg, (size_t)BP * g_cfg.topk * g_cfg.d * 2);
-        DALLOC(&d_moewup, (size_t)4 * 2 * g_cfg.moe_mid * g_cfg.d * 2 * (moe_lt_ovl ? 2 : 1));
-        DALLOC(&d_moewdn, (size_t)4 * g_cfg.d * g_cfg.moe_mid * 2 * (moe_lt_ovl ? 2 : 1));
-        if (moe_lt_cmp) {
-          DALLOC(&d_hidb2, (size_t)BP * g_cfg.topk * g_cfg.moe_mid * 2);
-          DALLOC(&d_pairs2, (size_t)BP * g_cfg.topk * g_cfg.d * 4);
-          DALLOC(&d_cmpi, 8);
-        }
-      }
-      DALLOC(&d_convb, BP * 10240 * 4);
-      DALLOC(&d_gdn_ws, (size_t)48 * 2 * 64 * 128 * 4);
-      if (!gdn_nosplit && !gdn_loop && !gdn_fused)  // fused needs no ws; streaming caps it at window chunks (15.05 MiB @4); pipeline double-buffers the slots
-        DALLOC(&d_gdn_split_ws,
-                     (size_t)(gdn_stream ? std::min<size_t>(gdn_window_chunks, (BP + 63) / 64)
-                                         : (BP + 63) / 64) * 48 * GDN_SPLIT_WS_FLOATS * 4 *
-                         (gdn_pipe ? 2 : 1));
-      DALLOC(&d_keysb, BP * 10240 * 4);
-      DALLOC(&d_plevb, BP * 2560 * 4);
-      DALLOC(&d_qnb, BP * 10240 * 4);
-      DALLOC(&d_Ub, BP * 10240 * 4);
-      DALLOC(&d_Unb, BP * 10240 * 4);
-      DALLOC(&d_convoutb, BP * 10240 * 4);
-      // d_posarr/d_ringarr are indexed by ABSOLUTE position (qsa_loop debug,
-      // ple_gpu_t): they stay maxctx-sized. d_tokarr only ever holds one
-      // prefill chunk.
-      DALLOC(&d_posarr, (size_t)maxctx * 4);
-      DALLOC(&d_ringarr, (size_t)maxctx * 4);
-      DALLOC(&d_tokarr, BP * 4);
-      DALLOC(&d_img_inj, BP * sizeof(int2));  // vision injection map
-      std::vector<int> h(maxctx);
-      for (int i = 0; i < maxctx; i++) h[i] = i;
-      CK(hipMemcpy(d_posarr, h.data(), (size_t)maxctx * 4, hipMemcpyHostToDevice));
-      for (int i = 0; i < maxctx; i++) h[i] = i % 9;
-      CK(hipMemcpy(d_ringarr, h.data(), (size_t)maxctx * 4, hipMemcpyHostToDevice));
-      if (rocblas_create_handle(&rbh) != rocblas_status_success) {
-        fprintf(stderr, "rocblas_create_handle failed\n");
-        exit(1);
-      }
-      if (hipblasLtCreate(&lth) != HIPBLAS_STATUS_SUCCESS) {
-        fprintf(stderr, "hipblasLtCreate failed\n");
-        exit(1);
-      }
-      DALLOC(&d_ltws, lt_ws_bytes);
-    }
 
     // ---- upload small fp32 weights (norms, conv, A_log, dt_bias) ----
     char buf[128];

@@ -10,25 +10,33 @@
 #ifdef _WIN32
 static void* g_devarena = nullptr;
 static size_t g_devarena_sz = 0, g_devarena_off = 0;
-static hipError_t dalloc_arena(void** p, size_t bytes) {
-  if (!g_devarena) return hipMalloc(p, bytes);
+static hipError_t dalloc_arena(void** p, size_t bytes, const char* name) {
+  static const bool dbg = getenv("GDEC_ARENA_DEBUG") != nullptr;
   size_t off = (g_devarena_off + 255) & ~(size_t)255;
-  if (off + bytes > g_devarena_sz) {
-    static bool warned = false;
-    if (!warned) {
-      warned = true;
-      fprintf(stderr,
-              "arena: capacity %.2f GiB exhausted at +%zu B; further allocations "
-              "fall back to hipMalloc\n",
-              g_devarena_sz / 1073741824.0, bytes);
+  if (!g_devarena || off + bytes > g_devarena_sz) {
+    if (g_devarena) {
+      static bool warned = false;
+      if (!warned) {
+        warned = true;
+        fprintf(stderr,
+                "arena: capacity %.2f GiB exhausted at +%zu B; further allocations "
+                "fall back to hipMalloc\n",
+                g_devarena_sz / 1073741824.0, bytes);
+      }
     }
+    if (dbg)
+      fprintf(stderr, "arena-debug: %-16s %10.2f MiB @ n/a (hipMalloc fallback)\n",
+              name, bytes / 1048576.0);
     return hipMalloc(p, bytes);
   }
+  if (dbg)
+    fprintf(stderr, "arena-debug: %-16s %10.2f MiB @ %.2f GiB\n", name,
+            bytes / 1048576.0, off / 1073741824.0);
   *p = (char*)g_devarena + off;
   g_devarena_off = off + bytes;
   return hipSuccess;
 }
-#define DALLOC(p, s) CK(dalloc_arena((void**)(p), (size_t)(s)))
+#define DALLOC(p, s) CK(dalloc_arena((void**)(p), (size_t)(s), #p))
 #else
 #define DALLOC(p, s) CK(hipMalloc(p, s))
 #endif
