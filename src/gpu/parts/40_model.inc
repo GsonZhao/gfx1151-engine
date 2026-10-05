@@ -57,7 +57,10 @@ struct GpuModel {
     return d_iqh != nullptr;
   }
   // Block ranking is sensitive to projection rounding; retain FP32 here.
-  bool index_f32 = getenv("GDEC_INDEX_BF16") == nullptr;
+  // aggr 10-05: bf16 indexer projection by default (the fp32 SGEMM ran at
+  // ~2.4 TFLOPS: 264 ms per 16K chunk; bf16 gemm path 16K +2.6%, ids equal).
+  // GDEC_INDEX_F32=1 (or GDEC_INDEX_BF16=0) restores the fp32 projection.
+  bool index_f32 = getenv("GDEC_INDEX_F32") != nullptr || env_zero("GDEC_INDEX_BF16");
   bool index_fused2 = getenv("GDEC_INDEX_FUSED2") != nullptr;
   bool index_stream_select = getenv("GDEC_INDEX_STREAM_SELECT") != nullptr;
   // Fused-path fast kernels (09_kernels_index.inc), bit-exact, default on:
@@ -2444,7 +2447,7 @@ struct GpuModel {
            ((((uintptr_t)d_t320b | (uintptr_t)d_xbf16b) & 15) == 0);
   }
   bool hc_up_fused(const WView& w, int P, const float* sc = nullptr,
-                   const float* hw = nullptr) {
+                   const float* hw = nullptr, bool x_ready = false) {
     static const bool on = !env_zero("GDEC_HC_FUSE") &&
                            getenv("GDEC_GEMM_WMMA") != nullptr &&
                            getenv("GDEC_GEMM_RB") == nullptr;
@@ -2456,8 +2459,9 @@ struct GpuModel {
     auto pt0 = std::chrono::steady_clock::now();
     const uint16_t* wp = gemm_wbf16(w);
     const uint64_t tot = (uint64_t)P * K;
-    k_f32_to_bf16_v4<<<(unsigned)((tot / 4 + 255) / 256), 256, 0, g_str>>>(
-        d_t320b, d_xbf16b, K, P, (int)K);
+    if (!x_ready)  // aggr: k_hc_mixcomb already wrote the bf16 X into d_xbf16b
+      k_f32_to_bf16_v4<<<(unsigned)((tot / 4 + 255) / 256), 256, 0, g_str>>>(
+          d_t320b, d_xbf16b, K, P, (int)K);
     // 128x128 w4x2 f2x4 (tools/hcmix_proto.cu tile sweep): the fused epilogue
     // favours the narrower tile — 2.33 vs 2.80 ms at P=8192 (pair 4.92 ms),
     // still bit-identical (K accumulation order is tile-independent).
@@ -2476,6 +2480,33 @@ struct GpuModel {
                 bool norhat = false) {
     char buf[128];
     snprintf(buf, sizeof buf, "%s.input_mix_weight_down.weight", prefix.c_str());
+    static const bool mixsplit = !env_zero("GDEC_HC_MIXSPLIT");
+    const WView wdn = wview(ckpt.at(buf));
+    if (norhat && mixsplit && wdn.dtype != 0 && wdn.rows == 320 && wdn.cols == 10240) {
+      // aggr 10-05: branch-split mix-down. W' = W*(1+hw) (dequant scratch,
+      // scaled in place), 4 K=2560 slice GEMMs in one launch on the raw R'
+      // (blockIdx.y = branch, partials in the fused path's idle d_Gb), then
+      // t = silu(0.25 * sum_b sc_b * part_b) straight to bf16 for the up GEMM.
+      // Not bit-identical to the Rhat path (bf16 W' vs bf16 Rhat rounding).
+      uint16_t* wp = (uint16_t*)gemm_wbf16(wdn);
+      k_scale_cols_bf16<<<640, 256, 0, g_str>>>(wp, hw, 320, 10240);
+      float* parts = d_Gb;
+      k_gemm_wmma<64, 160, 2, 2, 2, 5, 64, 128>
+          <<<dim3((unsigned)(((P + 63) / 64) * 2), 4), 128, 0, g_str>>>(
+              (const uint16_t*)d_Rb, wp, parts, P, 2560, 320, 1, nullptr, nullptr,
+              nullptr, nullptr, 10240, 10240, 2560, 2560, (size_t)P * 320);
+      k_hc_mixcomb<<<(P * 320 + 255) / 256, 256, 0, g_str>>>(parts, d_hcsc,
+                                                            d_xbf16b, P, 320);
+      const WView wup = wview(ckpt.at(std::string(prefix) + ".input_mix_weight_up.weight"));
+      if (!hc_up_fused(wup, P, d_hcsc, hw, true)) {
+        fprintf(stderr, "hc_norhat: up-fused route fell back with Rhat unwritten\n");
+        exit(1);
+      }
+      xf16_src = d_xb;
+      xf16_xs = xf16_K = g_cfg.d;
+      xf16_P = P;
+      return;
+    }
     if (norhat) {
       // B2-2: mix-down 的 A = 未归一化的 d_Rb，Epi=2 在 staging 现场归一化
       //（与 rmsnorm 同一表达式 -> A tile 与被取代的 Rhat 逐 bit）。路线条件与
@@ -4566,7 +4597,18 @@ struct GpuModel {
         if (count > 0) {
           std::vector<int> shifted(tokens.begin() + off + 1,
                                    tokens.begin() + off + 1 + count);
+          std::chrono::steady_clock::time_point mt0;
+          if (prof) {
+            CK(hipStreamSynchronize(g_str));
+            mt0 = std::chrono::steady_clock::now();
+          }
           mtp_ingest_b(d_mtap, shifted, count, c0);
+          if (prof) {
+            CK(hipStreamSynchronize(g_str));
+            fprintf(stderr, "prof-mtp: P=%d ingest=%.1fms\n", count,
+                    std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - mt0).count());
+          }
         }
       }
       off += n;
@@ -4643,9 +4685,12 @@ struct GpuModel {
           // address computation; worker 0 then pumps all 16*P rows in token
           // order through the 256-deep ring straight into pinned staging.
           ple_addrs.resize((size_t)P * 16);
-          ple_workers.store(1);  // only the pump thread accounts for ple_done
+          // pump threads (one per ring) account for ple_done; tiny P (decode/
+          // verify, 16*P rows) keeps a single ring.
+          const int npump = P >= 64 ? std::min(nt, ple_pump_count()) : 1;
+          ple_workers.store(npump);
           for (int w = 0; w < nt; w++)
-            ple_pool.emplace_back([&, w] {
+            ple_pool.emplace_back([&, w, npump] {  // npump by value: block-scoped
               const int t0 = (int)((size_t)w * P / nt), t1 = (int)((size_t)(w + 1) * P / nt);
               for (int t = t0; t < t1; t++) {
                 const int at = ple_base0 + t;
@@ -4661,11 +4706,13 @@ struct GpuModel {
                 }
               }
               ple_barrier.fetch_add(1, std::memory_order_acq_rel);
-              if (w != 0) return;
+              if (w >= npump) return;
               while (ple_barrier.load(std::memory_order_acquire) < nt)
                 std::this_thread::yield();
-              PLE_PUMP.run(ple_addrs.data(), ple_fp8,
-                           (uint64_t)(uintptr_t)ple_table->data, (size_t)P * 16);
+              const size_t nrow = (size_t)P * 16;
+              const size_t r0 = nrow * w / npump, r1 = nrow * (w + 1) / npump;
+              PLE_PUMP_I(w).run(ple_addrs.data() + r0, ple_fp8 + r0 * g_ple_rb,
+                                (uint64_t)(uintptr_t)ple_table->data, r1 - r0);
               if (ple_workers.fetch_sub(1) == 1)
                 ple_done = std::chrono::steady_clock::now();
             });
@@ -5198,7 +5245,11 @@ struct GpuModel {
   }
 
   // Batch QSA for the MTP layer (mirrors qsa_b flash path).
-  void mtp_qsa_b(int P, int base) {
+  // kv_only (aggr 10-05): ingest needs only the persistent state this layer
+  // leaves behind — indexer keys + raw ring and the K/V rows. The query path,
+  // selection, flash, gate and o_proj outputs are never read by any ingest
+  // caller, so they are skipped (identical KV -> identical drafts).
+  void mtp_qsa_b(int P, int base, bool kv_only = false) {
     const char* pfx = "mtp.layers.0.self_attn";
     char buf[128];
     // Table-driven rope (M-RoPE requests carry their 3-row positions in the
@@ -5213,6 +5264,7 @@ struct GpuModel {
         snprintf(buf, sizeof buf, "%s.indexer.index_qk_proj.weight", pfx);
         gemm(wview(ckpt.at(buf)), d_xb, d_iproj, P);
       }
+      if (!kv_only)
       k_index_q<<<dim3(P, 4), 128, 0, g_str>>>(d_iproj, d_minorm, d_iq, P,
                                                g_cfg.norm_eps, g_cfg.rope_theta,
                                                nullptr, base, d_ropecs, nullptr,
@@ -5230,7 +5282,7 @@ struct GpuModel {
       // paged: gather the keys contiguous for the scores (as trunk qsa_b)
       const float* skeys = d_mik;
       const uint16_t* skeys16 = mikh;
-      if (kv_paged && nb > 0 && std::max(2051, base) < base + P) {
+      if (!kv_only && kv_paged && nb > 0 && std::max(2051, base) < base + P) {
         k_ik_gather<<<nb, 128, 0, g_str>>>(d_mik, d_ptab, d_ikg, nb);
         skeys = d_ikg;
         if (mikh) {
@@ -5242,7 +5294,7 @@ struct GpuModel {
       const int a0 = std::max(2051, base);
       const int grid =
           2051 + (a0 - 2051 + INDEX_BATCH - 1) / INDEX_BATCH * INDEX_BATCH;
-      for (int first = a0; first < base + P;) {
+      for (int first = kv_only ? base + P : a0; first < base + P;) {
         int nxt = first < grid ? min(grid, base + P)
                                : min(first + INDEX_BATCH, base + P);
         int count = nxt - first;
@@ -5303,8 +5355,10 @@ struct GpuModel {
         first = nxt;
       }
     }
-    snprintf(buf, sizeof buf, "%s.q_proj.weight", pfx);
-    gemm(wview(ckpt.at(buf)), d_xb, d_qgb, P);
+    if (!kv_only) {
+      snprintf(buf, sizeof buf, "%s.q_proj.weight", pfx);
+      gemm(wview(ckpt.at(buf)), d_xb, d_qgb, P);
+    }
     snprintf(buf, sizeof buf, "%s.k_proj.weight", pfx);
     gemm(wview(ckpt.at(buf)), d_xb, d_kbb, P);
     snprintf(buf, sizeof buf, "%s.v_proj.weight", pfx);
@@ -5313,9 +5367,10 @@ struct GpuModel {
     float* qnw = ensure_norm256(buf);
     snprintf(buf, sizeof buf, "%s.k_norm.weight", pfx);
     float* knw = ensure_norm256(buf);
-    k_qsa_qsplit<true><<<dim3(24, P), 256, 0, g_str>>>(d_qgb, qnw, d_qsb, d_gsb,
-                                                       256, g_cfg.norm_eps, base,
-                                                       d_ropecs);
+    if (!kv_only)
+      k_qsa_qsplit<true><<<dim3(24, P), 256, 0, g_str>>>(d_qgb, qnw, d_qsb, d_gsb,
+                                                         256, g_cfg.norm_eps, base,
+                                                         d_ropecs);
     k_qsa_kprep<false><<<dim3(2, P), 256, 0, g_str>>>(d_kbb, knw, d_kbb,
                                                       nullptr, g_cfg.norm_eps,
                                                       base, d_ropecs);
@@ -5325,7 +5380,7 @@ struct GpuModel {
     if (qsa_kv_fp32) {
       kv_rows_store(d_mkcf, d_kbb, base, P);
       kv_rows_store(d_mvcf, d_vbb, base, P);
-      qsa_flash_b(d_mkcf, d_mvcf, P, dense_P, base, nullptr, kvpt());
+      if (!kv_only) qsa_flash_b(d_mkcf, d_mvcf, P, dense_P, base, nullptr, kvpt());
     } else {
       kv_runs(base, base + P, KV_PAGE, [&](int lr, size_t pr, int n) {
         const size_t so = (size_t)(lr - base) * 512;
@@ -5335,8 +5390,9 @@ struct GpuModel {
         k_f32_to_bf16_v4<<<g, 256, 0, g_str>>>(d_vbb + so, d_mvcb + pr * 512, 512, n,
                                                512);
       });
-      qsa_flash_b(d_mkcb, d_mvcb, P, dense_P, base, nullptr, kvpt());
+      if (!kv_only) qsa_flash_b(d_mkcb, d_mvcb, P, dense_P, base, nullptr, kvpt());
     }
+    if (kv_only) return;
     k_sigmoid_gate<<<(P * 6144 + 255) / 256, 256, 0, g_str>>>(d_attnb, d_gsb,
                                                               d_attnb, P * 6144);
     snprintf(buf, sizeof buf, "%s.o_proj.weight", pfx);
@@ -5419,11 +5475,63 @@ struct GpuModel {
     mtp_input_b(taps, P);
     xf16_src = nullptr;
     mtp_gr_read_b("mtp.layers.0.attn_hyper_connection", P);
-    mtp_qsa_b(P, base);
-    mtp_gr_write_b("mtp.layers.0.attn_hyper_connection", P);
-    mtp_gr_read_b("mtp.layers.0.mlp_hyper_connection", P);
-    mtp_moe_b(P);
-    mtp_gr_write_b("mtp.layers.0.mlp_hyper_connection", P);
+    // aggr 10-05: ingest = KV/indexer build only (see mtp_qsa_b kv_only). The
+    // attention output, the MLP-site HC and the MoE of ingested rows were
+    // never consumed (~80% of a 16K prompt's 425 ms MTP ingest).
+    // GDEC_MTP_INGEST_FULL=1 runs the full layer as before.
+    static const bool full = getenv("GDEC_MTP_INGEST_FULL") != nullptr;
+    static const bool kvo_qsa = !full && !env_zero("GDEC_MTP_KVO_QSA");
+    static const bool kvo_rest = !full && !env_zero("GDEC_MTP_KVO_REST");
+    mtp_qsa_b(P, base, kvo_qsa);
+    static const int rest_lvl = [] {  // bisect: how many of the 4 rest steps run
+      const char* e = getenv("GDEC_MTP_REST_LVL");
+      return e ? atoi(e) : -1;
+    }();
+    const int lvl = rest_lvl >= 0 ? rest_lvl : (kvo_rest ? 0 : 4);
+    if (lvl >= 1) mtp_gr_write_b("mtp.layers.0.attn_hyper_connection", P);
+    if (lvl >= 2) mtp_gr_read_b("mtp.layers.0.mlp_hyper_connection", P);
+    if (lvl >= 3) mtp_moe_b(P);
+    if (lvl >= 4) mtp_gr_write_b("mtp.layers.0.mlp_hyper_connection", P);
+    if (getenv("GDEC_MTP_HASH")) {  // debug: hash the MTP persistent state rows
+      CK(hipStreamSynchronize(g_str));
+      auto fnv = [](uint64_t h, const void* p, size_t n) {
+        const uint8_t* b = (const uint8_t*)p;
+        for (size_t i = 0; i < n; i++) h = (h ^ b[i]) * 1099511628211ULL;
+        return h;
+      };
+      uint64_t hk = 1469598103934665603ULL, hv = hk, hi = hk, hr = hk;
+      std::vector<uint8_t> tmp;
+      kv_runs(base, base + P, KV_PAGE, [&](int, size_t pr, int n) {
+        const size_t bytes = (size_t)n * 512 * (qsa_kv_fp32 ? 4 : 2);
+        tmp.resize(bytes);
+        CK(hipMemcpy(tmp.data(), qsa_kv_fp32 ? (void*)(d_mkcf + pr * 512) : (void*)(d_mkcb + pr * 512),
+                     bytes, hipMemcpyDeviceToHost));
+        hk = fnv(hk, tmp.data(), bytes);
+        CK(hipMemcpy(tmp.data(), qsa_kv_fp32 ? (void*)(d_mvcf + pr * 512) : (void*)(d_mvcb + pr * 512),
+                     bytes, hipMemcpyDeviceToHost));
+        hv = fnv(hv, tmp.data(), bytes);
+      });
+      const int nb = (base + P) / 4, b0 = base / 4;
+      if (!qsa_dense && nb > b0)
+        kv_runs(b0, nb, KV_PAGE_BLOCKS, [&](int, size_t pb, int n) {
+          tmp.resize((size_t)n * 128 * 4);
+          CK(hipMemcpy(tmp.data(), d_mik + pb * 128, tmp.size(), hipMemcpyDeviceToHost));
+          hi = fnv(hi, tmp.data(), tmp.size());
+        });
+      if (d_miraw) {
+        tmp.resize(512 * 4);
+        CK(hipMemcpy(tmp.data(), d_miraw, tmp.size(), hipMemcpyDeviceToHost));
+        hr = fnv(hr, tmp.data(), tmp.size());
+      }
+      fprintf(stderr, "[mtp-hash] base=%d P=%d K=%016llx V=%016llx ik=%016llx ring=%016llx\n",
+              base, P, (unsigned long long)hk, (unsigned long long)hv,
+              (unsigned long long)hi, (unsigned long long)hr);
+    }
+    // The MTP layer's d_xb rows live in the trunk's shared batch buffers: never
+    // leave a bf16-conversion cache entry for them behind (with the KV-only
+    // ingest a later same-shape gemm(d_xb) reused the MTP input — bisected
+    // 10-05: output diverged from plain greedy until this reset).
+    xf16_src = nullptr;
     mtp_pos = base + P;
     CK(hipMemcpyAsync(d_mpos, &mtp_pos, 4, hipMemcpyHostToDevice, g_str));
   }

@@ -2252,8 +2252,16 @@ __global__ void __launch_bounds__(NT)
                 const float* __restrict__ Hw = nullptr,
                 // B3 split-K: A/B 的行距（元素），0 = K（原布局）。非 0 时
                 // X/W 可指向大 K 张量的列切片（X + s*ks, ldA=全 K），免重排。
-                unsigned ldA = 0, unsigned ldB = 0) {
+                unsigned ldA = 0, unsigned ldB = 0,
+                // aggr 10-05: blockIdx.y slices (one launch for several
+                // independent K-slice GEMMs): X += y*zX, W += y*zW, Y += y*zY.
+                unsigned zX = 0, unsigned zW = 0, size_t zY = 0) {
   static_assert(Epi != 1 || (WP == 4 && PW * WP * 16 == BP), "hc epi layout");
+  if (zX | zW | zY) {
+    X += (size_t)blockIdx.y * zX;
+    W += (size_t)blockIdx.y * zW;
+    Y += (size_t)blockIdx.y * zY;
+  }
   constexpr int LSA = KST + 8;        // LDS row stride (elems)
   constexpr int BREG = 8 * LSA + 8;   // W 8-row region stride (elems)
   constexpr int NW = NT / 32;         // warps per block
@@ -2402,6 +2410,10 @@ __global__ void __launch_bounds__(NT)
     const int c = (n0 >> 2) + (wp0 >> 2) + cl;
     // B2-2: Sc 非空时 Rh 指向未归一化的 R，现场乘 (R*sc)*wn（wn=1+Hw[b*d+c]），
     // 比旧路径少一次 Rhat bf16 中间舍入（非逐 bit，KLD 门槛）。
+    float wn[4] = {1.f, 1.f, 1.f, 1.f};  // aggr: hoisted out of the (i, e) loops
+    if (Sc)
+#pragma unroll
+      for (int b = 0; b < 4; ++b) wn[b] = 1.f + __ldg(Hw + (size_t)b * d + c);
 #pragma unroll
     for (int i = 0; i < WM; ++i) {
       const int p0 = m0 + wm0 + i * 16 + rh;
@@ -2410,14 +2422,15 @@ __global__ void __launch_bounds__(NT)
         const int p = p0 + e;
         if (p < P) {
           const uint16_t* Rt = Rh + (size_t)p * 4 * d + c;
+          float4 s4 = make_float4(1.f, 1.f, 1.f, 1.f);
+          if (Sc) s4 = __ldg((const float4*)(Sc + (size_t)p * 4));
+          const float sv[4] = {s4.x, s4.y, s4.z, s4.w};
           float a = 0.f;
 #pragma unroll
           for (int b = 0; b < 4; ++b) {
             float gate = 1.f / (1.f + expf(-acc[i][b][e]));
             const float rv = gw_bf2f(Rt[b * d]);
-            a += gate * (Sc ? (rv * __ldg(Sc + (size_t)p * 4 + b)) *
-                                  (1.f + __ldg(Hw + (size_t)b * d + c))
-                            : rv);
+            a += gate * (Sc ? (rv * sv[b]) * wn[b] : rv);
           }
           const float value = a / 4;
           Y[(size_t)p * d + c] = value;
@@ -2448,6 +2461,41 @@ __global__ void __launch_bounds__(NT)
     }
 }
 // [gemm-wmma-end]
+
+// aggr 10-05 HC mix-down split (GDEC_HC_MIXSPLIT, with GDEC_HC_NORHAT):
+// W'[n][k] = bf16(W[n][k] * (1 + hw[k])) in place (the hc_norm weight folded
+// into the dequanted mix-down weight), so the mix-down reads the raw R' and the
+// per-(token, branch) rms scale is applied once per branch partial in
+// k_hc_mixcomb instead of per element at GEMM staging (B2-2's Epi=2 cost).
+__global__ void k_scale_cols_bf16(uint16_t* __restrict__ W, const float* __restrict__ hw,
+                                  int N, int K) {
+  const size_t n8 = (size_t)N * K / 8;
+  for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n8;
+       i += (size_t)gridDim.x * blockDim.x) {
+    uint4 v = ((uint4*)W)[i];
+    uint16_t* h = (uint16_t*)&v;
+    const int k0 = (int)((i * 8) % (size_t)K);
+#pragma unroll
+    for (int j = 0; j < 8; j++) h[j] = gw_f2bf(gw_bf2f(h[j]) * (1.f + hw[k0 + j]));
+    ((uint4*)W)[i] = v;
+  }
+}
+// t[p][n] = silu(0.25 * sum_b sc[p][b] * part[b][p][n]) -> bf16 (the up GEMM's
+// X operand; replaces k_silu_scale + k_f32_to_bf16_v4). Fixed b order.
+__global__ void k_hc_mixcomb(const float* __restrict__ part, const float* __restrict__ sc,
+                             uint16_t* __restrict__ out, int P, int N) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= P * N) return;
+  const int p = i / N;
+  const size_t ps = (size_t)P * N;
+  const float4 s = *(const float4*)(sc + (size_t)p * 4);
+  float x = s.x * part[i];
+  x += s.y * part[ps + i];
+  x += s.z * part[2 * ps + i];
+  x += s.w * part[3 * ps + i];
+  x *= 0.25f;
+  out[i] = gw_f2bf(x / (1.f + expf(-x)));
+}
 
 // B3 split-K：X[P,K] bf16 重排成 2 个连续列切片 Xs = [P,K/2][P,K/2]
 //（k1 (2560,6144) 专用；proto 证明加速来自 X 连续化，W 维持 strided 原布局）。

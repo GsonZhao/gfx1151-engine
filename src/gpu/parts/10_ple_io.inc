@@ -153,7 +153,13 @@ struct PleUring {
   }
 };
 
-static PleUring g_ple_ring;
+// aggr 10-05: several rings pumped by parallel workers. One pump thread did
+// all 16*P preads (16K prompt: 262K reads ≈ 276 ms on a warm page cache — the
+// per-op syscall/copy cost, not the disk), while L0 on the GPU takes ~210 ms,
+// so the GPU idled at the PLE join. GDEC_PLE_RINGS (default 8, 1 = old).
+static constexpr int kPleRingsMax = 16;
+static PleUring g_ple_rings[kPleRingsMax];
+static int g_ple_nrings = 0;
 static bool g_ple_ring_tried = false;
 
 static bool ple_uring_ready() {
@@ -161,14 +167,25 @@ static bool ple_uring_ready() {
   if (g_ple_fd < 0 || !g_ple_off_ok) return false;
   if (!g_ple_ring_tried) {
     g_ple_ring_tried = true;
-    if (!g_ple_ring.setup(256))  // fixed depth: one structural decision
-      fprintf(stderr,
-              "ple_uring: io_uring_setup failed (%s); using madvise path\n",
-              strerror(g_ple_ring.err ? g_ple_ring.err : EINVAL));
+    int want = 8;
+    if (const char* e = getenv("GDEC_PLE_RINGS")) want = atoi(e);
+    want = std::max(1, std::min(kPleRingsMax, want));
+    for (int i = 0; i < want; i++) {
+      if (!g_ple_rings[i].setup(256)) {  // fixed depth: one structural decision
+        if (i == 0)
+          fprintf(stderr,
+                  "ple_uring: io_uring_setup failed (%s); using madvise path\n",
+                  strerror(g_ple_rings[0].err ? g_ple_rings[0].err : EINVAL));
+        break;
+      }
+      g_ple_nrings = i + 1;
+    }
   }
-  return g_ple_ring.fd >= 0;
+  return g_ple_nrings > 0;
 }
-#define PLE_PUMP g_ple_ring
+static int ple_pump_count() { return g_ple_nrings; }
+#define PLE_PUMP g_ple_rings[0]
+#define PLE_PUMP_I(i) g_ple_rings[i]
 
 #else  // _WIN32 ------------------------------------------------------------
 
@@ -267,7 +284,9 @@ static void ple_uring_open(const char* path) {
 }
 
 static bool ple_uring_ready() { return g_ple_win.ok(); }
+static int ple_pump_count() { return 1; }
 #define PLE_PUMP g_ple_win
+#define PLE_PUMP_I(i) g_ple_win
 
 struct PleWinPrefetch {
   struct Buffer {

@@ -3005,6 +3005,7 @@ static int run(GpuModel& m, const std::string& host, int port) {
     m.borrow_fn = &borrow_turn;
     m.borrow_skip_fn = &borrow_skip;
   }
+  rckpt::prewarm(m.kv_nl > g_cfg.layers / 4);  // pinned checkpoint pool, background
   fprintf(stderr, "serve: listening on %s:%d (maxctx %d, %d slot%s)\n", host.c_str(), port,
           m.maxctx, m.nslots, m.nslots > 1 ? "s" : "");
   static kvsnap::Cfg kvs;  // read-only once serving; workers share it

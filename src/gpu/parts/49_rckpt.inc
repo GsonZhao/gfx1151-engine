@@ -32,14 +32,98 @@ static bool has_image_tok(const T* t, size_t n) {
 
 namespace rckpt {
 
+// aggr 10-05: checkpoint state lives in pooled pinned host buffers and is
+// captured with hipMemcpyAsync on g_str (stream-ordered: the next segment's
+// kernels that overwrite d_S run after the DMA). The old pageable
+// std::vector path (resize = 113 MB zero-fill + page faults, then a bounced
+// synchronous D2H) cost ~38 ms per save, twice per request on the TTFT path
+// (snapshot cut + prompt end). GDEC_RCKPT_SYNC=1 restores synchronous saves.
+struct PinBuf {
+  float* p = nullptr;
+  size_t n = 0;
+  PinBuf() = default;
+  PinBuf(const PinBuf&) = delete;
+  PinBuf& operator=(const PinBuf&) = delete;
+  PinBuf(PinBuf&& o) noexcept : p(o.p), n(o.n) { o.p = nullptr; o.n = 0; }
+  PinBuf& operator=(PinBuf&& o) noexcept {
+    if (this != &o) {
+      put();
+      p = o.p;
+      n = o.n;
+      o.p = nullptr;
+      o.n = 0;
+    }
+    return *this;
+  }
+  ~PinBuf() { put(); }
+  bool get(size_t cnt);
+  void put();
+  float* data() const { return p; }
+  size_t size() const { return n; }
+  bool empty() const { return n == 0; }
+};
+// Pool of free pinned buffers. hipHostMalloc of the 113 MB S buffer costs
+// ~20 ms (plus first-touch), the DMA itself 1.4 ms, so prewarm() fills the
+// pool from a background thread at serve start.
+static std::mutex g_pool_mu;
+static std::vector<std::pair<float*, size_t>>& pin_pool() {
+  static std::vector<std::pair<float*, size_t>> v;
+  return v;
+}
+static size_t g_pool_per_size = 10;
+bool PinBuf::get(size_t cnt) {
+  put();
+  {
+    std::lock_guard<std::mutex> lk(g_pool_mu);
+    auto& pool = pin_pool();
+    for (size_t i = 0; i < pool.size(); i++)
+      if (pool[i].second == cnt) {
+        p = pool[i].first;
+        n = cnt;
+        pool.erase(pool.begin() + (long)i);
+        return true;
+      }
+  }
+  void* q = nullptr;
+  if (hipHostMalloc(&q, cnt * 4, hipHostMallocDefault) != hipSuccess) {
+    (void)hipGetLastError();
+    return false;
+  }
+  p = (float*)q;
+  n = cnt;
+  return true;
+}
+void PinBuf::put() {
+  if (!p) return;
+  {
+    std::lock_guard<std::mutex> lk(g_pool_mu);
+    auto& pool = pin_pool();
+    size_t same = 0;
+    for (auto& e : pool) same += e.second == n;
+    if (same < g_pool_per_size) {
+      pool.push_back({p, n});
+      p = nullptr;
+    }
+  }
+  if (p) (void)hipHostFree(p);
+  p = nullptr;
+  n = 0;
+}
+static bool d2h(PinBuf& b, const void* src, size_t cnt) {
+  static const bool sync = getenv("GDEC_RCKPT_SYNC") != nullptr;
+  if (!b.get(cnt)) return false;
+  if (sync) return hipMemcpy(b.p, src, cnt * 4, hipMemcpyDeviceToHost) == hipSuccess;
+  return hipMemcpyAsync(b.p, src, cnt * 4, hipMemcpyDeviceToHost, g_str) == hipSuccess;
+}
+
 struct Ck {
   std::vector<int> toks;  // tokens covered; restore sets hist/chist to this
   int pos = 0, ringpos = 0;
-  std::vector<float> s, convst, ring, iraw;  // host copies, ~118 MB total
+  PinBuf s, convst, ring, iraw;  // pinned host copies, ~118 MB total
   std::vector<int> pages;  // A3: pinned KV pages for rows [0, pos) (paged only)
   bool mtp_ok = false;     // B0: MTP state below is valid (lockstep at save)
   int mtp_pos = 0;
-  std::vector<float> mR, miraw;  // d_R (h_{pos-1}), d_miraw
+  PinBuf mR, miraw;  // d_R (h_{pos-1}), d_miraw
   // M-RoPE guard (KVS2 meta semantics): placeholder ids are pixel-agnostic,
   // so a vision checkpoint only matches the same grids and patch hash. A
   // checkpoint without image tokens is saved as text (mrope false) and
@@ -103,6 +187,34 @@ static bool prefix_of(const std::vector<int>& t,
 
 bool enabled() { return g_on; }
 
+// Background-fill the pinned pool with g_cap + 2 buffer sets (the LRU keeps at
+// most g_cap checkpoints; +2 covers a save before the evicted one is freed).
+void prewarm(bool with_mtp) {
+  if (!g_on || getenv("GDEC_RCKPT_SYNC")) return;
+  const int nqsa = g_cfg.layers / 4, ngdn = g_cfg.layers - nqsa;
+  std::vector<size_t> sizes = {(size_t)ngdn * 48 * 128 * 128, (size_t)ngdn * 3 * 10240,
+                               9 * 10240, (size_t)nqsa * 512};
+  if (with_mtp) {
+    sizes.push_back((size_t)g_cfg.branches * g_cfg.d);
+    sizes.push_back(4 * 128);
+  }
+  const size_t sets = g_cap + 2;
+  g_pool_per_size = sets;
+  std::thread([sizes, sets] {
+    for (size_t s = 0; s < sets; s++)
+      for (size_t cnt : sizes) {
+        void* q = nullptr;
+        if (hipHostMalloc(&q, cnt * 4, hipHostMallocDefault) != hipSuccess) {
+          (void)hipGetLastError();
+          return;
+        }
+        memset(q, 0, cnt * 4);  // first touch off the request path
+        std::lock_guard<std::mutex> lk(g_pool_mu);
+        pin_pool().push_back({(float*)q, cnt});
+      }
+  }).detach();
+}
+
 // Drop checkpoints whose KV prefix the live state no longer holds. A3: pinned
 // checkpoints own their KV, so nothing to prune.
 void prune(const std::vector<int64_t>& chist) {
@@ -144,30 +256,14 @@ bool save(GpuModel& m, const std::vector<int>& toks, bool mtp = false) {
   ck.toks = toks;
   ck.pos = m.pos;
   ck.ringpos = m.ple_ringpos;
-  ck.s.resize((size_t)ngdn * 48 * 128 * 128);
-  ck.convst.resize((size_t)ngdn * 3 * 10240);
-  ck.ring.resize(9 * 10240);
-  ck.iraw.resize((size_t)nqsa * 512);
-  const bool ok =
-      hipMemcpy(ck.s.data(), m.d_S, ck.s.size() * 4,
-                hipMemcpyDeviceToHost) == hipSuccess &&
-      hipMemcpy(ck.convst.data(), m.d_convst, ck.convst.size() * 4,
-                hipMemcpyDeviceToHost) == hipSuccess &&
-      hipMemcpy(ck.ring.data(), m.d_ring, ck.ring.size() * 4,
-                hipMemcpyDeviceToHost) == hipSuccess &&
-      hipMemcpy(ck.iraw.data(), m.d_iraw, ck.iraw.size() * 4,
-                hipMemcpyDeviceToHost) == hipSuccess;
+  const bool ok = d2h(ck.s, m.d_S, (size_t)ngdn * 48 * 128 * 128) &&
+                  d2h(ck.convst, m.d_convst, (size_t)ngdn * 3 * 10240) &&
+                  d2h(ck.ring, m.d_ring, 9 * 10240) &&
+                  d2h(ck.iraw, m.d_iraw, (size_t)nqsa * 512);
   if (!ok) return false;
   if (mtp_ok) {
-    ck.mR.resize((size_t)g_cfg.branches * g_cfg.d);
-    ck.mtp_ok =
-        hipMemcpy(ck.mR.data(), m.d_R, ck.mR.size() * 4,
-                  hipMemcpyDeviceToHost) == hipSuccess;
-    if (ck.mtp_ok && m.d_miraw) {
-      ck.miraw.resize(4 * 128);
-      ck.mtp_ok = hipMemcpy(ck.miraw.data(), m.d_miraw, ck.miraw.size() * 4,
-                            hipMemcpyDeviceToHost) == hipSuccess;
-    }
+    ck.mtp_ok = d2h(ck.mR, m.d_R, (size_t)g_cfg.branches * g_cfg.d);
+    if (ck.mtp_ok && m.d_miraw) ck.mtp_ok = d2h(ck.miraw, m.d_miraw, 4 * 128);
     ck.mtp_pos = m.mtp_pos;
   }
   if (m.mrope_active_ && has_image_tok(ck.toks.data(), ck.toks.size())) {
