@@ -140,6 +140,11 @@ int main(int argc, char** argv) {
   if (shape == "mixdn" || shape == "all") sweep_mixdn("mixdn", P, 1);
   if (shape == "mixdn4" || shape == "all") sweep_mixdn("mixdn/s4", P, 4);
   if (shape == "upfused" || shape == "all") sweep_up("upfused", P);
+  if (shape == "n640") {
+    sweep0("n640", P, 2560, 640);
+    sweep0("n1280", P, 2560, 1280);
+    sweep0("n512", P, 2560, 512);
+  }
   if (shape == "d9") {
     sweep0("qkv", P, 2560, 10240);
     sweep0("z", P, 2560, 6144);

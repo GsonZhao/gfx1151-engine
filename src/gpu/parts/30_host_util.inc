@@ -817,7 +817,9 @@ static float f16_to_f32_host(uint16_t h) {
 
 // Upload every rotated weight's planes once (f16 -> f32), build the i4r
 // codebook and split-K scratch. No-op on v1 checkpoints. Call after load_arena.
+float* g_q6g_part = nullptr;  // q6g64 split-K partials [16][8][2048]
 static void v2_init(const Checkpoint& ck) {
+  if (!g_q6g_part) CK(hipMalloc(&g_q6g_part, (size_t)16 * 8 * 2048 * 4));
   std::unordered_map<std::string, const float*> up;  // sidecar name -> f32 copy
   auto sidecar = [&](const std::string& n, uint64_t want) -> const float* {
     auto it = up.find(n);
@@ -953,6 +955,41 @@ static void q6g64_gemv_p(const WView& w, const void* x, bool xbf16, uint64_t xs,
     else
       k_q6g64_gemv<P, float, 8><<<blocks, 256, 0, g_str>>>(wq, (const float*)x, xs, y, ys, R,
                                                            C, st);
+  } else if (C >= 4096 && R <= 2048 && [] {
+               const char* e = getenv("GDEC_Q6G_SPLITK");
+               return !(e && e[0] == '0' && e[1] == 0);
+             }()) {
+    // aggr 10-05: split-K for long-K small-R (HC mix-down 320x10240)
+    // fixed-size scratch, allocated on first use before any graph capture
+    // (q6g64_splitk_init from v2_init); C <= 32768 -> ns <= 16.
+    const int ng = C >> 6, gps = 32;
+    const int ns = (ng + gps - 1) / gps;
+    if (!g_q6g_part || ns > 16) {
+      fprintf(stderr, "q6g64 split-K scratch missing (ns=%d)\n", ns);
+      abort();
+    }
+    float* const part = g_q6g_part;
+    const dim3 grid((unsigned)((R + 7) / 8), (unsigned)ns);
+    if (xbf16)
+      k_q6g64_gemv_sk<P, uint16_t><<<grid, 256, 0, g_str>>>(wq, (const uint16_t*)x, xs, part, R,
+                                                           C, st, gps);
+    else
+      k_q6g64_gemv_sk<P, float><<<grid, 256, 0, g_str>>>(wq, (const float*)x, xs, part, R, C,
+                                                        st, gps);
+    k_q6g64_skred<P><<<(unsigned)((P * R + 255) / 256), 256, 0, g_str>>>(part, y, ys, R, ns);
+  } else if (C >= 8192 && [] {
+               // opt-in only: measured slower (P=7 21.4 -> 28.3 ms, 10-05)
+               const char* e = getenv("GDEC_Q6G_ROW256");
+               return e && !(e[0] == '0' && e[1] == 0);
+             }()) {
+    // aggr 10-05: one row per 256-lane block (see k_q6g64_gemv LPR=256)
+    const unsigned blocks = (unsigned)R;
+    if (xbf16)
+      k_q6g64_gemv<P, uint16_t, 256><<<blocks, 256, 0, g_str>>>(wq, (const uint16_t*)x, xs, y,
+                                                                ys, R, C, st);
+    else
+      k_q6g64_gemv<P, float, 256><<<blocks, 256, 0, g_str>>>(wq, (const float*)x, xs, y, ys, R,
+                                                             C, st);
   } else {
     const unsigned blocks = (unsigned)((R + 7) / 8);
     if (xbf16)

@@ -489,13 +489,106 @@ __global__ __launch_bounds__(256) void k_q6g64_gemv(const uint8_t* __restrict__ 
 #pragma unroll
     for (int p = 0; p < P; p++) acc[p] += sc * dx[p] + bi * sx[p];
   }
+  if constexpr (LPR <= 32) {
+#pragma unroll
+    for (int p = 0; p < P; p++)
+#pragma unroll
+      for (int off = LPR / 2; off > 0; off >>= 1) acc[p] += __shfl_xor(acc[p], off, LPR);
+    if (li == 0)
+#pragma unroll
+      for (int p = 0; p < P; p++) y[(size_t)p * ys + r] = acc[p];
+  } else {
+    // aggr 10-05: LPR = 256 (one row per block) for the K=10240 HC mix-down /
+    // inject: the LPR=32 form ran 40 blocks for R=320 (192 us, 13 GB/s at
+    // P=7). Wave shfl tree, then a fixed-order sum of the 8 wave partials.
+    static_assert(LPR == 256, "LPR > 32 means one 256-lane row per block");
+    __shared__ float red[P][8];
+#pragma unroll
+    for (int p = 0; p < P; p++)
+#pragma unroll
+      for (int off = 16; off > 0; off >>= 1) acc[p] += __shfl_xor(acc[p], off, 32);
+    if ((tid & 31) == 0)
+#pragma unroll
+      for (int p = 0; p < P; p++) red[p][tid >> 5] = acc[p];
+    __syncthreads();
+    if (tid < P) {
+      float s = red[tid][0];
+#pragma unroll
+      for (int w = 1; w < 8; w++) s += red[tid][w];
+      y[(size_t)tid * ys + r] = s;
+    }
+  }
+}
+
+// aggr 10-05: split-K q6g64 GEMV for the K=10240 HC mix-down at P<=8. The
+// LPR=32 kernel ran 40 blocks (R=320 / 8 rows) with 5 serial groups per lane
+// (~192 us, latency-bound). Here blockIdx.y = K slice of gps groups; partial
+// part[s][p][r] (same per-lane group order inside a slice, then the slices are
+// summed in order by k_q6g64_skred) -> deterministic, not bit-identical to
+// the LPR=32 kernel (different summation tree).
+template <int P, typename TX>
+__global__ __launch_bounds__(256) void k_q6g64_gemv_sk(const uint8_t* __restrict__ wq,
+                                                       const TX* __restrict__ x, uint64_t xs,
+                                                       float* __restrict__ part, int R, int C,
+                                                       int st, int gps) {
+  // One wave per row; 8 lanes share a 64-col group (lane sub = 8-elem slice
+  // i8), 4 groups per wave step -> a wave's x loads are 512 contiguous bytes
+  // (the LPR=32 kernel's lanes were 128 B apart: 32 lines per load).
+  constexpr int LPR = 32;
+  const int tid = threadIdx.x;
+  const int r = blockIdx.x * (256 / LPR) + tid / LPR;
+  const int li = tid % LPR;
+  const int sub = li & 7, gq = li >> 3;
+  const int s = blockIdx.y;
+  if (r >= R) return;
+  const uint8_t* row = wq + (size_t)r * st;
+  const int g0 = s * gps, g1 = min(C >> 6, g0 + gps);
+  float acc[P];
+#pragma unroll
+  for (int p = 0; p < P; p++) acc[p] = 0.f;
+  for (int g = g0 + gq; g < g1; g += 4) {
+    const uint32_t lw = *(const uint32_t*)(row + g * 32 + sub * 4);
+    const uint32_t hw = *(const uint32_t*)(row + C / 2 + g * 16 + (sub >> 1) * 4);
+    const uint32_t sb = *(const uint32_t*)(row + 3 * C / 4 + g * 4);
+    const float sc = __half2float(__ushort_as_half((unsigned short)(sb & 0xffffu)));
+    const float bi = __half2float(__ushort_as_half((unsigned short)(sb >> 16)));
+    float cf[8];
+#pragma unroll
+    for (int e = 0; e < 8; e++) {
+      const uint32_t lo = (lw >> (4 * e)) & 15u;
+      const uint32_t hi = (hw >> (2 * ((sub & 1) * 8 + e))) & 3u;
+      cf[e] = (float)(lo | (hi << 4));
+    }
+#pragma unroll
+    for (int p = 0; p < P; p++) {
+      float xv[8];
+      hv2::ldx8(x + (size_t)p * xs + g * 64 + sub * 8, xv);
+      float dx = 0.f, sx = 0.f;
+#pragma unroll
+      for (int e = 0; e < 8; e++) {
+        dx = fmaf(cf[e], xv[e], dx);
+        sx += xv[e];
+      }
+      acc[p] += sc * dx + bi * sx;
+    }
+  }
 #pragma unroll
   for (int p = 0; p < P; p++)
 #pragma unroll
     for (int off = LPR / 2; off > 0; off >>= 1) acc[p] += __shfl_xor(acc[p], off, LPR);
   if (li == 0)
 #pragma unroll
-    for (int p = 0; p < P; p++) y[(size_t)p * ys + r] = acc[p];
+    for (int p = 0; p < P; p++) part[((size_t)s * P + p) * R + r] = acc[p];
+}
+template <int P>
+__global__ void k_q6g64_skred(const float* __restrict__ part, float* __restrict__ y,
+                              uint64_t ys, int R, int ns) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= P * R) return;
+  const int p = i / R, r = i % R;
+  float v = part[(size_t)p * R + r];
+  for (int s = 1; s < ns; s++) v += part[((size_t)s * P + p) * R + r];
+  y[(size_t)p * ys + r] = v;
 }
 
 // One thread per 64-col group -> bf16 W[R][C].

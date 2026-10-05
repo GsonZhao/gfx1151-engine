@@ -77,11 +77,17 @@ struct GpuModel {
   // proto（tools/b3_splitk_proto.cu，logs/b3_splitk3.log）：16K 下
   // 14.5+0.5 ms vs 16.4 ms（x1.13）；收益来自 X 连续切片，strided 版 x0.84
   // 已否决。默认开，GDEC_GEMM_SPLITK=0 退出。
+  // B3 split-K: Windows +1.3% (10-03); Linux 16K −1.6% (aggr 10-05: unsplit
+  // k1 16.35 ms vs split+repack ~18.8) -> Linux default off, GDEC_GEMM_SPLITK=1 on.
   static bool gemm_splitk_on() {
+#ifdef _WIN32
+    static const bool want = !env_zero("GDEC_GEMM_SPLITK");
+#else
+    static const bool want = getenv("GDEC_GEMM_SPLITK") && !env_zero("GDEC_GEMM_SPLITK");
+#endif
     static const bool on = getenv("GDEC_GEMM_WMMA") != nullptr &&
                            getenv("GDEC_GEMM_NO_K64") == nullptr &&
-                           getenv("GDEC_GEMM_RB") == nullptr &&
-                           !env_zero("GDEC_GEMM_SPLITK");
+                           getenv("GDEC_GEMM_RB") == nullptr && want;
     return on;
   }
   int* d_iselected = nullptr;
@@ -2257,13 +2263,26 @@ struct GpuModel {
         return;
       }
       const bool gw_d3 = (N == 2560 && K == 6144);
-      const bool gw_d9 = (K == 2560 && (N == 6144 || N == 10240 || N == 12288));
-      const bool gw_d9n = (N == 10240 && K == 320) ||
-                          (N == 512 && K == 2560) || (N == 2560 && K == 640);
+      static const bool d9_old0 = getenv("GDEC_GEMM_D9_OLD") != nullptr;
+      // aggr: N=640 (shared gate/up, indexer proj; was hipBLASLt ~1.7 ms @16K)
+      // and N=512 join the 128x128 tile route (1.33 / 1.06 ms @16K).
+      const bool gw_d9 = (K == 2560 && (N == 6144 || N == 10240 || N == 12288 ||
+                                        (!d9_old0 && (N == 640 || N == 512))));
+      const bool gw_d9n = !gw_d9 && ((N == 10240 && K == 320) ||
+                                     (N == 512 && K == 2560) || (N == 2560 && K == 640));
       if (gw_d3 || gw_d9 || gw_d9n) {
         const unsigned gw_grid =
             (unsigned)(((P + 127) / 128) * (int)((N + 255) / 256));
-        if (gw_d3)
+        // aggr 10-05 (tools/gemm_tune d9 @16384): 128x128 w2x2 f4x4 128-thread
+        // tile beats the 128x256 d9 one — qkv N=10240 22.0 vs 22.8 ms (gm=4),
+        // z N=6144 12.8 vs 13.8 ms (gm=1). GDEC_GEMM_D9_OLD=1 restores.
+        static const bool d9_old = getenv("GDEC_GEMM_D9_OLD") != nullptr;
+        if (gw_d9 && !d9_old) {
+          const unsigned g2 = (unsigned)(((P + 127) / 128) * (int)((N + 127) / 128));
+          k_gemm_wmma<128, 128, 2, 2, 4, 4, 32, 128>
+              <<<g2, 128, 0, g_str>>>(xp, wp, y, P, (int)K, (int)N,
+                                      (N == 10240 || N == 12288) ? 4 : 1);
+        } else if (gw_d3)
           k_gemm_wmma<128, 256, 2, 8, 4, 2, 32, 512>
               <<<gw_grid, 512, 0, g_str>>>(xp, wp, y, P, (int)K, (int)N, 16);
         else if (gw_d9)
@@ -4539,9 +4558,12 @@ struct GpuModel {
   // the graph to drain — poll the last layer's event here at 1 s cadence.
   void prog_wait(int P) {
     if (!prog_ev[g_cfg.layers - 1]) return;
+    // 1 ms poll (was 20 ms: up to 20 ms of TTFT per served chunk end, i.e. at
+    // the snapshot cut and again at the prompt end). prog_print self-limits
+    // to its 1 s cadence.
     while (hipEventQuery(prog_ev[g_cfg.layers - 1]) == hipErrorNotReady) {
       prog_print(P);
-      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+      std::this_thread::sleep_for(std::chrono::microseconds(1000));
     }
   }
 
