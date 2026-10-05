@@ -1485,6 +1485,82 @@ __global__ void k_router_topk(const float* __restrict__ logits, int* __restrict_
   }
 }
 
+// Batched k_router_topk, one wave32 per token (aggr 10-05). n == 512, k <= 16.
+// Bit-identical to k_router_topk: lane l holds logits l + 32*j (j = 0..15);
+// the softmax sum replays the 512-wide LDS tree order exactly (off 256..32 are
+// in-lane j-pair adds, off 16..1 are shfl_down adds on lane 0's chain), max is
+// order-free, and each top-k round is the same argmax (largest p, ties -> the
+// lowest index, which is what the strict-> tree keeps). The old kernel spends
+// ~100 block barriers per token (2.25 ms/layer at P=16K); this one none.
+template <int k>
+__global__ void __launch_bounds__(256) k_router_topk_w32(const float* __restrict__ logits,
+                                                         int* __restrict__ ids,
+                                                         float* __restrict__ ws, int P) {
+  const int lane = threadIdx.x & 31;
+  const int tok = blockIdx.x * 8 + (threadIdx.x >> 5);
+  if (tok >= P) return;
+  logits += (size_t)tok * 512;
+  ids += (size_t)tok * 16;
+  ws += (size_t)tok * 16;
+  float v[16], p[16];
+#pragma unroll
+  for (int j = 0; j < 16; j++) v[j] = logits[lane + 32 * j];
+  float mx = v[0];
+#pragma unroll
+  for (int j = 1; j < 16; j++) mx = fmaxf(mx, v[j]);
+#pragma unroll
+  for (int o = 16; o; o >>= 1) mx = fmaxf(mx, __shfl_xor(mx, o, 32));
+#pragma unroll
+  for (int j = 0; j < 16; j++) p[j] = expf(v[j] - mx);
+  // tree sum in the LDS kernel's order: s[t] += s[t+off] for off = 256..1
+  float a[16];
+#pragma unroll
+  for (int j = 0; j < 16; j++) a[j] = p[j];
+#pragma unroll
+  for (int j = 0; j < 8; j++) a[j] += a[j + 8];   // off 256
+#pragma unroll
+  for (int j = 0; j < 4; j++) a[j] += a[j + 4];   // off 128
+#pragma unroll
+  for (int j = 0; j < 2; j++) a[j] += a[j + 2];   // off 64
+  a[0] += a[1];                                    // off 32
+  float s = a[0];
+#pragma unroll
+  for (int o = 16; o; o >>= 1) s += __shfl_down(s, o, 32);  // off 16..1 (lane 0 chain)
+  s = __shfl(s, 0, 32);
+  const float inv_se = 1.f / s;
+#pragma unroll
+  for (int j = 0; j < 16; j++) p[j] *= inv_se;
+  float raw[k];
+#pragma unroll
+  for (int r = 0; r < k; r++) {
+    float bv = p[0];
+    int bi = lane;
+#pragma unroll
+    for (int j = 1; j < 16; j++)
+      if (p[j] > bv) { bv = p[j]; bi = lane + 32 * j; }
+#pragma unroll
+    for (int o = 16; o; o >>= 1) {
+      const float ov = __shfl_xor(bv, o, 32);
+      const int oi = __shfl_xor(bi, o, 32);
+      if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+    }
+    raw[r] = bv;
+    if (lane == 0) ids[r] = bi;
+    if ((bi & 31) == lane) {
+#pragma unroll
+      for (int j = 0; j < 16; j++)
+        if (j == (bi >> 5)) p[j] = -1e30f;
+    }
+  }
+  if (lane == 0) {
+    float sw = 0.f;
+#pragma unroll
+    for (int j = 0; j < k; j++) sw += raw[j];
+#pragma unroll
+    for (int j = 0; j < k; j++) ws[j] = raw[j] / sw;
+  }
+}
+
 // Sort the P*k (expert, slot) pairs by expert id (ties by slot index) so
 // same-expert slots become adjacent in k_q4cp_gemv_gg's warp order: the
 // duplicate expert weight reads then execute in the same scheduling window

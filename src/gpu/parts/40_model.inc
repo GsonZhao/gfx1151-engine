@@ -3647,6 +3647,15 @@ struct GpuModel {
   // Returns true when the HC write-back of the moe output was fused into the
   // reduce (B2-1; only on the LUT sg_fuse paths with try_hcw set): R is
   // updated, acc/d_yb are not written and the caller skips gr_write_b.
+  // d_routerb [P][512] -> d_topidsb/d_topwb. wave-per-token kernel (bit-
+  // identical, aggr 10-05); GDEC_ROUTER_W32=0 restores the block-per-token one.
+  void router_topk_b(int P, int k) {
+    static const bool w32 = !env_zero("GDEC_ROUTER_W32");
+    if (w32 && g_cfg.experts == 512 && k == 10)
+      k_router_topk_w32<10><<<(P + 7) / 8, 256, 0, g_str>>>(d_routerb, d_topidsb, d_topwb, P);
+    else
+      k_router_topk<<<P, 512, 0, g_str>>>(d_routerb, d_topidsb, d_topwb, g_cfg.experts, k);
+  }
   bool moe_b(int l, int P, bool try_hcw = false) {
     char buf[128];
     const bool direct_output = pp_moe_out && P > 8;
@@ -3654,7 +3663,7 @@ struct GpuModel {
     snprintf(buf, sizeof buf, "layers.%d.mlp.gate.weight", l);
     gemm(wview(ckpt.at(buf)), d_xb, d_routerb, P);
     int k = g_cfg.topk;
-    k_router_topk<<<P, 512, 0, g_str>>>(d_routerb, d_topidsb, d_topwb, g_cfg.experts, k);
+    router_topk_b(P, k);
     // GDEC_MOE_UNION_LOG=1: distinct experts across the P rows (P<=8, i.e.
     // verify); decides whether naive-MoE expert dedup is worth it.
     static const bool moe_union_log = getenv("GDEC_MOE_UNION_LOG") != nullptr;
@@ -4878,6 +4887,10 @@ struct GpuModel {
               "prof: gemm_host=%.0fms topk_wait=%.0fms bucket+h2d=%.0fms "
               "ple_host=%.0fms ple_wait=%.0fms\n",
               p_gemm, p_topk_wait, p_bucket, p_pleh, p_ple_wait);
+    if (prof && P >= 64) {  // per-chunk view: zero the accumulators (aggr 10-05)
+      fprintf(stderr, "prof-chunk: P=%d wall=%.1fms\n", P, sec * 1e3);
+      p_gemm = p_topk_wait = p_bucket = p_pleh = p_ple_wait = 0;
+    }
 #ifdef GDEC_PHASE_PROF
     if (getenv("GDEC_PHASE_PROF")) {
       CK(hipStreamSynchronize(g_str));
@@ -5338,8 +5351,7 @@ struct GpuModel {
     snprintf(buf, sizeof buf, "%s.gate.weight", pfx);
     gemm(wview(ckpt.at(buf)), d_xb, d_routerb, P);
     int k = g_cfg.topk, E = g_cfg.experts, npairs = P * k;
-    k_router_topk<<<P, 512, 0, g_str>>>(d_routerb, d_topidsb, d_topwb,
-                                        g_cfg.experts, k);
+    router_topk_b(P, k);
     if (gg_mtp_on()) {  // GGUF sidecar experts; overwrites d_moeaccb
       moe_gguf(g_ggx_mtp, d_xb, d_topidsb, d_topwb, d_moeaccb, P);
       mtp_moe_b_shared(P);

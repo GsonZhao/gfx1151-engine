@@ -2426,24 +2426,40 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
     // speculative one would report the previous request's acceptance
     m.live_spec_rounds = m.live_spec_commits = m.live_spec_proposed = 0;
     std::vector<kvsnap::Pending> pend;  // SSD captures, committed at turn end
+    static const bool cut_prof = getenv("GDEC_PROF") != nullptr;
+    auto cut_tp = t0;
+    auto cut_lap = [&](const char* what) {
+      if (!cut_prof) return;
+      CK(hipStreamSynchronize(g_str));
+      auto now = std::chrono::steady_clock::now();
+      fprintf(stderr, "cutprof: %-12s %8.1f ms\n", what,
+              std::chrono::duration<double, std::milli>(now - cut_tp).count());
+      cut_tp = now;
+    };
+    cut_lap("pre-cuts");
     for (size_t cc : cuts) {
       std::vector<int> seg(g.ids.begin() + done_upto, g.ids.begin() + cc);
       cur = m.prefill_batch(seg, (int)done_upto);
+      cut_lap("seg-prefill");
       hist.assign(g.ids.begin(), g.ids.begin() + cc);
       // The segment leaves MTP position cc-1 pending (mtp_pos == pos-1,
       // d_R == h_{cc-1}): checkpoint that lockstep state, then pair h_{cc-1}
       // with token cc, which the next segment's ingest would otherwise skip.
       rckpt::save(m, hist, use_spec || chain_mtp);
+      cut_lap("rckpt-save");
       if (!kvs.dir.empty()) kvsnap::capture(m, hist, use_spec || chain_mtp, pend);
+      cut_lap("kvsnap-cap");
       if (use_spec || chain_mtp) {
         std::vector<int> bt{g.ids[cc]};
         m.mtp_ingest_b(m.d_R, bt, 1, (int)cc - 1);
       }
       done_upto = cc;
       m.yield_point();  // consistent state between segments
+      cut_lap("mtp+yield");
     }
     std::vector<int> seg(g.ids.begin() + done_upto, g.ids.end());
     cur = m.prefill_batch(seg, (int)done_upto);
+    cut_lap("last-prefill");
     m.prog_total = 0;
     m.mtp_tap_capture = false;  // decode/verify must not capture taps
     hist = g.ids;  // prompt fully ingested on both paths
@@ -2452,6 +2468,7 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
       m.get_logits(lbuf);
       cur = smp.sample(lbuf, &cur_lp);
     }
+    cut_lap("sample");
     double pre_ms = std::chrono::duration<double, std::milli>(
                         std::chrono::steady_clock::now() - t0)
                         .count();
