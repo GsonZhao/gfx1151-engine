@@ -1993,8 +1993,10 @@ __global__ void __launch_bounds__(128)
       om[t] = 0;
       ++t;
     }
+    // pad with a real block id != own (mask 0 -> invisible, never matches
+    // the causal override): 0xFFFF collided with block 65535 at 256K ctx.
     while (t & 3) {
-      ob[t] = 0xFFFFu;
+      ob[t] = (uint16_t)(own - 1);
       om[t] = 0;
       ++t;
     }
@@ -2009,13 +2011,18 @@ __global__ void __launch_bounds__(128)
 // ptile LDS 回转成 PV 的 B 操作数；PV 的 A = V（vct 转置 cache，4 slot 一次
 // 64-bit 读），C 的行是 perm 后的维度、列是 Q 行。每 chunk 恰 2 次
 // __syncthreads()，K 描述符与 fragment 软件流水预取。
+// Paged (aggr 10-05): K rows / vct blocks go through the page table (logical
+// block ids in ublk; the own-block causal check stays logical).
+template <bool Paged = false>
 __global__ void __launch_bounds__(256)
     k_qsa_wmma_u(const float* __restrict__ q, const uint16_t* __restrict__ kc,
                  const uint16_t* __restrict__ vct, float* __restrict__ out,
                  int dh, int hkv, int hq,
                  const uint16_t* __restrict__ ublk,
                  const uint16_t* __restrict__ umask,
-                 const int* __restrict__ ucount, int cap, int g0, int kbase) {
+                 const int* __restrict__ ucount, int cap, int g0, int kbase,
+                 const int* __restrict__ ptab = nullptr) {
+  (void)ptab;
   const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5, r = lane & 15,
             hi = lane >> 4;
   const int g = blockIdx.x, kvh = blockIdx.y;
@@ -2069,14 +2076,14 @@ __global__ void __launch_bounds__(256)
     b01 = bb.x; b23 = bb.y; m01 = mm.x; m23 = mm.y;
   };
   auto blk_of = [&](const uint32_t b01, const uint32_t b23, const int j) -> int {
-    const uint32_t v = (j < 2 ? b01 : b23) >> (16 * (j & 1)) & 0xFFFFu;
-    return v == 0xFFFFu ? 0 : (int)v;
+    return (int)((j < 2 ? b01 : b23) >> (16 * (j & 1)) & 0xFFFFu);
   };
   // K：行主序 bf16 cache 按键 gather；lane r 持有 chunk 内第 r 个 key 的
   // [32w,+32) 维（硬件 A 布局实际取 lane 2r/17+2(r-8) -> key 交错
   // 0,2,4,...,14,1,3,...,15，掩码侧按同一 perm 映射）。
   auto load_k = [&](const uint32_t b01, const uint32_t b23, qw_shortx16* kf) {
-    const int src = 4 * blk_of(b01, b23, r >> 2) + (r & 3);
+    int src = 4 * blk_of(b01, b23, r >> 2) + (r & 3);
+    if constexpr (Paged) src = kv_row(ptab, src);
     const uint16_t* krow = kc + ((size_t)src * hkv + kvh) * dh + w * 32;
 #pragma unroll
     for (int t = 0; t < 2; ++t) kf[t] = qw_ld16(krow + 16 * t);
@@ -2106,7 +2113,11 @@ __global__ void __launch_bounds__(256)
       const uint16_t* vb[4];
 #pragma unroll
       for (int j = 0; j < 4; ++j)
-        vb[j] = vct + (((size_t)blk_of(b01, b23, j) * hkv + kvh) * dh) * 4;
+      {
+        int vbk = blk_of(b01, b23, j);
+        if constexpr (Paged) vbk = ik_blk(ptab, vbk);
+        vb[j] = vct + (((size_t)vbk * hkv + kvh) * dh) * 4;
+      }
 #pragma unroll
       for (int t = 0; t < 2; ++t) {
         const int d = 32 * w + 16 * t + r;
@@ -2368,8 +2379,13 @@ __device__ __forceinline__ uint4 gw_stage_normA(const uint16_t* p, int arow,
 // to Yb. Only the column->block assignment changes, not the K accumulation,
 // so G and x are bit-identical to the unfused pair. Requires WP == 4,
 // PW * 64 == BP and N % BP == 0 (host-checked); G never touches DRAM.
+// PF (aggr 10-05): global->register prefetch depth. PF=2 keeps two register
+// stage sets so the loads for step ks+2 are in flight during compute(ks) and
+// compute(ks+1): ~2 compute stages of latency cover for the L2-miss-heavy
+// shapes (o_proj L2 hit 13.6%, served from MALL/DRAM). Same LDS double
+// buffer, same K order -> bit-identical to PF=1.
 template <int BM, int BP, int MW, int PW, int WM, int WP, int KST, int NT,
-          int Epi = 0>
+          int Epi = 0, int PF = 1>
 __global__ void __launch_bounds__(NT)
     k_gemm_wmma(const uint16_t* __restrict__ X, const uint16_t* __restrict__ W,
                 float* __restrict__ Y, int P, int K, int N, int gm,
@@ -2518,14 +2534,26 @@ __global__ void __launch_bounds__(NT)
   uint4 ra0[AN], rb0[BN];
   GWMMA_STAGE_LOAD(ra0, rb0, 0);
   GWMMA_STAGE_STORE(0, ra0, rb0);
-  gwmma_sync();
-
-#pragma unroll 1
-  for (int ks = 0; ks < ksteps; ++ks) {
-    GWMMA_STAGE_LOAD(ra0, rb0, min(ks + 1, ksteps - 1));
-    GWMMA_COMPUTE(ks & 1);
-    GWMMA_STAGE_STORE((ks & 1) ^ 1, ra0, rb0);
+  if constexpr (PF == 2) {
+    // (aggr) the PF=2 register-pipelined form spilled (private 336 B) and ran
+    // 5x slower on gfx1151; kept compiling as an alias of PF=1 for A/B tools.
     gwmma_sync();
+#pragma unroll 1
+    for (int ks = 0; ks < ksteps; ++ks) {
+      GWMMA_STAGE_LOAD(ra0, rb0, min(ks + 1, ksteps - 1));
+      GWMMA_COMPUTE(ks & 1);
+      GWMMA_STAGE_STORE((ks & 1) ^ 1, ra0, rb0);
+      gwmma_sync();
+    }
+  } else {
+    gwmma_sync();
+#pragma unroll 1
+    for (int ks = 0; ks < ksteps; ++ks) {
+      GWMMA_STAGE_LOAD(ra0, rb0, min(ks + 1, ksteps - 1));
+      GWMMA_COMPUTE(ks & 1);
+      GWMMA_STAGE_STORE((ks & 1) ^ 1, ra0, rb0);
+      gwmma_sync();
+    }
   }
 #undef GWMMA_STAGE_LOAD
 #undef GWMMA_STAGE_STORE

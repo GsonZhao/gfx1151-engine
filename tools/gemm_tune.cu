@@ -30,8 +30,42 @@ __device__ __forceinline__ qw_shortx16 qw_ld16(const uint16_t* p) {
 }
 #include "gemm_wmma_kernel_live.inc"
 
+static int g_dump_isa = 0;
 static uint16_t *dX, *dW, *dR, *dYb;
 static float *dY, *dSc, *dHw;
+
+// PF A/B: time PF=1 and PF=2 of one config and bit-compare their outputs.
+template <int BM, int BP, int MW, int PW, int WM, int WP, int KST, int NT>
+static void run_pf(const char* tag, int P, int K, int N, int gm) {
+  const unsigned gx = (unsigned)(((P + BM - 1) / BM) * ((N + BP - 1) / BP));
+  std::vector<float> h1((size_t)P * N), h2((size_t)P * N);
+  float ms[2];
+  for (int v = 0; v < 2; v++) {
+    auto launch = [&] {
+      if (v == 0)
+        k_gemm_wmma<BM, BP, MW, PW, WM, WP, KST, NT, 0, 1><<<gx, NT>>>(dX, dW, dY, P, K, N, gm);
+      else
+        k_gemm_wmma<BM, BP, MW, PW, WM, WP, KST, NT, 0, 2><<<gx, NT>>>(dX, dW, dY, P, K, N, gm);
+    };
+    for (int i = 0; i < 3; i++) launch();
+    CK(hipDeviceSynchronize());
+    hipEvent_t a, b;
+    CK(hipEventCreate(&a));
+    CK(hipEventCreate(&b));
+    CK(hipEventRecord(a));
+    for (int i = 0; i < 20; i++) launch();
+    CK(hipEventRecord(b));
+    CK(hipEventSynchronize(b));
+    CK(hipEventElapsedTime(&ms[v], a, b));
+    ms[v] /= 20;
+    CK(hipMemcpy(v ? h2.data() : h1.data(), dY, (size_t)P * N * 4, hipMemcpyDeviceToHost));
+  }
+  size_t mis = 0;
+  for (size_t i = 0; i < h1.size(); i++) mis += memcmp(&h1[i], &h2[i], 4) != 0;
+  printf("%-8s P=%-6d N=%-5d K=%-5d <%d,%d,..,KST%d,NT%d> gm=%d  PF1 %7.3f ms (%5.1f TF)  PF2 %7.3f ms (%5.1f TF)  %+.1f%%  mismatch %zu\n",
+         tag, P, N, K, BM, BP, KST, NT, gm, ms[0], 2.0 * P * K * N / (ms[0] * 1e9),
+         ms[1], 2.0 * P * K * N / (ms[1] * 1e9), (ms[0] / ms[1] - 1) * 100, mis);
+}
 
 template <int BM, int BP, int MW, int PW, int WM, int WP, int KST, int NT, int Epi = 0>
 static void run(const char* tag, int P, int K, int N, int gm, int split = 1, bool sc = false) {
@@ -140,6 +174,18 @@ int main(int argc, char** argv) {
   if (shape == "mixdn" || shape == "all") sweep_mixdn("mixdn", P, 1);
   if (shape == "mixdn4" || shape == "all") sweep_mixdn("mixdn/s4", P, 4);
   if (shape == "upfused" || shape == "all") sweep_up("upfused", P);
+  if (shape == "pf") {  // production configs, PF=1 vs PF=2
+    run_pf<64, 128, 2, 2, 2, 4, 64, 128>("oproj", P, 6144, 2560, 1);
+    run_pf<128, 128, 2, 2, 4, 4, 32, 128>("qkv", P, 2560, 10240, 4);
+    run_pf<128, 128, 2, 2, 4, 4, 32, 128>("z", P, 2560, 6144, 1);
+    //q12k needs a bigger dW
+    run_pf<128, 128, 2, 2, 4, 4, 32, 128>("n640", P, 2560, 640, 1);
+    run_pf<64, 160, 2, 2, 2, 5, 64, 128>("mixdn", P, 10240, 320, 1);
+    run_pf<128, 128, 2, 2, 4, 4, 32, 128>("sgdn", P, 640, 2560, 1);
+  }
+  if (shape == "op1") {  // engine oproj config, counters
+    for (int i = 0; i < 3; i++) run<64, 128, 2, 2, 2, 4, 64, 128>("op1", P, 6144, 2560, 1);
+  }
   if (shape == "z1") {  // single config for counter collection
     for (int i = 0; i < 3; i++) run<128, 128, 2, 2, 4, 4, 32, 128>("z1", P, 2560, 6144, 1);
   }

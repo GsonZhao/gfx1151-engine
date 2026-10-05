@@ -167,7 +167,10 @@ struct GpuModel {
   bool qsa_wmma6 = qsa_wmma_btv && getenv("GDEC_QSA_WMMA6") != nullptr;
   // GDEC_QSA_UNION=1: 4-query 块并集 WMMA prefill（k_qsa_union_merge +
   // k_qsa_wmma_u），叠加在转置 V 路径上；组边缘回退 k_qsa_wmma<true>。
-  bool qsa_union = qsa_wmma_btv && getenv("GDEC_QSA_UNION") != nullptr;
+  // aggr 10-05: default ON (paged support + tail-edge sel-offset fix added;
+  // 16K +0.9% paged, +2.2% unpaged; NOT bit-identical — key order — KLD
+  // pending). GDEC_QSA_UNION=0 restores the per-token kernel.
+  bool qsa_union = qsa_wmma_btv && !env_zero("GDEC_QSA_UNION");
   uint16_t* d_ublk = nullptr;  // [ngroups][QSA_UCAP] 并集块号
   uint16_t* d_umask = nullptr; // [ngroups][QSA_UCAP] 4 query x 4 slot 掩码
   int* d_ucount = nullptr;     // [ngroups] 并集块数（含 pad，4 的倍数）
@@ -475,7 +478,7 @@ struct GpuModel {
   }();
 
   explicit GpuModel(const Checkpoint& c, int mc) : ckpt(c), maxctx(mc) {
-    if (qsa_union && maxctx > 262144) {
+    if (qsa_union && maxctx > 262144) {  // block ids uint16: 65536 blocks max
       fprintf(stderr, "qsa: disabling GDEC_QSA_UNION above 256K because its "
                       "block ids are uint16\n");
       qsa_union = false;
@@ -639,7 +642,7 @@ struct GpuModel {
       // A1c: the BF16 cache is paged on the k_qsa_flash (dense / decode) and
       // k_qsa_wmma<*, true> (sparse prefill, with or without BTV) kernels.
       // The union / wmma6 / k_qsa_flash_bf16 sparse kernels are not paged.
-      const bool bf16_ok = qsa_dense || (qsa_wmma && !qsa_wmma6 && !qsa_union);
+      const bool bf16_ok = qsa_dense || (qsa_wmma && !qsa_wmma6);  // union: paged since aggr
       if (mode && !qsa_kv_fp32 && !bf16_ok) {
         fprintf(stderr, "[kvpage] GDEC_KV_PAGED ignored: with GDEC_QSA_KV_BF16, "
                         "paging needs GDEC_QSA_WMMA (with or without _BTV) and no "
@@ -3052,18 +3055,28 @@ struct GpuModel {
             const int ngroups = (ge - ga) >> 2;
             k_qsa_union_merge<<<ngroups, 128, 0, g_str>>>(
                 d_iselected, ga, d_ublk, d_umask, d_ucount, QSA_UCAP, base);
-            k_qsa_wmma_u<<<dim3(ngroups, 2), 256, 0, g_str>>>(
-                d_qsb, kc, vc_transposed, d_attnb, 256, 2, 24, d_ublk, d_umask,
-                d_ucount, QSA_UCAP, ga, base);
+            if (ptab)
+              k_qsa_wmma_u<true><<<dim3(ngroups, 2), 256, 0, g_str>>>(
+                  d_qsb, kc, vc_transposed, d_attnb, 256, 2, 24, d_ublk, d_umask,
+                  d_ucount, QSA_UCAP, ga, base, ptab);
+            else
+              k_qsa_wmma_u<<<dim3(ngroups, 2), 256, 0, g_str>>>(
+                  d_qsb, kc, vc_transposed, d_attnb, 256, 2, 24, d_ublk, d_umask,
+                  d_ucount, QSA_UCAP, ga, base);
           }
-          if (ga > first_abs)
-            k_qsa_wmma<true><<<dim3(ga - first_abs, 2), 256, 0, g_str>>>(
-                d_qsb, kc, vc, vc_transposed, d_attnb, P, 256, 2, 24, sel,
-                first_abs, base);
-          if (base + P > ge)
-            k_qsa_wmma<true><<<dim3(base + P - ge, 2), 256, 0, g_str>>>(
-                d_qsb, kc, vc, vc_transposed, d_attnb, P, 256, 2, 24, sel, ge,
-                base);
+          // ragged edges: per-token kernel (selected rows relative to its
+          // own first token -> offset sel)
+          auto edge = [&](int f, int n) {
+            const int* es = sel + (size_t)(f - first_abs) * 512;
+            if (ptab)
+              k_qsa_wmma<true, true><<<dim3(n, 2), 256, 0, g_str>>>(
+                  d_qsb, kc, vc, vc_transposed, d_attnb, P, 256, 2, 24, es, f, base, ptab);
+            else
+              k_qsa_wmma<true><<<dim3(n, 2), 256, 0, g_str>>>(
+                  d_qsb, kc, vc, vc_transposed, d_attnb, P, 256, 2, 24, es, f, base);
+          };
+          if (ga > first_abs) edge(first_abs, std::min(ga, base + P) - first_abs);
+          if (base + P > ge && ge >= ga) edge(ge, base + P - ge);
         }
         else if (qsa_wmma6 && vc_transposed)
           k_qsa_wmma6<<<dim3(nsparse, 2), 128, 0, g_str>>>(
@@ -7862,7 +7875,11 @@ struct GpuModel {
   // by the borrower; chunk-level member state is restored explicitly.
   void conc_borrow_yield(int base, int P, int layer) {
     if (!ws_ok_ || !borrow_query_fn || ws_lent_ || P <= conc_rmax_) return;
-    if (moe_lt || qsa_union) return;  // paths with unduplicated scratch
+    // moe_lt: unduplicated scratch live across layers. qsa_union's
+    // d_ublk/d_umask/d_ucount are written and consumed inside one qsa_flash_b
+    // call -> dead at this layer boundary, so a borrower may reuse them
+    // (aggr 10-05: union is default-on; refusing here would disable D1b).
+    if (moe_lt) return;
     if (!borrow_query_fn()) return;
     CK(hipEventRecord(conc_ev_b_, g_str));
     CK(hipEventSynchronize(conc_ev_b_));  // GPU drained through this layer

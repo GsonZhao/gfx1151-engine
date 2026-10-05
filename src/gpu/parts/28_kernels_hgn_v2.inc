@@ -347,16 +347,26 @@ __global__ __launch_bounds__(256) void k_ht_gemv(const uint8_t* __restrict__ cod
   }
   __syncthreads();
   if (gridDim.y > 1) {
+    // aggr 10-05: deterministic split-K. Each K slice stores its partial in
+    // its own slot zs[(kz*P + p)*O + row]; the last-arriving block sums the
+    // slots in kz order. (The float atomicAdd form made v2 decode / verify
+    // depend on block arrival order: spec-decode and 4-slot serving outputs
+    // were not reproducible.)
     for (int i = tid; i < P * 128; i += 256)
-      atomicAdd(zs + (size_t)(i >> 7) * O + ty * 128 + (i & 127), zl[i]);
+      zs[((size_t)kz * P + (i >> 7)) * O + ty * 128 + (i & 127)] = zl[i];
     __threadfence();
     __syncthreads();
     if (tid == 0) s_last = atomicAdd(cnt + ty, 1) == (int)gridDim.y - 1;
     __syncthreads();
     if (!s_last) return;
     __threadfence();
-    for (int i = tid; i < P * 128; i += 256)
-      zl[i] = atomicExch(zs + (size_t)(i >> 7) * O + ty * 128 + (i & 127), 0.f);
+    for (int i = tid; i < P * 128; i += 256) {
+      const size_t o = (size_t)(i >> 7) * O + ty * 128 + (i & 127);
+      float s = __builtin_nontemporal_load(zs + o);
+      for (int k2 = 1; k2 < (int)gridDim.y; k2++)
+        s += __builtin_nontemporal_load(zs + (size_t)k2 * P * O + o);
+      zl[i] = s;
+    }
     if (tid == 0) atomicExch(cnt + ty, 0);
     __syncthreads();
   }

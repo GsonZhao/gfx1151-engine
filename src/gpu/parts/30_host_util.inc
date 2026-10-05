@@ -790,7 +790,7 @@ static std::unordered_map<std::string, V2Rot> g_v2rot;  // weight name -> planes
 static float* g_i4r_cb = nullptr;   // linear codebook -8..7 for the q4cp-style kernels
 static float* g_ht_zs = nullptr;    // split-K partial z, zero between launches
 static int* g_ht_cnt = nullptr;     // split-K per-tile-row arrival counters
-static constexpr size_t kHtZs = 8ull * 262144;
+static constexpr size_t kHtZs = 16ull << 20;  // split-K slots: ks * P * O floats
 static bool g_hgn_v2 = false;
 
 static float f16_to_f32_host(uint16_t h) {
@@ -912,10 +912,12 @@ static void ht_gemv_p(const WView& w, const void* x, bool xbf16, uint64_t xs, fl
   // than they win (microbench 10240x2048 / 2048x4096). LDS holds tpc tiles
   // of rotated x per pass (<= 24 tile-rows) or the 8 wave partials.
   int ks = std::max(1, std::min((80 + nty - 1) / nty, ntx));
+  // deterministic split-K needs ks separate slots: shrink ks to fit
+  while (ks > 1 && (size_t)ks * P * nty * 128 > kHtZs) ks = (ks + 1) / 2;
   const int tpb = (ntx + ks - 1) / ks;
   ks = (ntx + tpb - 1) / tpb;
   const int tpc = std::min(tpb, std::max(1, 24 / P));
-  if (ks > 1 && ((size_t)P * nty * 128 > kHtZs || nty > 4096))
+  if (ks > 1 && ((size_t)ks * P * nty * 128 > kHtZs || nty > 4096))
     throw std::runtime_error("ht gemv: split-K scratch too small");
   const size_t lds = (size_t)std::max(P * tpc, 8 * P) * 128 * 4;
   const dim3 grid((unsigned)nty, (unsigned)ks);
@@ -955,7 +957,7 @@ static void q6g64_gemv_p(const WView& w, const void* x, bool xbf16, uint64_t xs,
     else
       k_q6g64_gemv<P, float, 8><<<blocks, 256, 0, g_str>>>(wq, (const float*)x, xs, y, ys, R,
                                                            C, st);
-  } else if (C >= 4096 && R <= 2048 && [] {
+  } else if (P >= 2 && C >= 4096 && R <= 2048 && [] {  // P=1: LPR=32 faster (decode -1.7%)
                const char* e = getenv("GDEC_Q6G_SPLITK");
                return !(e && e[0] == '0' && e[1] == 0);
              }()) {
