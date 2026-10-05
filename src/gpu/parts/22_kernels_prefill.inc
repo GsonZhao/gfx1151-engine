@@ -2414,8 +2414,11 @@ __global__ void __launch_bounds__(NT)
   static_assert(BM == MW * WM * 16 && BP == PW * WP * 16, "tile mismatch");
   static_assert(BM * (KST / 8) % NT == 0 && BP * (KST / 8) % NT == 0,
                 "staging mismatch");
-  __shared__ uint16_t As[2][BM * LSA];
-  __shared__ uint16_t Bs[2][(BP / 8) * BREG];
+  // PF == 3 (aggr): single LDS buffer (half the LDS -> 2x CTAs per WGP for the
+  // LDS-limited long-K tiles), two barriers per K step. Same K order.
+  constexpr int NBUF = PF == 3 ? 1 : 2;
+  __shared__ uint16_t As[NBUF][BM * LSA];
+  __shared__ uint16_t Bs[NBUF][(BP / 8) * BREG];
 
   const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
   // grouped swizzle for L2/MALL reuse (group along token blocks)
@@ -2534,7 +2537,17 @@ __global__ void __launch_bounds__(NT)
   uint4 ra0[AN], rb0[BN];
   GWMMA_STAGE_LOAD(ra0, rb0, 0);
   GWMMA_STAGE_STORE(0, ra0, rb0);
-  if constexpr (PF == 2) {
+  if constexpr (PF == 3) {
+    gwmma_sync();
+#pragma unroll 1
+    for (int ks = 0; ks < ksteps; ++ks) {
+      GWMMA_STAGE_LOAD(ra0, rb0, min(ks + 1, ksteps - 1));
+      GWMMA_COMPUTE(0);
+      gwmma_sync();
+      GWMMA_STAGE_STORE(0, ra0, rb0);
+      gwmma_sync();
+    }
+  } else if constexpr (PF == 2) {
     // (aggr) the PF=2 register-pipelined form spilled (private 336 B) and ran
     // 5x slower on gfx1151; kept compiling as an alias of PF=1 for A/B tools.
     gwmma_sync();

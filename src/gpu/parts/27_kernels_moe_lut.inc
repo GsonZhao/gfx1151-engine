@@ -150,15 +150,31 @@ __launch_bounds__(256) __global__
   constexpr int kMidRow = BM + 2;
   constexpr int kMidPlaneB = 64 * kMidRow * 2;
   constexpr int kStageOff = kMid ? (BN > 64 ? 2 * kMidPlaneB : kMidPlaneB) : 0;
-  constexpr int kLdsStage = kStageBytes > 8 * 1024 ? kStageBytes : 8 * 1024;
+  // aggr 10-05: non-kMid kernels double-buffer the LDS stage (commit of
+  // stage s+1 overlaps compute of stage s, one barrier per stage). Same K
+  // order -> bit-identical. MOE_LUT_NODB restores the single buffer.
+  // measured 10-05: down share2 15.98 -> 16.33 ms (LDS x2 halves occupancy) -> opt-in only
+#ifdef MOE_LUT_DB
+  constexpr bool kDB = !kMid && BN <= 128;
+#else
+  constexpr bool kDB = false;
+#endif
+  constexpr int kLdsStage = (kDB ? 2 : 1) * kStageBytes > 8 * 1024 ? (kDB ? 2 : 1) * kStageBytes
+                                                                    : 8 * 1024;
   constexpr int kLdsBytes =
       kMid ? kStageOff + (kStageBytes > kMidPlaneB ? kStageBytes : kMidPlaneB) : kLdsStage;
   static_assert(!kMid || kLdsBytes <= 64 * 1024, "kMid LDS");
   __shared__ __attribute__((aligned(16))) uint8_t lds[kLdsBytes];
   __shared__ uint32_t s_cbp[kLut == kI4R || kQ4Perm ? 1 : 256];  // i4r: arithmetic; perm: registers
-  auto* s_codes = reinterpret_cast<uint4*>(lds + kStageOff);
-  auto* s_scale = reinterpret_cast<uint32_t*>(lds + kStageOff + kCodeBytes);
-  auto* s_act = reinterpret_cast<uint4*>(lds + kStageOff + kCodeBytes + kScaleBytes);
+  uint4* s_codes = reinterpret_cast<uint4*>(lds + kStageOff);
+  uint32_t* s_scale = reinterpret_cast<uint32_t*>(lds + kStageOff + kCodeBytes);
+  uint4* s_act = reinterpret_cast<uint4*>(lds + kStageOff + kCodeBytes + kScaleBytes);
+  const auto set_buf = [&](int b) {
+    uint8_t* const sb = lds + kStageOff + b * kStageBytes;
+    s_codes = reinterpret_cast<uint4*>(sb);
+    s_scale = reinterpret_cast<uint32_t*>(sb + kCodeBytes);
+    s_act = reinterpret_cast<uint4*>(sb + kCodeBytes + kScaleBytes);
+  };
 
   if ((int)blockIdx.y >= *ntiles) return;
   const int tid = threadIdx.x;
@@ -327,6 +343,17 @@ __launch_bounds__(256) __global__
           __builtin_bit_cast(__half2, s_scale[kLut == kI4R ? row : kb * BM + row]);
       const uint32_t words[4] = {raw[kb].x, raw[kb].y, raw[kb].z, raw[kb].w};
       __half2 h[16];
+#ifdef MOE_LUT_ABLATE_DECODE
+      if constexpr (kLut == kI4R) {  // ablation: raw bits as halves (wrong numerics, timing only)
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+          h[4 * i + 0] = __builtin_bit_cast(__half2, words[i]);
+          h[4 * i + 1] = __builtin_bit_cast(__half2, words[i] ^ 0x11111111u);
+          h[4 * i + 2] = __builtin_bit_cast(__half2, words[i] ^ 0x22222222u);
+          h[4 * i + 3] = __builtin_bit_cast(__half2, words[i] ^ 0x33333333u);
+        }
+      } else
+#endif
       if constexpr (kLut == kI4R) {
         // Arithmetic decode (bit-identical to the s_cbp table path): f16 bits
         // 0x6400+nib = 1024+nib (exact); minus 1032 -> nib-8 (exact,
@@ -410,12 +437,29 @@ __launch_bounds__(256) __global__
 #pragma unroll
     for (int j = 0; j < kTokTiles; ++j) acc[j] = v8f{0, 0, 0, 0, 0, 0, 0, 0};
     fetch_stage(0);
-    for (int kb0 = 0; kb0 < num_kb; kb0 += BK) {
+    if constexpr (kDB) {
+      set_buf(0);
       commit_stage();
       __syncthreads();
-      if (kb0 + BK < num_kb) fetch_stage(kb0 + BK);
-      compute_stage();
-      __syncthreads();
+      for (int kb0 = 0, b = 0; kb0 < num_kb; kb0 += BK, b ^= 1) {
+        const bool more = kb0 + BK < num_kb;
+        if (more) fetch_stage(kb0 + BK);
+        set_buf(b);
+        compute_stage();
+        if (more) {
+          set_buf(b ^ 1);
+          commit_stage();
+        }
+        __syncthreads();
+      }
+    } else {
+      for (int kb0 = 0; kb0 < num_kb; kb0 += BK) {
+        commit_stage();
+        __syncthreads();
+        if (kb0 + BK < num_kb) fetch_stage(kb0 + BK);
+        compute_stage();
+        __syncthreads();
+      }
     }
     if constexpr (kMid) {
       // Spill acc to the f16 plane [slot][row]: the same rounding the kRaw

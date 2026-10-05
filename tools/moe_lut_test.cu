@@ -50,6 +50,11 @@
 #include "../src/gguf.h"
 #include "../src/hgn.h"
 
+#ifdef MOE_LUT_ABLATE_DECODE
+#define MOE_ABL_SKIP 1
+#else
+#define MOE_ABL_SKIP 0
+#endif
 struct MoeTile { int expert, first, count; };
 #include "../src/gpu/parts/26_kernels_moe_gguf.inc"
 #define MOE_LUT_SHARE34_PROTO 1  // 放开 BN=192/256 static_assert（§13.7 否决原型的复测口）
@@ -1370,7 +1375,7 @@ int main(int argc, char** argv) {
     }
     if (!ok_bits) {
       printf("RESULT FAIL\n");
-      return 1;
+      if (!MOE_ABL_SKIP) return 1;
     }
   }
   if (share && v2) {
@@ -1479,7 +1484,7 @@ int main(int argc, char** argv) {
     }
     if (!ok_bits) {
       printf("RESULT FAIL\n");
-      return 1;
+      if (!MOE_ABL_SKIP) return 1;
     }
   }
 
@@ -1538,7 +1543,7 @@ int main(int argc, char** argv) {
     if (bad) ok_bits = false;
     if (!ok_bits) {
       printf("RESULT FAIL\n");
-      return 1;
+      if (!MOE_ABL_SKIP) return 1;
     }
   }
 
@@ -1575,7 +1580,7 @@ int main(int argc, char** argv) {
     CK(hipFree(d_hidref));
     if (bad) {
       printf("RESULT FAIL\n");
-      return 1;
+      if (!MOE_ABL_SKIP) return 1;
     }
   }
 

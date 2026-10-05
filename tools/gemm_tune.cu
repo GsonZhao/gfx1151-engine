@@ -45,7 +45,7 @@ static void run_pf(const char* tag, int P, int K, int N, int gm) {
       if (v == 0)
         k_gemm_wmma<BM, BP, MW, PW, WM, WP, KST, NT, 0, 1><<<gx, NT>>>(dX, dW, dY, P, K, N, gm);
       else
-        k_gemm_wmma<BM, BP, MW, PW, WM, WP, KST, NT, 0, 2><<<gx, NT>>>(dX, dW, dY, P, K, N, gm);
+        k_gemm_wmma<BM, BP, MW, PW, WM, WP, KST, NT, 0, 3><<<gx, NT>>>(dX, dW, dY, P, K, N, gm);
     };
     for (int i = 0; i < 3; i++) launch();
     CK(hipDeviceSynchronize());
