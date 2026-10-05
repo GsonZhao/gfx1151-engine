@@ -442,6 +442,19 @@ struct GpuModel {
   float* d_csnap = nullptr;    // [maxbatch+1][ngdn][3*10240]
   float* d_iproj_snap = nullptr;  // [nqsa][maxbatch+1][128]
   bool spec_snap = false;         // set around spec verify chunks only
+  // aggr 10-05 in-pass snapshot cut: the serve loop used to split the prompt
+  // at the frontend snapshot point cc (prefill [0,cc), checkpoint, then a tiny
+  // [cc,N) pass ~70 ms of extra TTFT). With cut_abs = cc the single pass
+  // assembles the recurrent state at cc into shadow buffers instead (GDN S by
+  // splitting the fused scan at the cut row, conv / PLE ring / indexer rings
+  // by replaying their update with the first r rows, d_R = stream row cc-1,
+  // MTP ring at cc-1); with_cut_state() swaps them in for rckpt / kvsnap.
+  int cut_abs = -1;   // absolute cut position, -1 = off
+  int cut_r_ = 0;     // chunk-local cut row this chunk (0 = none)
+  bool cut_hit = false, cut_mtp_hit = false;
+  float *d_cS = nullptr, *d_cconvst = nullptr, *d_cring = nullptr, *d_ciraw = nullptr,
+        *d_cR = nullptr, *d_cmiraw = nullptr;
+  bool cut_busy = false;  // NOT per slot: one shadow set, one owner at a time
   // Greedy draft chain without per-step D2H: step j reads step j-1's argmax
   // via D2D, one blocking D2H collects the chain. 0 restores per-step sync.
   const bool draft_desync =
@@ -2707,7 +2720,29 @@ struct GpuModel {
       // Per-(t,b) arithmetic is T-invariant (proto: R/Rhat bit-identical), the
       // 4-token serial loop was pure latency at 4 blocks. GDEC_SCAT_T1=0: T=4.
       static const bool scat_t1 = !env_zero("GDEC_SCAT_T1");
-      if (scat_t1 && P <= 8 && !write_done)
+      // v2 (coalesced + pipelined): kernel −5% only (this op is at ~190 GB/s,
+      // bandwidth-bound) and not bit-identical -> opt-in GDEC_GR_SCAT_V2=1.
+      static const bool scat_v2 = getenv("GDEC_GR_SCAT_V2") && !env_zero("GDEC_GR_SCAT_V2");
+      static const bool scat_t8 = getenv("GDEC_GR_SCAT_T8") != nullptr;
+      if (scat_v2 && scat_t8 && g_cfg.d == 2560 && P > 8) {
+        if (write_done)
+          k_gr_scatter_norm_inj_bf16_v2<8, false><<<4 * ((P + 7) / 8), 256, 0, g_str>>>(
+              nullptr, nullptr, (uint16_t*)d_Rb, nullptr, hw, rh, wn, d_injp[nxt], P,
+              g_cfg.norm_eps, sc);
+        else
+          k_gr_scatter_norm_inj_bf16_v2<8><<<4 * ((P + 7) / 8), 256, 0, g_str>>>(
+              pfull, pin, (uint16_t*)d_Rb, y, hw, rh, wn, d_injp[nxt], P,
+              g_cfg.norm_eps, sc);
+      } else if (scat_v2 && g_cfg.d == 2560 && P > 8) {
+        if (write_done)
+          k_gr_scatter_norm_inj_bf16_v2<4, false><<<4 * ((P + 3) / 4), 256, 0, g_str>>>(
+              nullptr, nullptr, (uint16_t*)d_Rb, nullptr, hw, rh, wn, d_injp[nxt], P,
+              g_cfg.norm_eps, sc);
+        else
+          k_gr_scatter_norm_inj_bf16_v2<4><<<4 * ((P + 3) / 4), 256, 0, g_str>>>(
+              pfull, pin, (uint16_t*)d_Rb, y, hw, rh, wn, d_injp[nxt], P,
+              g_cfg.norm_eps, sc);
+      } else if (scat_t1 && P <= 8 && !write_done)
         k_gr_scatter_norm_inj_bf16<1><<<4 * P, 256, 0, g_str>>>(
             pfull, pin, (uint16_t*)d_Rb, y, hw, rh, wn, d_injp[nxt],
             g_cfg.d, P, g_cfg.norm_eps, sc);
@@ -2784,6 +2819,9 @@ struct GpuModel {
             d_qkvb, convst, d_csnap + (size_t)gi * 3 * 10240, P, 10240,
             (size_t)ngdn * 3 * 10240);
       }
+      if (cut_r_)  // in-pass cut: conv state after the first r rows
+        k_convst_update<<<(10240 + 255) / 256, 256, 0, g_str>>>(
+            d_cconvst + (size_t)gi * 3 * 10240, d_qkvb, cut_r_, 10240);
       k_convst_update<<<(10240 + 255) / 256, 256, 0, g_str>>>(convst, d_qkvb, P,
                                                               10240);
       if (!cl2)
@@ -2806,8 +2844,23 @@ struct GpuModel {
                                               d_gdn_ws, P, 10240);
       } else if (gdn_fused) {
         // one launch for all of P: no window, no workspace; S in/out via global
-        k_gdn_fused<<<48, 1024, 0, g_str>>>(d_convb, d_g48b, d_beta48b, S,
-                                            d_convb, P, 10240);
+        const int r = cut_r_;
+        float* const cS = d_cS ? d_cS + (size_t)gi * 48 * 128 * 128 : nullptr;
+        if (r > 0 && r < P) {
+          // in-pass cut: scan [0, r), keep S(cut), scan [r, P) (chunk grid
+          // restarts at r -> not bit-identical to the single launch)
+          k_gdn_fused<<<48, 1024, 0, g_str>>>(d_convb, d_g48b, d_beta48b, S,
+                                              d_convb, r, 10240);
+          CK(hipMemcpyAsync(cS, S, (size_t)48 * 128 * 128 * 4, hipMemcpyDeviceToDevice, g_str));
+          k_gdn_fused<<<48, 1024, 0, g_str>>>(
+              d_convb + (size_t)r * 10240, d_g48b + (size_t)r * 48, d_beta48b + (size_t)r * 48,
+              S, d_convb + (size_t)r * 10240, P - r, 10240);
+        } else {
+          k_gdn_fused<<<48, 1024, 0, g_str>>>(d_convb, d_g48b, d_beta48b, S,
+                                              d_convb, P, 10240);
+          if (r == P)
+            CK(hipMemcpyAsync(cS, S, (size_t)48 * 128 * 128 * 4, hipMemcpyDeviceToDevice, g_str));
+        }
       } else {
         // Keep producer and consumer close; S carries the exact recurrence
         // across windows and the last window alone can contain a padded chunk.
@@ -3436,6 +3489,9 @@ struct GpuModel {
                                                  vbptr(), keys16);
       k_index_ring<<<min(P, 4), 128, 0, g_str>>>(d_iproj, d_iraw + qi * 512, P, base,
                                                  vbptr());
+      if (cut_r_)  // in-pass cut: raw ring after the first r rows
+        k_index_ring<<<min(cut_r_, 4), 128, 0, g_str>>>(d_iproj, d_ciraw + qi * 512,
+                                                         cut_r_, base, vbptr());
       if (spec_snap)
         k_iproj_snap<<<P, 128, 0, g_str>>>(
             d_iproj, d_iproj_snap + (size_t)qi * 9 * 128, P);
@@ -3697,6 +3753,58 @@ struct GpuModel {
   // Returns true when the HC write-back of the moe output was fused into the
   // reduce (B2-1; only on the LUT sg_fuse paths with try_hcw set): R is
   // updated, acc/d_yb are not written and the caller skips gr_write_b.
+  // ---- in-pass snapshot cut (see cut_abs) ----
+  bool cut_snap_supported() const {
+    static const bool off = env_zero("GDEC_CUT_INPASS");
+    return !off && gdn_fused && !gdn_loop && !gdn_nosplit && gr_bf16 && !ple_loop;
+  }
+  void cut_alloc() {
+    if (d_cS) return;
+    const int nqsa = g_cfg.layers / 4, ngdn = g_cfg.layers - nqsa;
+    CK(hipMalloc(&d_cS, (size_t)ngdn * 48 * 128 * 128 * 4));
+    CK(hipMalloc(&d_cconvst, (size_t)ngdn * 3 * 10240 * 4));
+    CK(hipMalloc(&d_cring, (size_t)9 * 10240 * 4));
+    CK(hipMalloc(&d_ciraw, (size_t)nqsa * 4 * 128 * 4));
+    CK(hipMalloc(&d_cR, (size_t)g_cfg.branches * g_cfg.d * 4));
+    CK(hipMalloc(&d_cmiraw, (size_t)4 * 128 * 4));
+  }
+  // chunk start: r = chunk-local cut row in (0, P], else 0. Copies the
+  // pre-chunk rings / conv state; the per-site replays below update them.
+  void cut_begin_chunk(int base, int P) {
+    cut_r_ = (cut_abs > base && cut_abs <= base + P) ? cut_abs - base : 0;
+    if (!cut_r_) return;
+    const int nqsa = g_cfg.layers / 4, ngdn = g_cfg.layers - nqsa;
+    CK(hipMemcpyAsync(d_cconvst, d_convst, (size_t)ngdn * 3 * 10240 * 4,
+                      hipMemcpyDeviceToDevice, g_str));
+    CK(hipMemcpyAsync(d_cring, d_ring, (size_t)9 * 10240 * 4, hipMemcpyDeviceToDevice, g_str));
+    if (d_iraw)
+      CK(hipMemcpyAsync(d_ciraw, d_iraw, (size_t)nqsa * 4 * 128 * 4, hipMemcpyDeviceToDevice,
+                        g_str));
+  }
+  // Run fn with the cut-point state swapped in (pos = cut_abs). mtp: the MTP
+  // ring snapshot was taken, so the lockstep invariant mtp_pos == pos-1 holds.
+  template <class F>
+  void with_cut_state(bool mtp, F&& fn) {
+    const int sv_pos = pos, sv_ring = ple_ringpos, sv_mpos = mtp_pos;
+    auto swp = [&] {
+      std::swap(d_S, d_cS);
+      std::swap(d_convst, d_cconvst);
+      std::swap(d_ring, d_cring);
+      if (d_iraw) std::swap(d_iraw, d_ciraw);
+      std::swap(d_R, d_cR);
+      if (mtp && d_miraw) std::swap(d_miraw, d_cmiraw);
+    };
+    swp();
+    pos = cut_abs;
+    ple_ringpos = cut_abs % 9;
+    if (mtp) mtp_pos = cut_abs - 1;
+    fn();
+    swp();
+    pos = sv_pos;
+    ple_ringpos = sv_ring;
+    mtp_pos = sv_mpos;
+  }
+
   // d_routerb [P][512] -> d_topidsb/d_topwb. wave-per-token kernel (bit-
   // identical, aggr 10-05); GDEC_ROUTER_W32=0 restores the block-per-token one.
   void router_topk_b(int P, int k) {
@@ -4441,6 +4549,8 @@ struct GpuModel {
     k_add2<<<(unsigned)((tot + 255) / 256), 256, 0, g_str>>>(d_Rb, d_Ub, d_convoutb,
                                                              (int)tot);
     k_ple_ring_wr<<<9, 256, 0, g_str>>>(d_Unb, d_ring, P, 10240, base, vbptr());
+    if (cut_r_)  // in-pass cut: PLE ring after the first r rows
+      k_ple_ring_wr<<<9, 256, 0, g_str>>>(d_Unb, d_cring, cut_r_, 10240, base, vbptr());
   }
 
   void enq_layer_b(int l, int P, bool fuse_prev_mlp = false,
@@ -4652,6 +4762,7 @@ struct GpuModel {
     moe_dump_base_ = base;
     kv_prepare(base, base + P);  // A2/A3: back (and unshare) rows [base, base+P)
     set_vbase(base);  // P3-A: all base-reading batch kernels this chunk read d_vbase
+    cut_begin_chunk(base, P);
     static const bool phase_prof = getenv("GDEC_PHASE") != nullptr;
     auto phase = [&](const char* tag, std::chrono::steady_clock::time_point& tp) {
       if (!phase_prof) return;
@@ -4920,6 +5031,16 @@ struct GpuModel {
         CK(hipMemcpyAsync(d_mtap, d_Rb, (size_t)P * 10240 * 4,
                           hipMemcpyDeviceToDevice, g_str));
       }
+    }
+    if (cut_r_) {  // in-pass cut: d_R(cut) = final stream row cut-1
+      if (gr_bf16)
+        k_bf16_to_f32<<<(10240 + 255) / 256, 256, 0, g_str>>>(
+            (const uint16_t*)d_Rb + (size_t)(cut_r_ - 1) * 10240, d_cR, 10240);
+      else
+        CK(hipMemcpyAsync(d_cR, d_Rb + (size_t)(cut_r_ - 1) * 10240, 10240 * 4,
+                          hipMemcpyDeviceToDevice, g_str));
+      cut_hit = true;
+      cut_r_ = 0;
     }
     // hand off last row to the single-token decode state
     if (gr_bf16)
@@ -5300,6 +5421,14 @@ struct GpuModel {
                                                  g_cfg.norm_eps,
                                                  g_cfg.rope_theta, base, d_miraw,
                                                  d_ropecs, kvpt(), nullptr, mikh);
+      if (cut_abs > 0 && d_cmiraw && cut_abs - 1 >= base && cut_abs - 1 <= base + P) {
+        // in-pass cut: MTP lockstep at the cut = rows [0, cut-1) ingested
+        CK(hipMemcpyAsync(d_cmiraw, d_miraw, 4 * 128 * 4, hipMemcpyDeviceToDevice, g_str));
+        const int rr = cut_abs - 1 - base;
+        if (rr > 0)
+          k_index_ring<<<min(rr, 4), 128, 0, g_str>>>(d_iproj, d_cmiraw, rr, base);
+        cut_mtp_hit = true;
+      }
       k_index_ring<<<min(P, 4), 128, 0, g_str>>>(d_iproj, d_miraw, P, base);
       // paged: gather the keys contiguous for the scores (as trunk qsa_b)
       const float* skeys = d_mik;
@@ -7543,6 +7672,7 @@ struct GpuModel {
   X(mrope_active_) X(rope_delta_) X(mrope_pos_) X(mrope_grids_) X(d_rdelta)   \
   X(img_inj) X(img_hash_) X(d_img_emb) X(img_emb_rows) X(img_emb_cap)         \
   X(mtp_tap_capture) X(spec_snap) X(ngram_verify_active)                      \
+  X(cut_abs) X(cut_r_) X(cut_hit) X(cut_mtp_hit)                              \
   X(prog_total) X(prog_base) X(prog_last_est) X(prog_req) X(prog_t0)          \
   X(prog_last) X(last_spec_rounds) X(last_spec_commit) X(last_spec_rollbacks) \
   X(last_spec_proposed) X(live_spec_rounds) X(live_spec_commits)              \

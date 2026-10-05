@@ -272,6 +272,21 @@ bool save(GpuModel& m, const std::vector<int>& toks, bool mtp = false) {
     ck.img_hash = m.img_hash_;
     ck.grids = m.mrope_grids_;
   }
+  if (getenv("GDEC_RCKPT_HASH")) {  // debug: hash the saved state (after the async D2H)
+    CK(hipStreamSynchronize(g_str));
+    auto fnv = [](const PinBuf& b) {
+      uint64_t h = 1469598103934665603ULL;
+      const uint8_t* p = (const uint8_t*)b.data();
+      for (size_t i = 0; i < b.size() * 4; i++) h = (h ^ p[i]) * 1099511628211ULL;
+      return (unsigned long long)h;
+    };
+    fprintf(stderr,
+            "[rckpt-hash] n=%zu pos=%d ring=%d S=%016llx conv=%016llx ring=%016llx iraw=%016llx "
+            "mR=%016llx miraw=%016llx mtp=%d mpos=%d\n",
+            toks.size(), ck.pos, ck.ringpos, fnv(ck.s), fnv(ck.convst), fnv(ck.ring),
+            fnv(ck.iraw), ck.mtp_ok ? fnv(ck.mR) : 0ULL, ck.mtp_ok ? fnv(ck.miraw) : 0ULL,
+            (int)ck.mtp_ok, ck.mtp_pos);
+  }
   prune(m.chist);
   if (g_pin) ck.pages = m.kv_pin(m.pos);
   g_list.push_back(std::move(ck));

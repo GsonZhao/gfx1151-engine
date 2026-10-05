@@ -2437,6 +2437,14 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
       cut_tp = now;
     };
     cut_lap("pre-cuts");
+    // aggr 10-05: the LAST cut is taken in-pass (no separate tiny tail pass);
+    // earlier cuts keep the split path. GDEC_CUT_INPASS=0 disables.
+    size_t inpass_cc = 0;
+    if (!cuts.empty() && m.cut_snap_supported() && g.mrope_grids.empty() && !m.cut_busy) {
+      inpass_cc = cuts.back();
+      cuts.pop_back();
+      m.cut_busy = true;  // released after the save below
+    }
     for (size_t cc : cuts) {
       std::vector<int> seg(g.ids.begin() + done_upto, g.ids.begin() + cc);
       cur = m.prefill_batch(seg, (int)done_upto);
@@ -2458,8 +2466,30 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
       cut_lap("mtp+yield");
     }
     std::vector<int> seg(g.ids.begin() + done_upto, g.ids.end());
+    if (inpass_cc) {
+      m.cut_alloc();
+      m.cut_abs = (int)inpass_cc;
+      m.cut_hit = m.cut_mtp_hit = false;
+    }
     cur = m.prefill_batch(seg, (int)done_upto);
     cut_lap("last-prefill");
+    if (inpass_cc) {
+      const bool mtp_cut = (use_spec || chain_mtp) && m.cut_mtp_hit;
+      if (m.cut_hit) {
+        std::vector<int> chist(g.ids.begin(), g.ids.begin() + inpass_cc);
+        m.with_cut_state(mtp_cut, [&] {
+          rckpt::save(m, chist, mtp_cut);
+          if (!kvs.dir.empty()) kvsnap::capture(m, chist, mtp_cut, pend);
+        });
+      } else {
+        fprintf(stderr, "%s cut: in-pass snapshot at %zu missed (req %lld)\n", log_ts(),
+                inpass_cc, (long long)g.req);
+      }
+      m.cut_abs = -1;
+      m.cut_r_ = 0;
+      m.cut_busy = false;
+      cut_lap("cut-save");
+    }
     m.prog_total = 0;
     m.mtp_tap_capture = false;  // decode/verify must not capture taps
     hist = g.ids;  // prompt fully ingested on both paths

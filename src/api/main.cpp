@@ -2037,7 +2037,20 @@ class ThinkSplitter {
                 // character boundary: a byte-count cut would split a
                 // multi-byte character across two frames and make each frame
                 // individually invalid UTF-8.
-                size_t safe = buf_.size() >= kMarkerLen - 1 ? buf_.size() - (kMarkerLen - 1) : 0;
+                // Hold back only a tail that is a real partial marker ("<",
+                // "</th", ...), not a blind 7 bytes: the blind window kept
+                // the first reasoning token(s) ("We", 2 bytes) off the wire
+                // until the first speculative round landed (~65 ms TTFT).
+                size_t hold = 0;
+                for (size_t n = std::min(buf_.size(), kMarkerLen - 1); n > 0; --n)
+                    if (buf_.compare(buf_.size() - n, n, kMarker, n) == 0) {
+                        hold = n;
+                        break;
+                    }
+                // trailing newlines may precede the marker (trimmed off the
+                // reasoning once it lands): keep them too
+                while (hold < buf_.size() && buf_[buf_.size() - 1 - hold] == '\n') ++hold;
+                size_t safe = buf_.size() - hold;
                 safe = utf8_boundary_at_or_before(buf_, std::max(safe, rpos_));
                 if (safe > rpos_) {
                     *reasoning_out = buf_.substr(rpos_, safe - rpos_);

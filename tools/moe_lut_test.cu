@@ -33,6 +33,7 @@
 // Metric: per-slot relative L2 error; FAIL if max > --tol (default 1e-2).
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
+#include <hip/hip_bf16.h>
 
 #include <algorithm>
 #include <atomic>

@@ -140,6 +140,23 @@ int main(int argc, char** argv) {
   if (shape == "mixdn" || shape == "all") sweep_mixdn("mixdn", P, 1);
   if (shape == "mixdn4" || shape == "all") sweep_mixdn("mixdn/s4", P, 4);
   if (shape == "upfused" || shape == "all") sweep_up("upfused", P);
+  if (shape == "z1") {  // single config for counter collection
+    for (int i = 0; i < 3; i++) run<128, 128, 2, 2, 4, 4, 32, 128>("z1", P, 2560, 6144, 1);
+  }
+  if (shape == "oproj2") {  // (2560, 6144): N=2560 = 16 x 160 = 20 x 128
+    const int K = 6144, N = 2560;
+    for (int gm : {1, 2, 4, 8}) {
+      run<64, 160, 2, 2, 2, 5, 64, 128>("op2", P, K, N, gm);
+      run<64, 160, 2, 2, 2, 5, 32, 128>("op2", P, K, N, gm);
+      run<128, 160, 2, 2, 4, 5, 32, 128>("op2", P, K, N, gm);
+      run<64, 128, 2, 2, 2, 4, 64, 128>("op2", P, K, N, gm);
+      run<64, 256, 2, 2, 2, 8, 32, 128>("op2", P, K, N, gm);
+      run<64, 256, 1, 4, 4, 4, 32, 128>("op2", P, K, N, gm);
+      run<128, 128, 2, 2, 4, 4, 32, 128>("op2", P, K, N, gm);
+      run<96, 128, 2, 2, 3, 4, 32, 128>("op2", P, K, N, gm);
+      run<96, 160, 2, 2, 3, 5, 32, 128>("op2", P, K, N, gm);
+    }
+  }
   if (shape == "n640") {
     sweep0("n640", P, 2560, 640);
     sweep0("n1280", P, 2560, 1280);

@@ -574,6 +574,133 @@ __global__ void __launch_bounds__(256) k_gr_scatter_norm_inj_bf16(
     }
   }
 }
+// aggr 10-05: same contract as k_gr_scatter_norm_inj_bf16 (d == 2560 only,
+// 256 threads, block = (T tokens, branch)), restructured for bandwidth:
+// lane owns column pairs c = 2*lane + 512*j (j < 5) -> 4 B bf16x2 / 8 B float2
+// accesses (warp = 128/256 B contiguous), and the per-token reductions are
+// wave shuffles + one 8-entry LDS exchange (2 barriers per token instead of
+// ~10). Summation order differs -> Rhat / partials not bit-identical (R is:
+// the write is element-wise). GDEC_GR_SCAT_V2=0 restores the old kernel.
+template <int T, bool Write = true>
+__global__ void __launch_bounds__(256) k_gr_scatter_norm_inj_bf16_v2(
+    const float* __restrict__ pfull, const float* __restrict__ pin,
+    uint16_t* __restrict__ R, const float* __restrict__ y,
+    const float* __restrict__ w, uint16_t* __restrict__ Rhat,
+    const uint16_t* __restrict__ winj, float* __restrict__ pout, int P,
+    float eps, float* __restrict__ sc = nullptr) {
+  constexpr int d = 2560, J = 5;
+  const int b = blockIdx.x & 3;
+  const int t0 = (blockIdx.x >> 2) * T;
+  const int lane = threadIdx.x, wv = lane >> 5;
+  __shared__ float s_ss[2][8];
+  __shared__ float s_red[2][8][4];
+  __shared__ float s_inj[T];
+  if (Write && lane < T) {
+    const int t = t0 + lane;
+    float v = 0.f;
+    if (t < P) {
+      const float x = pin ? inj_psum(pin + (size_t)t * 16 + b) : pfull[(size_t)t * 4 + b];
+      v = 2.f / (1.f + expf(-x * 0.25f));
+    }
+    s_inj[lane] = v;
+  }
+  const float* wg = w + (size_t)b * d;
+  float wn[J][2], wr[4][J][2];
+#pragma unroll
+  for (int j = 0; j < J; j++) {
+    const int c = 2 * lane + 512 * j;
+    const float2 w2 = *(const float2*)(wg + c);
+    wn[j][0] = 1.f + w2.x;
+    wn[j][1] = 1.f + w2.y;
+#pragma unroll
+    for (int k = 0; k < 4; k++) {
+      const uint32_t u = *(const uint32_t*)(winj + (size_t)k * 4 * d + (size_t)b * d + c);
+      wr[k][j][0] = bf2f((uint16_t)(u & 0xffff));
+      wr[k][j][1] = bf2f((uint16_t)(u >> 16));
+    }
+  }
+  // software pipeline: token i+1's R / y loads are issued before token i's
+  // reductions, so the per-token DRAM round trip overlaps the barriers.
+  uint32_t nu[J];
+  float2 ny[J];
+  auto load_tok = [&](int t) {
+#pragma unroll
+    for (int j = 0; j < J; j++) {
+      const int c = 2 * lane + 512 * j;
+      nu[j] = *(const uint32_t*)(R + ((size_t)t * 4 + b) * d + c);
+      if constexpr (Write) ny[j] = *(const float2*)(y + (size_t)t * d + c);
+    }
+  };
+  if (t0 < P) load_tok(t0);
+  __syncthreads();
+  for (int i = 0; i < T; i++) {
+    const int t = t0 + i;
+    if (t >= P) break;  // block-uniform
+    const int buf = i & 1;
+    uint16_t* Rg = R + ((size_t)t * 4 + b) * d;
+    uint16_t* og = Rhat ? Rhat + ((size_t)t * 4 + b) * d : nullptr;
+    const float inject = Write ? s_inj[i] : 0.f;
+    uint32_t cu[J];
+    float2 cy[J];
+#pragma unroll
+    for (int j = 0; j < J; j++) {
+      cu[j] = nu[j];
+      if constexpr (Write) cy[j] = ny[j];
+    }
+    if (i + 1 < T && t + 1 < P) load_tok(t + 1);
+    float v[J][2];
+    float ss = 0.f;
+#pragma unroll
+    for (int j = 0; j < J; j++) {
+      const int c = 2 * lane + 512 * j;
+      uint32_t u = cu[j];
+      if constexpr (Write) {
+        const float2 y2 = cy[j];
+        const uint16_t r0 = f2bf(bf2f((uint16_t)(u & 0xffff)) + inject * y2.x);
+        const uint16_t r1 = f2bf(bf2f((uint16_t)(u >> 16)) + inject * y2.y);
+        u = (uint32_t)r0 | ((uint32_t)r1 << 16);
+        *(uint32_t*)(Rg + c) = u;
+      }
+      v[j][0] = bf2f((uint16_t)(u & 0xffff));
+      v[j][1] = bf2f((uint16_t)(u >> 16));
+      ss += v[j][0] * v[j][0] + v[j][1] * v[j][1];
+    }
+#pragma unroll
+    for (int o = 16; o; o >>= 1) ss += __shfl_xor(ss, o, 32);
+    if ((lane & 31) == 0) s_ss[buf][wv] = ss;
+    __syncthreads();
+    float tot = s_ss[buf][0];
+#pragma unroll
+    for (int q = 1; q < 8; q++) tot += s_ss[buf][q];
+    const float inv = rsqrtf(tot / d + eps);
+    if (sc && lane == 0) sc[(size_t)t * 4 + b] = inv;
+    float a[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+    for (int j = 0; j < J; j++) {
+      const int c = 2 * lane + 512 * j;
+      const uint16_t o0 = f2bf(v[j][0] * inv * wn[j][0]);
+      const uint16_t o1 = f2bf(v[j][1] * inv * wn[j][1]);
+      if (og) *(uint32_t*)(og + c) = (uint32_t)o0 | ((uint32_t)o1 << 16);
+      const float f0 = bf2f(o0), f1 = bf2f(o1);
+#pragma unroll
+      for (int k = 0; k < 4; k++) a[k] += f0 * wr[k][j][0] + f1 * wr[k][j][1];
+    }
+#pragma unroll
+    for (int k = 0; k < 4; k++)
+#pragma unroll
+      for (int o = 16; o; o >>= 1) a[k] += __shfl_xor(a[k], o, 32);
+    if ((lane & 31) == 0)
+#pragma unroll
+      for (int k = 0; k < 4; k++) s_red[buf][wv][k] = a[k];
+    __syncthreads();
+    if (lane < 4) {
+      float s = s_red[buf][0][lane];
+#pragma unroll
+      for (int q = 1; q < 8; q++) s += s_red[buf][q][lane];
+      pout[((size_t)t * 4 + b) * 4 + lane] = s;
+    }
+  }
+}
 // [gr-injfuse-end]
 
 // One-block-per-token variant: y is staged in LDS once instead of being
