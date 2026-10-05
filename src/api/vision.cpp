@@ -33,10 +33,12 @@ namespace {
 constexpr size_t kMaxEncodedBytes = 64u << 20;
 constexpr uint64_t kMaxDecodedPixels = 100000000u;
 constexpr int kDefaultMaxImages = 8;
-// The engine's GEN protocol accepts at most this many VIMG frames per
-// request (kVimgMax in src/gpu/parts/51_host_cfg.inc); a larger API-side
-// cap only produces requests the engine always rejects.
-constexpr int kMaxImagesCap = 16;
+// Ceiling for GDEC_API_MAX_IMAGES: the launchers' MAX_IMAGES range (1–256)
+// and the engine's GEN-protocol frame ceiling (kVimgMax in
+// src/gpu/parts/51_host_cfg.inc). Keep all three equal: if the API allowed
+// more than the engine accepts, a configured value would turn into requests
+// the engine always rejects.
+constexpr int kMaxImagesCap = 256;
 constexpr int kPatch = 16;
 constexpr int kMerge = 2;
 constexpr int kFactor = kPatch * kMerge;
@@ -446,8 +448,9 @@ bool image_url_from_item(const json& item, std::string* url, bool* image,
 
 }  // namespace
 
-// GDEC_API_MAX_IMAGES overrides the per-request image cap (default 8); values
-// above the engine's protocol cap clamp to it with a warning.
+// GDEC_API_MAX_IMAGES (= service.conf MAX_IMAGES) sets the per-request image
+// cap (default 8). The launchers reject values outside 1–256; a hand-set value
+// above 256 clamps to it with a warning.
 int max_images() {
     static const int limit = [] {
         const char* e = std::getenv("GDEC_API_MAX_IMAGES");
@@ -458,7 +461,7 @@ int max_images() {
                 if (v <= kMaxImagesCap) return static_cast<int>(v);
                 fprintf(stderr,
                         "vision: GDEC_API_MAX_IMAGES=%ld clamped to %d "
-                        "(the engine rejects more frames per request)\n",
+                        "(engine GEN-protocol ceiling)\n",
                         v, kMaxImagesCap);
                 return kMaxImagesCap;
             }

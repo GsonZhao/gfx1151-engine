@@ -1181,9 +1181,18 @@ struct GpuModel {
         continue;
       }
       if (emb_off + (size_t)M > img_emb_cap) {
+        // Grow WITHOUT losing the rows already written for earlier images of
+        // this request: they are only consumed at prefill (k_img_inject), so
+        // the old free-then-malloc dropped images 1..k-1 whenever image k
+        // overflowed (first multi-image request per slot past 4096 rows).
         size_t ncap = std::max<size_t>(emb_off + M, 4096);
+        uint16_t* nbuf = nullptr;
+        CK(hipMalloc(&nbuf, ncap * 2560 * 2));
+        if (d_img_emb && emb_off)
+          CK(hipMemcpy(nbuf, d_img_emb, emb_off * 2560 * 2,
+                       hipMemcpyDeviceToDevice));
         if (d_img_emb) (void)hipFree(d_img_emb);
-        CK(hipMalloc(&d_img_emb, ncap * 2560 * 2));
+        d_img_emb = nbuf;
         img_emb_cap = ncap;
       }
       auto t0 = std::chrono::steady_clock::now();

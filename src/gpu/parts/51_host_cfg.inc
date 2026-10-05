@@ -1275,12 +1275,17 @@ static bool send_all(sockfd_t fd, const std::string& s) {
   return true;
 }
 
-// VIMG frames accepted per GEN line (protocol cap). parse_gen keeps the
-// parsed count even when it rejects the value, so the serve loop can still
-// drain that many binary frames before replying — a reject that skips the
-// drain leaves frame bytes to be misread as protocol lines and silently
-// wedges the connection. src/api/vision.cpp clamps its image cap to this.
-constexpr int kVimgMax = 16;
+// VIMG frames (and MROPE grids) accepted per GEN line. This is only a
+// protocol sanity ceiling, not the image policy: the per-request image cap is
+// the user's MAX_IMAGES (service.conf, range 1–256), enforced by the API
+// (src/api/vision.cpp, same 256 ceiling), so every configurable value is
+// accepted here. It used to be 16 while the config allowed 256, which turned
+// MAX_IMAGES>16 into a silent clamp. parse_gen keeps the parsed count even
+// when it rejects the value, so the serve loop can still drain that many
+// binary frames before replying — a reject that skips the drain leaves frame
+// bytes to be misread as protocol lines and silently wedges the connection
+// (73159c9).
+constexpr int kVimgMax = 256;
 
 struct GenReq {
   int64_t req = 0;
@@ -1684,7 +1689,8 @@ static GenReq parse_gen(std::istringstream& ss) {
       g.logprobs = true;
     } else if (tok == "MROPE") {
       int k;
-      if (!(ss >> k) || k <= 0 || k > 64) { g.reject = true; return g; }
+      // One grid per image: same ceiling as VIMG (was 64, a hidden 2nd cap).
+      if (!(ss >> k) || k <= 0 || k > kVimgMax) { g.reject = true; return g; }
       for (int i = 0; i < k; i++) {
         std::array<int, 3> g3{0, 0, 0};
         if (!(ss >> g3[0] >> g3[1] >> g3[2])) { g.reject = true; return g; }
